@@ -1,4 +1,5 @@
 # BlockNexa
+<<<<<<< HEAD
 
 One project: the website, the admin panel and the backend, started with one command.
 
@@ -33,3 +34,6 @@ data/                created on first start: the database (never commit it)
 - Use HTTPS. Behind Nginx or Cloudflare set `TRUST_PROXY=1`.
 - Set `ADMIN_IPS` so only your own IP can open /admin.
 - Download a backup from the admin panel every few days and keep it off the server.
+=======
+Next Gen Digital Payment
+>>>>>>> c7cbbe662035538cc604b6be534cb9c670fb09f2
