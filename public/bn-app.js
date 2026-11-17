@@ -97,8 +97,7 @@
     logout: () => req('POST', '/auth/logout'),
     google: credential => req('POST', '/auth/google', { credential }),
     otpRequest: (phone, mode) => req('POST', '/auth/otp/request', { phone, mode }),
-    otpVerify: (phone, code, mode, password) => req('POST', '/auth/otp/verify', { phone, code, mode, ...(password ? { password } : {}) }),
-    passwordLogin: (phone, password) => req('POST', '/auth/password/login', { phone, password }),
+    otpVerify: (phone, code, mode) => req('POST', '/auth/otp/verify', { phone, code, mode }),
     rates: () => req('GET', '/rates'), balance: () => req('GET', '/balance'), history: t => req('GET', '/history/' + t),
     buyCreate: inr => req('POST', '/buy', { inr }), buyPaid: (id, utr) => req('POST', `/buy/${id}/paid`, { utr }),
     sellCreate: b => req('POST', '/sell', b), withdraw: b => req('POST', '/withdraw', { chain: 'bsc', ...b }), deposit: () => req('GET', '/deposit')
@@ -114,7 +113,7 @@
 (function () {
   const BN = window.BN, { icon, esc, $, GOOGLE, tg } = BN.ui;
   function render(root, done) {
-    let mode = 'login', phone = '', password = '', timer = null;
+    let mode = 'login', phone = '', timer = null;
     const brand = `<div class="brand"><span class="mark">${icon('cube')}</span>${esc(BN.cfg.NAME)}</div>`;
     const set = h => { root.innerHTML = `<div class="acard">${brand}${h}</div>`; };
     const err = m => { const e = $('#aerr', root); if (e) e.textContent = m || ''; };
@@ -136,13 +135,10 @@
     async function initGoogle(slot) {
       let id = ''; try { id = (await BN.api.rates()).googleClientId || ''; } catch (e) {}
       if (!id) { slot.innerHTML = '<p class="mut" style="text-align:center">Google sign-in is not set up yet.</p>'; return; }
-      slot.className = 'google-slot';
       const s = document.createElement('script'); s.src = 'https://accounts.google.com/gsi/client'; s.async = true;
       s.onload = () => {
-        google.accounts.id.initialize({ client_id: id, callback: r => {
-          slot.classList.add('is-loading'); BN.api.google(r.credential).then(done, e => { slot.classList.remove('is-loading'); fail(e); });
-        } });
-        google.accounts.id.renderButton(slot, { theme: 'filled_black', size: 'large', shape: 'pill', text: 'continue_with', width: Math.min(340, slot.clientWidth || innerWidth - 80), logo_alignment: 'left' });
+        google.accounts.id.initialize({ client_id: id, callback: r => BN.api.google(r.credential).then(done, fail) });
+        google.accounts.id.renderButton(slot, { theme: 'filled_black', size: 'large', shape: 'pill', text: 'continue_with', width: Math.min(340, innerWidth - 100) });
       };
       document.head.appendChild(s);
     }
@@ -151,52 +147,23 @@
       set(`<h1>${reg ? 'Create your account' : 'Welcome back'}</h1>
         <p class="mut sub">${reg ? 'Enter your mobile number. We send a code to your Telegram to verify it.' : 'Enter your registered mobile number. We send a code to your Telegram.'}</p>
         <label class="field"><span class="pre">+91</span><input id="num" class="sm" type="tel" inputmode="numeric" maxlength="10" placeholder="10-digit mobile number" autocomplete="tel-national" aria-label="Mobile number"></label>
-        ${reg ? '<label class="field"><input id="newpass" class="sm" type="password" minlength="8" maxlength="128" autocomplete="new-password" placeholder="Create password (8+ characters)" aria-label="Create password"></label><label class="field"><input id="confirmpass" class="sm" type="password" minlength="8" maxlength="128" autocomplete="new-password" placeholder="Confirm password" aria-label="Confirm password"></label><label class="chk"><input type="checkbox" id="tos"><span>I agree to the terms of service</span></label>' : ''}
+        ${reg ? '<label class="chk"><input type="checkbox" id="tos"><span>I agree to the terms of service</span></label>' : ''}
         <p class="err" id="aerr" role="alert"></p>
         <button class="btn" id="send">Send code on Telegram</button>
-        ${!reg ? '<button class="link" id="pwlogin" style="display:block;margin:8px auto 0">Login with password instead</button>' : ''}
         <button class="btn ghost" id="back">Back</button>
         <button class="link" id="sw" style="display:block;margin:8px auto 0">${reg ? 'Already have an account? Log in' : 'New here? Register your account'}</button>`);
       $('#num', root).oninput = e => { e.target.value = e.target.value.replace(/\D/g, ''); };
       $('#num', root).onkeydown = e => { if (e.key === 'Enter') $('#send', root).click(); };
       $('#back', root).onclick = choose;
       $('#sw', root).onclick = () => enterPhone(reg ? 'login' : 'register');
-      if (!reg) $('#pwlogin', root).onclick = enterPasswordLogin;
       $('#send', root).onclick = async e => {
         const n = $('#num', root).value;
         if (!/^[6-9]\d{9}$/.test(n)) return err('Enter a valid 10-digit Indian mobile number.');
         if (reg && !$('#tos', root).checked) return err('Please agree to the terms of service to continue.');
-        if (reg) {
-          password = $('#newpass', root).value;
-          if (password.length < 8 || password.length > 128) return err('Your password must be between 8 and 128 characters.');
-          if (password !== $('#confirmpass', root).value) return err('The passwords do not match.');
-        }
         phone = '+91' + n; busy(e.target, true);
         try { await BN.api.otpRequest(phone, mode); otp(); }
         catch (x) { fail(x); busy(e.target, false, 'Send code on Telegram'); }
       };
-    }
-    function enterPasswordLogin() {
-      mode = 'login';
-      set(`<h1>Welcome back</h1><p class="mut sub">Sign in securely with your mobile number and password.</p>
-        <label class="field"><span class="pre">+91</span><input id="num" class="sm" type="tel" inputmode="numeric" maxlength="10" placeholder="10-digit mobile number" autocomplete="tel-national" aria-label="Mobile number"></label>
-        <label class="field"><input id="pass" class="sm" type="password" maxlength="128" autocomplete="current-password" placeholder="Your password" aria-label="Password"></label>
-        <p class="err" id="aerr" role="alert"></p>
-        <button class="btn" id="passlogin">Login securely</button>
-        <button class="btn ghost" id="otpback">Use Telegram OTP instead</button>
-        <button class="link" id="back" style="display:block;margin:6px auto 0">Back</button>`);
-      $('#num', root).oninput = e => { e.target.value = e.target.value.replace(/\D/g, ''); };
-      $('#passlogin', root).onclick = async e => {
-        const n = $('#num', root).value, p = $('#pass', root).value;
-        if (!/^[6-9]\d{9}$/.test(n)) return err('Enter a valid 10-digit Indian mobile number.');
-        if (!p) return err('Enter your password.');
-        busy(e.target, true);
-        try { done(await BN.api.passwordLogin('+91' + n, p)); }
-        catch (x) { fail(x); busy(e.target, false, 'Login securely'); }
-      };
-      $('#pass', root).onkeydown = e => { if (e.key === 'Enter') $('#passlogin', root).click(); };
-      $('#otpback', root).onclick = () => enterPhone('login');
-      $('#back', root).onclick = choose;
     }
     function otp() {
       let left = 30; const sender = BN.cfg.OTP_SENDER;
@@ -211,7 +178,7 @@
       const submit = async () => {
         if (!/^\d{6}$/.test(code.value)) return err('Enter the 6-digit code.');
         busy(ver, true);
-        try { clearTimeout(timer); done(await BN.api.otpVerify(phone, code.value, mode, mode === 'register' ? password : '')); }
+        try { clearTimeout(timer); done(await BN.api.otpVerify(phone, code.value, mode)); }
         catch (x) { fail(x); busy(ver, false, vlabel); code.select(); }
       };
       code.oninput = () => { code.value = code.value.replace(/\D/g, ''); if (code.value.length === 6) submit(); };
