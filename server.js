@@ -40,7 +40,7 @@ db.pragma('journal_mode = WAL'); db.pragma('foreign_keys = ON');
 db.exec(`
 CREATE TABLE IF NOT EXISTS users(
   id INTEGER PRIMARY KEY, uid TEXT NOT NULL UNIQUE, phone TEXT UNIQUE, email TEXT UNIQUE, google_sub TEXT UNIQUE,
-  created_at INTEGER NOT NULL, wd_suspended INTEGER NOT NULL DEFAULT 0, wd_reason TEXT, wd_suspended_at INTEGER, password_hash TEXT);
+  created_at INTEGER NOT NULL, wd_suspended INTEGER NOT NULL DEFAULT 0, wd_reason TEXT, wd_suspended_at INTEGER);
 CREATE TABLE IF NOT EXISTS sessions(token_hash TEXT PRIMARY KEY, user_id INTEGER NOT NULL REFERENCES users(id), created_at INTEGER NOT NULL, expires_at INTEGER NOT NULL);
 CREATE TABLE IF NOT EXISTS otps(phone TEXT PRIMARY KEY, code_hash TEXT, expires_at INTEGER NOT NULL DEFAULT 0, tries INTEGER NOT NULL DEFAULT 0,
   sent_at INTEGER NOT NULL, sends INTEGER NOT NULL, window_start INTEGER NOT NULL);
@@ -58,16 +58,12 @@ CREATE TABLE IF NOT EXISTS ledger(                      -- balance = SUM of this
 CREATE INDEX IF NOT EXISTS idx_ledger_user ON ledger(user_id);
 CREATE TABLE IF NOT EXISTS audit(id INTEGER PRIMARY KEY AUTOINCREMENT, at INTEGER NOT NULL, action TEXT NOT NULL, target TEXT, details TEXT);
 `);
-const userColumns = new Set(db.pragma('table_info(users)').map(c => c.name));
-if (!userColumns.has('password_hash')) db.exec('ALTER TABLE users ADD COLUMN password_hash TEXT');
 
 /* ============================ SECTION 3: HELPERS ============================ */
 const P = new Map(); const S = sql => { let s = P.get(sql); if (!s) { s = db.prepare(sql); P.set(sql, s); } return s; };
 const now = () => Date.now(), micro = x => Math.round(Number(x) * 1e6), usdt = m => m / 1e6, f2 = m => (m / 1e6).toFixed(2);
 const sha = x => crypto.createHash('sha256').update(x).digest('hex');
 const hmac = x => crypto.createHmac('sha256', CFG.APP_SECRET).update(x).digest('hex');
-const hashPassword = password => { const salt = crypto.randomBytes(16).toString('hex'); const derived = crypto.scryptSync(password, salt, 64); return ['scrypt', salt, derived.toString('hex')].join(':'); };
-const verifyPassword = (password, stored) => { if (!stored || typeof stored !== 'string') return false; const parts = stored.split(':'); if (parts.length !== 3 || parts[0] !== 'scrypt' || !/^[a-f0-9]{128}$/i.test(parts[2])) return false; const actual = crypto.scryptSync(password, parts[1], 64); return crypto.timingSafeEqual(actual, Buffer.from(parts[2], 'hex')); };
 const same = (a, b) => a.length === b.length && crypto.timingSafeEqual(Buffer.from(a), Buffer.from(b));
 const ID_CHARS = 'ABCDEFGHJKMNPQRSTUVWXYZ23456789';                                          // no look-alike characters
 const newOrderId = () => { for (;;) { const id = Array.from({ length: 6 }, () => ID_CHARS[crypto.randomInt(ID_CHARS.length)]).join(''); if (!S('SELECT 1 FROM orders WHERE public_id=?').get(id)) return id; } };
@@ -94,7 +90,7 @@ const limiter = (max, windowMs = 60000) => (req, res, next) => {
 /* ===================== SECTION 4: LOGIN (Telegram code + Google) ===================== */
 const SESSION_MS = 30 * 24 * 3600 * 1000;
 const cookieOf = (req, n) => (req.headers.cookie || '').split(';').map(c => c.trim().split('=')).find(c => c[0] === n)?.[1];
-const cookie = (req, token, ms) => `bn_session=${token}; HttpOnly; SameSite=Lax; Path=/; Max-Age=${Math.floor(ms / 1000)}; Expires=${new Date(Date.now() + ms).toUTCString()}${req.secure ? '; Secure' : ''}`;
+const cookie = (req, token, ms) => `bn_session=${token}; HttpOnly; SameSite=Lax; Path=/; Max-Age=${Math.floor(ms / 1000)}${req.secure ? '; Secure' : ''}`;
 function startSession(req, res, userId) {
   const token = crypto.randomBytes(32).toString('hex'), t = now();
   S('DELETE FROM sessions WHERE expires_at<=?').run(t);
@@ -146,28 +142,14 @@ V.post('/auth/otp/verify', limiter(30), (req, res) => {
   const b = req.body || {}, phone = String(b.phone || ''), code = String(b.code || ''), mode = b.mode;
   const bad = msg => res.status(400).json({ error: msg || 'Invalid or expired code. Please request a new one.' });
   if (!/^\+91[6-9]\d{9}$/.test(phone) || !/^\d{6}$/.test(code) || (mode !== 'register' && mode !== 'login')) return bad();
-  const password = String(b.password || '');
-  if (mode === 'register' && (password.length < 8 || password.length > 128)) return bad('Create a password between 8 and 128 characters.');
   const r = S('SELECT * FROM otps WHERE phone=?').get(phone);
   if (!r || !r.code_hash || r.expires_at < now()) return bad();
   if (r.tries >= 3) { S('UPDATE otps SET code_hash=NULL WHERE phone=?').run(phone); return bad(); }          // 3 wrong guesses destroy the code
   if (!same(hmac(phone + ':' + code), r.code_hash)) { S('UPDATE otps SET tries=tries+1 WHERE phone=?').run(phone); return bad('Wrong code. Please try again.'); }
   S('UPDATE otps SET code_hash=NULL, expires_at=0 WHERE phone=?').run(phone);                              // a code works once
   let u = S('SELECT * FROM users WHERE phone=?').get(phone);
-  if (mode === 'register') {
-    if (u) return res.status(409).json({ error: 'This number is already registered. Please log in.' });
-    u = createUser({ phone });
-    S('UPDATE users SET password_hash=? WHERE id=?').run(hashPassword(password), u.id);
-    u = S('SELECT * FROM users WHERE id=?').get(u.id);
-  } else if (!u) return res.status(404).json({ error: 'No account found for this number. Please register first.' });
-  startSession(req, res, u.id); res.json(me(u));
-});
-
-V.post('/auth/password/login', limiter(8), (req, res) => {
-  const b = req.body || {}, phone = String(b.phone || ''), password = String(b.password || '');
-  if (!/^\+91[6-9]\d{9}$/.test(phone) || !password || password.length > 128) return res.status(400).json({ error: 'Enter your registered mobile number and password.' });
-  const u = S('SELECT * FROM users WHERE phone=?').get(phone);
-  if (!u || !verifyPassword(password, u.password_hash)) return res.status(401).json({ error: 'Incorrect mobile number or password. You can also log in with a Telegram code.' });
+  if (mode === 'register') { if (u) return res.status(409).json({ error: 'This number is already registered. Please log in.' }); u = createUser({ phone }); }
+  else if (!u) return res.status(404).json({ error: 'No account found for this number. Please register first.' });
   startSession(req, res, u.id); res.json(me(u));
 });
 
