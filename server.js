@@ -69,7 +69,15 @@ const hmac = x => crypto.createHmac('sha256', CFG.APP_SECRET).update(x).digest('
 const hashPassword = password => {
   const salt = crypto.randomBytes(16).toString('hex');
   const derived = crypto.scryptSync(password, salt, 64);
-  return 'scrypt
+  return ['scrypt', salt, derived.toString('hex')].join('$');
+};
+const verifyPassword = (password, stored) => {
+  if (!stored || typeof stored !== 'string') return false;
+  const parts = stored.split('$');
+  if (parts.length !== 3 || parts[0] !== 'scrypt' || !/^[a-f0-9]{128}$/i.test(parts[2])) return false;
+  const actual = crypto.scryptSync(password, parts[1], 64);
+  return crypto.timingSafeEqual(actual, Buffer.from(parts[2], 'hex'));
+};
 const same = (a, b) => a.length === b.length && crypto.timingSafeEqual(Buffer.from(a), Buffer.from(b));
 const ID_CHARS = 'ABCDEFGHJKMNPQRSTUVWXYZ23456789';                                          // no look-alike characters
 const newOrderId = () => { for (;;) { const id = Array.from({ length: 6 }, () => ID_CHARS[crypto.randomInt(ID_CHARS.length)]).join(''); if (!S('SELECT 1 FROM orders WHERE public_id=?').get(id)) return id; } };
