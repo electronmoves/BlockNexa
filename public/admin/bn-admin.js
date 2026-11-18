@@ -166,8 +166,80 @@
     if ($('#eb', m)) $('#eb', m).onclick = editBalance; if ($('#susp', m)) $('#susp', m).onclick = suspend; if ($('#unsusp', m)) $('#unsusp', m).onclick = unsuspend;
     if (order) { if ($('#ok', m)) $('#ok', m).onclick = () => changeStatus(order, 'success'); if ($('#bad', m)) $('#bad', m).onclick = () => changeStatus(order, 'failed'); }
   }
+  // ---------- userbase ----------
+  let ubPage = 0;
+  async function userbase(page) {
+    ubPage = page || 0;
+    try {
+      const d = await api('/users?page=' + ubPage);
+      const totalPages = Math.ceil(d.total / 50);
+      const rows = d.users.map(u => `
+        <tr>
+          <td><button class="uid-link" data-uid="${esc(u.uid)}">${esc(u.uid)}</button></td>
+          <td>${esc(u.email || u.phone || '—')}</td>
+          <td>${day(u.createdAt)}</td>
+          <td>${u.deactivated
+            ? `<span class="deact-badge">Deactivated</span>${u.deactivateReason ? '<br><small style="color:var(--error);margin-top:4px;display:block">' + esc(u.deactivateReason) + '</small>' : ''}`
+            : '<span class="active-badge">Active</span>'}</td>
+          <td>
+            ${u.deactivated
+              ? `<button class="btn ghost" style="padding:7px 12px;font-size:12px" data-reactivate="${esc(u.uid)}">Reactivate</button>`
+              : `<button class="btn danger" style="padding:7px 12px;font-size:12px" data-deactivate="${esc(u.uid)}">Deactivate</button>`}
+          </td>
+        </tr>`).join('');
+      $('#main').innerHTML = `
+        <div class="card">
+          <div class="head"><h2>Userbase</h2><small style="color:var(--text2)">${d.total} total users</small></div>
+          <div class="ub-wrap">
+            <table class="ub-table">
+              <thead><tr><th>User ID</th><th>Email / Phone</th><th>Joined</th><th>Status</th><th>Action</th></tr></thead>
+              <tbody>${rows || '<tr><td colspan="5" class="empty">No users yet.</td></tr>'}</tbody>
+            </table>
+          </div>
+          <div class="ub-pages">
+            ${ubPage > 0 ? '<button class="btn ghost" style="width:auto;padding:8px 16px" id="ubPrev">← Prev</button>' : ''}
+            <span style="color:var(--text2);font-size:13px">Page ${ubPage + 1} of ${Math.max(1, totalPages)}</span>
+            ${(ubPage + 1) < totalPages ? '<button class="btn ghost" style="width:auto;padding:8px 16px" id="ubNext">Next →</button>' : ''}
+          </div>
+        </div>`;
+      bind(); bindUserbase(d.users);
+    } catch(e) { toast(e.message, true); }
+  }
+  function bindUserbase(users) {
+    const m = $('#main');
+    m.querySelectorAll('[data-uid]').forEach(b => b.onclick = () => openUser(b.dataset.uid));
+    if ($('#ubPrev', m)) $('#ubPrev', m).onclick = () => userbase(ubPage - 1);
+    if ($('#ubNext', m)) $('#ubNext', m).onclick = () => userbase(ubPage + 1);
+    m.querySelectorAll('[data-deactivate]').forEach(b => b.onclick = async () => {
+      const uid = b.dataset.deactivate;
+      const r = await ask({
+        title: 'Deactivate account',
+        html: `<p>Deactivating <b>${esc(uid)}</b> will block this user from logging in. You can reactivate them anytime.</p>`,
+        chips: ['Suspicious activity', 'Fraud detected', 'Policy violation', 'User request', 'Duplicate account'],
+        text: { placeholder: 'Reason for deactivation (required)', required: true },
+        ok: 'Deactivate account',
+        danger: true
+      });
+      if (!r) return;
+      try { await api(`/user/${encodeURIComponent(uid)}/deactivate`, { method: 'POST', body: { reason: r.text } }); toast('Account deactivated'); userbase(ubPage); }
+      catch(e) { toast(e.message, true); }
+    });
+    m.querySelectorAll('[data-reactivate]').forEach(b => b.onclick = async () => {
+      const uid = b.dataset.reactivate;
+      const r = await ask({
+        title: 'Reactivate account',
+        html: `<p>Reactivating <b>${esc(uid)}</b> will allow this user to log in again.</p>`,
+        text: { placeholder: 'Note (optional)' },
+        ok: 'Reactivate'
+      });
+      if (!r) return;
+      try { await api(`/user/${encodeURIComponent(uid)}/reactivate`, { method: 'POST', body: { reason: r.text } }); toast('Account reactivated'); userbase(ubPage); }
+      catch(e) { toast(e.message, true); }
+    });
+  }
+
   $('#enter').onclick = enter; $('#key').onkeydown = e => { if (e.key === 'Enter') enter(); };
   $('#sf').onsubmit = e => { e.preventDefault(); find($('#q').value.trim()); };
-  $('#nPending').onclick = pending; $('#nAudit').onclick = auditLog; $('#nBackup').onclick = backup; $('#nLock').onclick = lock;
+  $('#nPending').onclick = pending; $('#nUsers').onclick = () => userbase(0); $('#nAudit').onclick = auditLog; $('#nBackup').onclick = backup; $('#nLock').onclick = lock;
   if (KEY) api('/ping').then(() => { $('#login').hidden = true; $('#panel').hidden = false; }).catch(() => {});
 })();

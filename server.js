@@ -64,6 +64,9 @@ CREATE TABLE IF NOT EXISTS audit(id INTEGER PRIMARY KEY AUTOINCREMENT, at INTEGE
   const cols = t => db.prepare(`PRAGMA table_info(${t})`).all().map(c => c.name);
   if (!cols('users').includes('password_hash')) db.exec('ALTER TABLE users ADD COLUMN password_hash TEXT');
   if (!cols('sessions').includes('method')) db.exec('ALTER TABLE sessions ADD COLUMN method TEXT');
+  if (!cols('users').includes('deactivated')) db.exec('ALTER TABLE users ADD COLUMN deactivated INTEGER NOT NULL DEFAULT 0');
+  if (!cols('users').includes('deactivate_reason')) db.exec('ALTER TABLE users ADD COLUMN deactivate_reason TEXT');
+  if (!cols('users').includes('deactivated_at')) db.exec('ALTER TABLE users ADD COLUMN deactivated_at INTEGER');
 }
 
 /* ============================ SECTION 3: HELPERS ============================ */
@@ -98,16 +101,21 @@ const limiter = (max, windowMs = 60000) => (req, res, next) => {
 const SESSION_MS = CFG.SESSION_DAYS * 24 * 3600 * 1000;     // a login lasts this long and is renewed while the user keeps coming back
 const cookieOf = (req, n) => (req.headers.cookie || '').split(';').map(c => c.trim().split('=')).find(c => c[0] === n)?.[1];
 const cookie = (req, token, ms) => `bn_session=${token}; HttpOnly; SameSite=Lax; Path=/; Max-Age=${Math.floor(ms / 1000)}; Expires=${new Date(now() + ms).toUTCString()}${req.secure ? '; Secure' : ''}`;
-function startSession(req, res, userId, method) {
+const blockedMsg = u => 'This account has been deactivated' + (u.deactivate_reason ? ': ' + u.deactivate_reason : '') + '. Please contact support.';
+function startSession(req, res, userId, method) {      // returns false (and answers 403) if the account is deactivated
+  const acc = S('SELECT deactivated, deactivate_reason FROM users WHERE id=?').get(userId);
+  if (acc && acc.deactivated) { res.status(403).json({ error: blockedMsg(acc) }); return false; }
   const token = crypto.randomBytes(32).toString('hex'), t = now();
   S('DELETE FROM sessions WHERE expires_at<=?').run(t);
   S('INSERT INTO sessions(token_hash,user_id,created_at,expires_at,method) VALUES(?,?,?,?,?)').run(sha(token), userId, t, t + SESSION_MS, method);   // only a hash is stored
   res.append('Set-Cookie', cookie(req, token, SESSION_MS));
+  return true;
 }
 const requireAuth = (req, res, next) => {
   const tok = cookieOf(req, 'bn_session'), t = now();
   const u = tok && S('SELECT u.*, s.method AS s_method, s.created_at AS s_created, s.expires_at AS s_expires, s.token_hash AS s_hash FROM sessions s JOIN users u ON u.id=s.user_id WHERE s.token_hash=? AND s.expires_at>?').get(sha(tok), t);
   if (!u) return res.status(401).json({ error: 'Please log in.' });
+  if (u.deactivated) { S('DELETE FROM sessions WHERE user_id=?').run(u.id); return res.status(401).json({ error: blockedMsg(u) }); }
   if (u.s_expires - t < SESSION_MS / 2) { S('UPDATE sessions SET expires_at=? WHERE token_hash=?').run(t + SESSION_MS, u.s_hash); res.append('Set-Cookie', cookie(req, tok, SESSION_MS)); }   // renew when half used
   req.user = u; next();
 };
@@ -168,7 +176,7 @@ V.post('/auth/otp/verify', limiter(30), async (req, res) => {
   let u = S('SELECT * FROM users WHERE phone=?').get(phone);
   if (mode === 'register') { if (u) return res.status(409).json({ error: 'This number is already registered. Please log in.' }); u = createUser({ phone, password_hash: await hashPw(b.password) }); }
   else if (!u) return res.status(404).json({ error: 'No account found for this number. Please register first.' });
-  startSession(req, res, u.id, 'otp'); res.json(me(u));
+  if (startSession(req, res, u.id, 'otp')) res.json(me(u));
 });
 
 // ---- Log in with phone + password (no code needed)
@@ -181,7 +189,7 @@ V.post('/auth/login/password', limiter(30), async (req, res) => {
   if (f.length >= 5) return res.status(429).json({ error: 'Too many wrong attempts. Wait 15 minutes, or log in with a Telegram code.' });
   const u = S('SELECT * FROM users WHERE phone=?').get(phone);
   if (!(await checkPw(pw, u && u.password_hash)) || !u) { f.push(t); return bad(); }
-  pwFails.delete(phone); startSession(req, res, u.id, 'password'); res.json(me(u));
+  pwFails.delete(phone); if (startSession(req, res, u.id, 'password')) res.json(me(u));
 });
 
 // ---- Continue with Google: we check Google's signed token ourselves (signature, audience, expiry, verified email)
@@ -211,7 +219,7 @@ V.post('/auth/google', limiter(20), async (req, res) => {
   let u = S('SELECT * FROM users WHERE google_sub=?').get(g.sub) || S('SELECT * FROM users WHERE email=?').get(email);
   if (u && u.google_sub && u.google_sub !== g.sub) return fail();
   if (!u) u = createUser({ email, google_sub: g.sub }); else if (!u.google_sub) S('UPDATE users SET google_sub=? WHERE id=?').run(g.sub, u.id);
-  startSession(req, res, u.id, 'google'); res.json(me(u));
+  if (startSession(req, res, u.id, 'google')) res.json(me(u));
 });
 V.post('/auth/logout', (req, res) => {
   const tok = cookieOf(req, 'bn_session'); if (tok) S('DELETE FROM sessions WHERE token_hash=?').run(sha(tok));
@@ -397,6 +405,52 @@ A.get('/backup', async (req, res) => {                                         /
   try { await db.backup(tmp); audit('backup', null, {}); res.download(tmp, `blocknexa-backup-${new Date().toISOString().slice(0, 10)}.db`, () => fs.unlink(tmp, () => {})); }
   catch { fs.unlink(tmp, () => {}); res.status(500).json({ error: 'Backup failed.' }); }
 });
+
+// All users list (for Userbase tab)
+A.get('/users', (req, res) => {
+  const page = Math.max(0, parseInt(req.query.page) || 0);
+  const limit = 50;
+  const rows = S('SELECT * FROM users ORDER BY id DESC LIMIT ? OFFSET ?').all(limit, page * limit);
+  const total = S('SELECT COUNT(*) c FROM users').get().c;
+  res.json({
+    total,
+    page,
+    users: rows.map(u => ({
+      uid: u.uid,
+      email: u.email || null,
+      phone: u.phone || null,
+      createdAt: u.created_at,
+      suspended: !!u.wd_suspended,
+      deactivated: !!u.deactivated,
+      deactivatedAt: u.deactivated_at || null,
+      deactivateReason: u.deactivate_reason || null,
+    }))
+  });
+});
+
+// Deactivate a user account (admin action)
+A.post('/user/:uid/deactivate', (req, res) => {
+  const u = S('SELECT * FROM users WHERE uid=?').get(String(req.params.uid).toUpperCase());
+  if (!u) return res.status(404).json({ error: 'User not found.' });
+  const reason = reasonOf(req.body);
+  if (!reason) return res.status(400).json({ error: 'Write a short reason for deactivation.' });
+  if (u.deactivated) return res.status(409).json({ error: 'This account is already deactivated.' });
+  S('UPDATE users SET deactivated=1, deactivate_reason=?, deactivated_at=? WHERE id=?').run(reason, now(), u.id);
+  S('DELETE FROM sessions WHERE user_id=?').run(u.id);                          // log them out everywhere right away
+  audit('deactivate_user', u.uid, { reason });
+  res.json({ ok: true });
+});
+
+// Reactivate a user account (admin action)
+A.post('/user/:uid/reactivate', (req, res) => {
+  const u = S('SELECT * FROM users WHERE uid=?').get(String(req.params.uid).toUpperCase());
+  if (!u) return res.status(404).json({ error: 'User not found.' });
+  if (!u.deactivated) return res.status(409).json({ error: 'This account is not deactivated.' });
+  S('UPDATE users SET deactivated=0, deactivate_reason=NULL, deactivated_at=NULL WHERE id=?').run(u.id);
+  audit('reactivate_user', u.uid, { reason: reasonOf(req.body) || undefined });
+  res.json({ ok: true });
+});
+
 app.use('/api/admin', A);
 
 /* ================================= SECTION 7: START ================================= */
