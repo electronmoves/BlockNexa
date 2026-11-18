@@ -21,30 +21,37 @@
     back: 'M15 5l-7 7 7 7', copy: 'M9 9h10v10H9zM5 15V5h10', check: 'M5 12.5l4.5 4.5L19 7.5', x: 'M6 6l12 12M18 6L6 18',
     user: 'M12 12a4 4 0 100-8 4 4 0 000 8zM4 21a8 8 0 0116 0', send: 'M21 3L3 10.5l7 2.5 2.5 7L21 3zM10 13l11-10',
     warn: 'M12 9v4M12 17h.01M10.3 3.9L2.4 18a2 2 0 001.7 3h15.8a2 2 0 001.7-3L13.7 3.9a2 2 0 00-3.4 0z',
+    eye: 'M2 12s4-7 10-7 10 7 10 7-4 7-10 7S2 12 2 12zM12 15a3 3 0 100-6 3 3 0 000 6z', lock: 'M7 11V8a5 5 0 0110 0v3M5 11h14v9H5z',
     shield: 'M12 3l8 3v6c0 5-3.5 8-8 9-4.5-1-8-4-8-9V6z', cube: 'M12 3l8 4.5v9L12 21l-8-4.5v-9L12 3zM12 12l8-4.5M12 12v9M12 12L4 7.5', mail: 'M4 6h16v12H4zM4 7l8 6 8-6', users: 'M16 11a3 3 0 100-6 3 3 0 000 6zM8 11a3 3 0 100-6 3 3 0 000 6zM2 20a6 6 0 0112 0M14 20a6 6 0 018 0', help: 'M12 17h.01M9.1 9a3 3 0 115.2 2c-.8.8-2.3 1.2-2.3 3M12 21a9 9 0 100-18 9 9 0 000 18z', logout: 'M9 4H5a1 1 0 00-1 1v14a1 1 0 001 1h4M16 8l4 4-4 4M20 12H9', clock: 'M12 7v5l3 2M12 21a9 9 0 100-18 9 9 0 000 18z'
   };
-  const icon = (n, c = '') => `<svg class="ic ${c}" viewBox="0 0 24 24" aria-hidden="true"><path d="${P[n]}"/></svg>`;
+  const icon = (n, c = '') => `<svg class="ic ${c}" viewBox="0 0 24 24" aria-hidden="true"><path pathLength="100" d="${P[n]}"/></svg>`;
   const esc = s => String(s ?? '').replace(/[&<>"']/g, c => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' }[c]));
   const fmt = (n, d = 2) => Number(n).toLocaleString('en-IN', { minimumFractionDigits: d, maximumFractionDigits: d });
   const when = t => new Date(t).toLocaleString('en-IN', { day: 'numeric', month: 'short', hour: 'numeric', minute: '2-digit' });
   const $ = (s, r = document) => r.querySelector(s);
   const short = a => String(a).slice(0, 8) + '…' + String(a).slice(-6);
 
+  // Notification capsule: slides in from the top, hexagon badge, a thin line shows how long it stays.
   function toast(msg, bad) {
-    const t = document.createElement('div'); t.className = 'toast' + (bad ? ' bad' : ''); t.textContent = msg;
-    $('#toasts').appendChild(t); setTimeout(() => t.remove(), 2600);
+    const t = document.createElement('div'); t.className = 'toast' + (bad ? ' bad' : ''); t.setAttribute('role', bad ? 'alert' : 'status');
+    t.innerHTML = `<span class="tmark">${icon(bad ? 'x' : 'check')}</span><span>${esc(msg)}</span>`;
+    $('#toasts').appendChild(t);
+    setTimeout(() => { t.classList.add('out'); setTimeout(() => t.remove(), 260); }, 3000);
   }
-  // Stylish confirm popup. Resolves true / false.
-  function ask({ title, rows = [], note = '', ok = 'Confirm', cancel = 'Cancel', danger = false }) {
+  // BlockNexa popup: glass card, glowing animated edge, hexagon orb with a drawn icon. Resolves true / false.
+  // tone: '' (green-blue, default) | 'danger' (red) | 'info' (blue)
+  function ask({ title, rows = [], note = '', ok = 'Confirm', cancel = 'Cancel', danger = false, tone = '', icon: ic = '' }) {
     return new Promise(resolve => {
-      const m = $('#modal'), prev = document.activeElement;
-      m.innerHTML = `<div class="mcard" role="dialog" aria-modal="true"><div class="mic ${danger ? 'danger' : ''}">${icon(danger ? 'warn' : 'check')}</div><h3>${esc(title)}</h3>
+      const m = $('#modal'), prev = document.activeElement, t = danger ? 'danger' : tone;
+      m.innerHTML = `<div class="mcard ${t}" role="dialog" aria-modal="true" aria-labelledby="mtitle">
+        <div class="orb"><i class="hex r"></i><i class="hex r r2"></i><i class="hex"></i><i class="hex core"></i>${icon(ic || (t === 'danger' ? 'warn' : t === 'info' ? 'shield' : 'check'))}</div>
+        <h3 id="mtitle">${esc(title)}</h3>
         ${rows.length ? `<div class="kv">${rows.map(r => `<div><span>${esc(r[0])}</span><b>${esc(r[1])}</b></div>`).join('')}</div>` : ''}
         ${note ? `<p class="mnote">${esc(note)}</p>` : ''}
-        <div class="mbtns"><button class="btn ghost" id="mno">${esc(cancel)}</button><button class="btn ${danger ? 'danger' : ''}" id="myes">${esc(ok)}</button></div></div>`;
-      m.hidden = false;
+        <div class="mbtns"><button class="btn ghost" id="mno">${esc(cancel)}</button><button class="btn" id="myes">${esc(ok)}</button></div></div>`;
+      m.classList.remove('out'); m.hidden = false;
       const key = e => { if (e.key === 'Escape') done(false); };
-      const done = v => { m.hidden = true; document.removeEventListener('keydown', key); if (prev && prev.focus) prev.focus(); resolve(v); };
+      const done = v => { document.removeEventListener('keydown', key); m.classList.add('out'); setTimeout(() => { m.hidden = true; m.classList.remove('out'); }, 170); if (prev && prev.focus) prev.focus(); resolve(v); };
       document.addEventListener('keydown', key);
       $('#mno').onclick = () => done(false); $('#myes').onclick = () => done(true); m.onclick = e => { if (e.target === m) done(false); };
       $('#myes').focus();
@@ -68,13 +75,15 @@
 // (This list matches backend/server.js. If a request answers 401 after login, the app returns to the login screen.)
 //
 // API CONTRACT (what the real backend must provide), all JSON under /api/v2:
-//   GET  /me                        -> { uid, email?, phone? }        401 if logged out
+//   GET  /me                        -> { uid, email?, phone?, hasPassword }        401 if logged out
 //   POST /auth/logout
 //   POST /auth/google      {credential}                 -> user
 //   POST /auth/otp/request {phone, mode}   mode = 'register' | 'login'  -> { status:'sent' }
 //        errors: 409 "This number is already registered. Please log in."  /  404 "No account found for this number. Please register first."
 //                400 "We could not reach this number on Telegram. Check that it has a Telegram account."
-//   POST /auth/otp/verify  {phone, code, mode}          -> user   (mode 'register' creates the account)
+//   POST /auth/otp/verify  {phone, code, mode, password?}   -> user   (mode 'register' needs a password of 8+ characters and creates the account)
+//   POST /auth/login/password {phone, password}             -> user   (no code needed)
+//   POST /account/password {current?, next}                 -> { ok }  (current is not needed right after a Telegram-code login)
 //   GET  /rates   (public)          -> { buy, sell, minBuyUsdt, maxBuyInr, minSellUsdt, minWithdraw, googleClientId }
 //   GET  /balance                   -> { usdt }
 //   GET  /history/:type             -> buy | sell | withdraw | all   (each item: id, status, at, usdt, inr?, address?, reason?)
@@ -97,7 +106,9 @@
     logout: () => req('POST', '/auth/logout'),
     google: credential => req('POST', '/auth/google', { credential }),
     otpRequest: (phone, mode) => req('POST', '/auth/otp/request', { phone, mode }),
-    otpVerify: (phone, code, mode) => req('POST', '/auth/otp/verify', { phone, code, mode }),
+    otpVerify: (phone, code, mode, password) => req('POST', '/auth/otp/verify', { phone, code, mode, password }),
+    loginPassword: (phone, password) => req('POST', '/auth/login/password', { phone, password }),
+    setPassword: b => req('POST', '/account/password', b),
     rates: () => req('GET', '/rates'), balance: () => req('GET', '/balance'), history: t => req('GET', '/history/' + t),
     buyCreate: inr => req('POST', '/buy', { inr }), buyPaid: (id, utr) => req('POST', `/buy/${id}/paid`, { utr }),
     sellCreate: b => req('POST', '/sell', b), withdraw: b => req('POST', '/withdraw', { chain: 'bsc', ...b }), deposit: () => req('GET', '/deposit')
@@ -109,63 +120,100 @@
    SECTION 3  LOGIN / REGISTER
    Phone number + Telegram code, or Google
    ============================================================ */
-// Register / Login screen: phone number + one-time code sent to the user's Telegram, or Google.
 (function () {
-  const BN = window.BN, { icon, esc, $, GOOGLE, tg } = BN.ui;
+  const BN = window.BN, { icon, esc, $, tg, toast, GOOGLE } = BN.ui;
   function render(root, done) {
-    let mode = 'login', phone = '', timer = null;
+    let phone = '', regPw = '', timer = null;
     const brand = `<div class="brand"><span class="mark">${icon('cube')}</span>${esc(BN.cfg.NAME)}</div>`;
     const set = h => { root.innerHTML = `<div class="acard">${brand}${h}</div>`; };
-    const err = m => { const e = $('#aerr', root); if (e) e.textContent = m || ''; };
+    const err = m => { const e = $('#aerr', root); if (e) { e.textContent = ''; void e.offsetWidth; e.textContent = m || ''; } };
     const busy = (b, on, label) => { b.disabled = on; b.innerHTML = on ? 'Please wait…' : label; };
     const fail = e => err(e.message || 'Something went wrong. Please try again.');
+    const phoneField = '<label class="field"><span class="pre">+91</span><input id="num" class="sm" type="tel" inputmode="numeric" maxlength="10" placeholder="10-digit mobile number" autocomplete="tel-national" aria-label="Mobile number"></label>';
+    const pwField = (id, ph, ac) => `<label class="field"><input id="${id}" class="sm" type="password" placeholder="${ph}" autocomplete="${ac}" aria-label="${ph}"><button type="button" class="eye" data-eye="${id}" aria-label="Show password">${icon('eye')}</button></label>`;
+    const wire = () => {
+      root.querySelectorAll('[data-eye]').forEach(b => b.onclick = () => { const i = $('#' + b.dataset.eye, root); i.type = i.type === 'password' ? 'text' : 'password'; b.classList.toggle('on', i.type === 'text'); });
+      const n = $('#num', root); if (n) n.oninput = e => { e.target.value = e.target.value.replace(/\D/g, ''); };
+    };
+    const validPhone = () => { const n = $('#num', root).value; if (!/^[6-9]\d{9}$/.test(n)) { err('Enter a valid 10-digit Indian mobile number.'); return null; } return '+91' + n; };
+    const onEnter = (sel, btn) => { const el = $(sel, root); if (el) el.onkeydown = e => { if (e.key === 'Enter') $(btn, root).click(); }; };
 
     function choose() {
-      set(`<h1>Welcome to ${esc(BN.cfg.NAME)}</h1><p class="mut sub">Create your account or log in. Your code arrives on Telegram.</p>
+      set(`<h1>Welcome to ${esc(BN.cfg.NAME)}</h1><p class="mut sub">Create your account or log in.</p>
         <button class="btn" id="reg" style="margin-top:0">Register your account</button>
         <button class="btn ghost" id="log">Login to your account</button>
         <div class="or"><span>or</span></div><div id="gslot"></div>
         <p class="err" id="aerr" role="alert"></p>
         <p class="fine">By continuing you agree to the terms of service.</p>
         <p class="fine" style="margin-top:8px">Need help? <a class="link" style="padding:0" href="${esc(tg(BN.cfg.SUPPORT_TELEGRAM))}" target="_blank" rel="noopener">Telegram support</a></p>`);
-      $('#reg', root).onclick = () => enterPhone('register');
-      $('#log', root).onclick = () => enterPhone('login');
+      $('#reg', root).onclick = registerForm; $('#log', root).onclick = loginForm;
       initGoogle($('#gslot', root));
     }
+    // Our own good-looking button on top; Google's real (invisible) button sits above it so the click is handled by Google.
     async function initGoogle(slot) {
       let id = ''; try { id = (await BN.api.rates()).googleClientId || ''; } catch (e) {}
-      if (!id) { slot.innerHTML = '<p class="mut" style="text-align:center">Google sign-in is not set up yet.</p>'; return; }
+      if (!id) { slot.hidden = true; if (slot.previousElementSibling) slot.previousElementSibling.hidden = true; return; }
+      slot.innerHTML = `<div class="gwrap"><div class="gface">${GOOGLE}<span>Continue with Google</span></div><div class="gover" id="gover"></div></div>`;
       const s = document.createElement('script'); s.src = 'https://accounts.google.com/gsi/client'; s.async = true;
       s.onload = () => {
+        if (!window.google || !google.accounts) return;
         google.accounts.id.initialize({ client_id: id, callback: r => BN.api.google(r.credential).then(done, fail) });
-        google.accounts.id.renderButton(slot, { theme: 'filled_black', size: 'large', shape: 'pill', text: 'continue_with', width: Math.min(340, innerWidth - 100) });
+        google.accounts.id.renderButton($('#gover', root), { theme: 'filled_black', size: 'large', shape: 'pill', text: 'continue_with', width: Math.min(400, Math.max(200, $('.gwrap', root).clientWidth)) });
       };
+      s.onerror = () => { const w = $('.gwrap', root); if (w) w.onclick = () => toast('Google sign-in could not load. Check your connection or any ad blocker.', true); };
       document.head.appendChild(s);
     }
-    function enterPhone(m) {
-      mode = m; const reg = m === 'register';
-      set(`<h1>${reg ? 'Create your account' : 'Welcome back'}</h1>
-        <p class="mut sub">${reg ? 'Enter your mobile number. We send a code to your Telegram to verify it.' : 'Enter your registered mobile number. We send a code to your Telegram.'}</p>
-        <label class="field"><span class="pre">+91</span><input id="num" class="sm" type="tel" inputmode="numeric" maxlength="10" placeholder="10-digit mobile number" autocomplete="tel-national" aria-label="Mobile number"></label>
-        ${reg ? '<label class="chk"><input type="checkbox" id="tos"><span>I agree to the terms of service</span></label>' : ''}
+
+    function registerForm() {
+      set(`<h1>Create your account</h1><p class="mut sub">Your mobile number and a password. We confirm the number with a code on Telegram.</p>
+        ${phoneField}${pwField('pw', 'Choose a password (8+ characters)', 'new-password')}${pwField('pw2', 'Repeat the password', 'new-password')}
+        <label class="chk"><input type="checkbox" id="tos"><span>I agree to the terms of service</span></label>
         <p class="err" id="aerr" role="alert"></p>
-        <button class="btn" id="send">Send code on Telegram</button>
-        <button class="btn ghost" id="back">Back</button>
-        <button class="link" id="sw" style="display:block;margin:8px auto 0">${reg ? 'Already have an account? Log in' : 'New here? Register your account'}</button>`);
-      $('#num', root).oninput = e => { e.target.value = e.target.value.replace(/\D/g, ''); };
-      $('#num', root).onkeydown = e => { if (e.key === 'Enter') $('#send', root).click(); };
-      $('#back', root).onclick = choose;
-      $('#sw', root).onclick = () => enterPhone(reg ? 'login' : 'register');
+        <button class="btn" id="send">Send code on Telegram</button><button class="btn ghost" id="back">Back</button>
+        <button class="link" id="sw" style="display:block;margin:8px auto 0">Already have an account? Log in</button>`);
+      wire(); $('#back', root).onclick = choose; $('#sw', root).onclick = loginForm;
       $('#send', root).onclick = async e => {
-        const n = $('#num', root).value;
-        if (!/^[6-9]\d{9}$/.test(n)) return err('Enter a valid 10-digit Indian mobile number.');
-        if (reg && !$('#tos', root).checked) return err('Please agree to the terms of service to continue.');
-        phone = '+91' + n; busy(e.target, true);
-        try { await BN.api.otpRequest(phone, mode); otp(); }
+        const ph = validPhone(); if (!ph) return;
+        const pw = $('#pw', root).value;
+        if (pw.length < 8 || pw.length > 128) return err('Choose a password with at least 8 characters.');
+        if (pw !== $('#pw2', root).value) return err('The two passwords do not match.');
+        if (!$('#tos', root).checked) return err('Please agree to the terms of service to continue.');
+        phone = ph; regPw = pw; busy(e.target, true);
+        try { await BN.api.otpRequest(phone, 'register'); otp('register'); }
         catch (x) { fail(x); busy(e.target, false, 'Send code on Telegram'); }
       };
     }
-    function otp() {
+    function loginForm() {
+      set(`<h1>Welcome back</h1><p class="mut sub">Log in with your mobile number and password.</p>
+        ${phoneField}${pwField('pw', 'Your password', 'current-password')}
+        <p class="err" id="aerr" role="alert"></p>
+        <button class="btn" id="login">Log in</button>
+        <div class="two"><button class="link" id="viaCode">Log in with a Telegram code</button><button class="link" id="forgot">Forgot password?</button></div>
+        <button class="btn ghost" id="back" style="margin-top:6px">Back</button>
+        <button class="link" id="sw" style="display:block;margin:8px auto 0">New here? Register your account</button>`);
+      wire(); onEnter('#pw', '#login'); $('#back', root).onclick = choose; $('#sw', root).onclick = registerForm;
+      $('#viaCode', root).onclick = () => codeForm(false); $('#forgot', root).onclick = () => codeForm(true);
+      $('#login', root).onclick = async e => {
+        const ph = validPhone(); if (!ph) return;
+        const pw = $('#pw', root).value; if (!pw) return err('Enter your password.');
+        busy(e.target, true);
+        try { done(await BN.api.loginPassword(ph, pw)); } catch (x) { fail(x); busy(e.target, false, 'Log in'); }
+      };
+    }
+    function codeForm(forgot) {
+      set(`<h1>${forgot ? 'Reset your password' : 'Log in with a code'}</h1>
+        <p class="mut sub">${forgot ? 'We send a code to your Telegram. After you log in you can choose a new password.' : 'We send a 6-digit code to your Telegram.'}</p>
+        ${phoneField}<p class="err" id="aerr" role="alert"></p>
+        <button class="btn" id="send">Send code on Telegram</button><button class="btn ghost" id="back">Back</button>`);
+      wire(); onEnter('#num', '#send'); $('#back', root).onclick = loginForm;
+      $('#send', root).onclick = async e => {
+        const ph = validPhone(); if (!ph) return;
+        phone = ph; busy(e.target, true);
+        try { await BN.api.otpRequest(phone, 'login'); otp('login', forgot); }
+        catch (x) { fail(x); busy(e.target, false, 'Send code on Telegram'); }
+      };
+    }
+    function otp(mode, forgot) {
       let left = 30; const sender = BN.cfg.OTP_SENDER;
       set(`<h1>Enter the code</h1><p class="mut sub">We sent a 6-digit code to your Telegram for <b>${esc(phone)}</b>. Look for a message from <b>@${esc(sender)}</b>.</p>
         <label class="field"><input id="code" class="otp" type="text" inputmode="numeric" autocomplete="one-time-code" maxlength="6" placeholder="······" aria-label="6-digit code"></label>
@@ -178,7 +226,7 @@
       const submit = async () => {
         if (!/^\d{6}$/.test(code.value)) return err('Enter the 6-digit code.');
         busy(ver, true);
-        try { clearTimeout(timer); done(await BN.api.otpVerify(phone, code.value, mode)); }
+        try { clearTimeout(timer); done(await BN.api.otpVerify(phone, code.value, mode, mode === 'register' ? regPw : undefined), forgot ? { setPassword: true } : undefined); }
         catch (x) { fail(x); busy(ver, false, vlabel); code.select(); }
       };
       code.oninput = () => { code.value = code.value.replace(/\D/g, ''); if (code.value.length === 6) submit(); };
@@ -214,7 +262,7 @@
       <div class="rend"><b>${sign[x.kind]}${fmt(x.usdt)} USDT</b><span class="badge ${c}">${l}</span></div></div>`;
   }
   function done(root, title, text, rows, hist) {
-    screen(root, title, `<div class="card center"><div class="okmark">${icon('check')}</div><h3 style="font:700 20px var(--display)">${esc(text)}</h3>
+    screen(root, title, `<div class="card center"><div class="okmark">${icon('check')}${'<i class="pt"></i>'.repeat(8)}</div><h3 style="font:700 20px var(--display)">${esc(text)}</h3>
       <div class="kv" style="text-align:left">${rows.map(r => `<div><span>${esc(r[0])}</span><b>${esc(r[1])}</b></div>`).join('')}</div>
       <a class="btn" href="#/history/${hist}">View history</a><a class="btn ghost" href="#/home">Back to home</a></div>`);
   }
@@ -342,12 +390,29 @@
   function account(root) {
     const u = BN.app.user();
     screen(root, 'Account', `<div class="card"><div class="kv" style="margin-top:0"><div><span>Account</span><b>${esc(u.email || u.phone || '')}</b></div><div><span>User ID</span><b>${esc(u.uid)}</b></div></div>
+      <a class="btn ghost" href="#/password">${icon('lock')}${u.hasPassword ? 'Change password' : 'Set a password'}</a>
       <a class="btn ghost" href="#/support">${icon('help')}Contact support</a>
       <a class="btn ghost" href="${esc(tg(cfg.COMMUNITY_TELEGRAM))}" target="_blank" rel="noopener">${icon('users')}Join our community</a>
       <button class="btn danger" id="out">${icon('logout')}Log out</button></div>`);
     $('#out', root).onclick = () => BN.app.logout();
   }
-  BN.screens = { home, buy, sell, deposit, withdraw, history, support, account };
+  function password(root, arg) {
+    const u = BN.app.user(), forgot = arg === 'forgot', needCur = u.hasPassword && !forgot;
+    const fld = (id, ph, ac) => `<label class="field"><input id="${id}" class="sm" type="password" placeholder="${ph}" autocomplete="${ac}" aria-label="${ph}"><button type="button" class="eye" data-eye="${id}" aria-label="Show password">${icon('eye')}</button></label>`;
+    screen(root, u.hasPassword ? 'Change password' : 'Set a password', `<div class="card"><p class="mut">${forgot ? 'You proved your number with a Telegram code. Choose a new password. Next time you can log in without a code.' : u.hasPassword ? 'Your other devices will be logged out.' : 'With a password you can log in without waiting for a code.'}</p>
+      ${needCur ? fld('cur', 'Current password', 'current-password') : ''}${fld('nw', 'New password (8+ characters)', 'new-password')}${fld('nw2', 'Repeat the new password', 'new-password')}
+      <p class="err" id="err" role="alert"></p><button class="btn" id="save">Save password</button></div>`, forgot ? '#/home' : '#/account');
+    root.querySelectorAll('[data-eye]').forEach(b => b.onclick = () => { const i = $('#' + b.dataset.eye, root); i.type = i.type === 'password' ? 'text' : 'password'; b.classList.toggle('on', i.type === 'text'); });
+    $('#save', root).onclick = async e => {
+      const nw = $('#nw', root).value, err = $('#err', root); err.textContent = '';
+      if (nw.length < 8 || nw.length > 128) return err.textContent = 'Choose a password with at least 8 characters.';
+      if (nw !== $('#nw2', root).value) return err.textContent = 'The two passwords do not match.';
+      e.target.disabled = true;
+      try { await api().setPassword({ current: needCur ? $('#cur', root).value : undefined, next: nw }); u.hasPassword = true; toast('Password saved'); location.hash = '#/home'; }
+      catch (x) { err.textContent = msg(x); e.target.disabled = false; }
+    };
+  }
+  BN.screens = { home, buy, sell, deposit, withdraw, history, support, account, password };
 })();
 
 /* ============================================================
@@ -370,7 +435,7 @@
   }
   function showAuth() {
     user = null; app.hidden = true; auth.hidden = false;
-    BN.auth.render(auth, u => { user = u; auth.hidden = true; app.hidden = false; location.hash = '#/home'; route(); });
+    BN.auth.render(auth, (u, opts) => { user = u; auth.hidden = true; app.hidden = false; location.hash = opts && opts.setPassword ? '#/password/forgot' : '#/home'; route(); });
   }
   async function logout() { await BN.api.logout().catch(() => {}); showAuth(); }
   BN.app = { user: () => user, logout, expired: showAuth };

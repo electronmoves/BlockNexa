@@ -28,6 +28,7 @@ const CFG = {
   ADMIN_KEY: env('ADMIN_KEY') || crypto.randomBytes(18).toString('hex'),
   ADMIN_IPS: env('ADMIN_IPS').split(',').map(s => s.trim()).filter(Boolean),                // optional: only these IPs may use the admin panel
   APP_SECRET: env('APP_SECRET') || crypto.randomBytes(32).toString('hex'),
+  SESSION_DAYS: Math.max(7, num('SESSION_DAYS', 30)),                                       // how long a login lasts (never less than 7 days)
 };
 CFG.MIN_BUY_INR = Math.ceil(CFG.MIN_BUY_USDT * CFG.BUY_RATE);
 
@@ -59,6 +60,12 @@ CREATE INDEX IF NOT EXISTS idx_ledger_user ON ledger(user_id);
 CREATE TABLE IF NOT EXISTS audit(id INTEGER PRIMARY KEY AUTOINCREMENT, at INTEGER NOT NULL, action TEXT NOT NULL, target TEXT, details TEXT);
 `);
 
+{ // upgrade an older database: password column and the way each session was opened
+  const cols = t => db.prepare(`PRAGMA table_info(${t})`).all().map(c => c.name);
+  if (!cols('users').includes('password_hash')) db.exec('ALTER TABLE users ADD COLUMN password_hash TEXT');
+  if (!cols('sessions').includes('method')) db.exec('ALTER TABLE sessions ADD COLUMN method TEXT');
+}
+
 /* ============================ SECTION 3: HELPERS ============================ */
 const P = new Map(); const S = sql => { let s = P.get(sql); if (!s) { s = db.prepare(sql); P.set(sql, s); } return s; };
 const now = () => Date.now(), micro = x => Math.round(Number(x) * 1e6), usdt = m => m / 1e6, f2 = m => (m / 1e6).toFixed(2);
@@ -88,22 +95,32 @@ const limiter = (max, windowMs = 60000) => (req, res, next) => {
 };
 
 /* ===================== SECTION 4: LOGIN (Telegram code + Google) ===================== */
-const SESSION_MS = 30 * 24 * 3600 * 1000;
+const SESSION_MS = CFG.SESSION_DAYS * 24 * 3600 * 1000;     // a login lasts this long and is renewed while the user keeps coming back
 const cookieOf = (req, n) => (req.headers.cookie || '').split(';').map(c => c.trim().split('=')).find(c => c[0] === n)?.[1];
-const cookie = (req, token, ms) => `bn_session=${token}; HttpOnly; SameSite=Lax; Path=/; Max-Age=${Math.floor(ms / 1000)}${req.secure ? '; Secure' : ''}`;
-function startSession(req, res, userId) {
+const cookie = (req, token, ms) => `bn_session=${token}; HttpOnly; SameSite=Lax; Path=/; Max-Age=${Math.floor(ms / 1000)}; Expires=${new Date(now() + ms).toUTCString()}${req.secure ? '; Secure' : ''}`;
+function startSession(req, res, userId, method) {
   const token = crypto.randomBytes(32).toString('hex'), t = now();
   S('DELETE FROM sessions WHERE expires_at<=?').run(t);
-  S('INSERT INTO sessions(token_hash,user_id,created_at,expires_at) VALUES(?,?,?,?)').run(sha(token), userId, t, t + SESSION_MS);   // only a hash is stored
+  S('INSERT INTO sessions(token_hash,user_id,created_at,expires_at,method) VALUES(?,?,?,?,?)').run(sha(token), userId, t, t + SESSION_MS, method);   // only a hash is stored
   res.append('Set-Cookie', cookie(req, token, SESSION_MS));
 }
 const requireAuth = (req, res, next) => {
-  const tok = cookieOf(req, 'bn_session'), u = tok && S('SELECT u.* FROM sessions s JOIN users u ON u.id=s.user_id WHERE s.token_hash=? AND s.expires_at>?').get(sha(tok), now());
+  const tok = cookieOf(req, 'bn_session'), t = now();
+  const u = tok && S('SELECT u.*, s.method AS s_method, s.created_at AS s_created, s.expires_at AS s_expires, s.token_hash AS s_hash FROM sessions s JOIN users u ON u.id=s.user_id WHERE s.token_hash=? AND s.expires_at>?').get(sha(tok), t);
   if (!u) return res.status(401).json({ error: 'Please log in.' });
+  if (u.s_expires - t < SESSION_MS / 2) { S('UPDATE sessions SET expires_at=? WHERE token_hash=?').run(t + SESSION_MS, u.s_hash); res.append('Set-Cookie', cookie(req, tok, SESSION_MS)); }   // renew when half used
   req.user = u; next();
 };
-const me = u => ({ uid: u.uid, email: u.email || undefined, phone: u.phone || undefined });
-const createUser = f => S('SELECT * FROM users WHERE id=?').get(S('INSERT INTO users(uid,phone,email,google_sub,created_at) VALUES(?,?,?,?,?)').run(newUid(), f.phone || null, f.email || null, f.google_sub || null, now()).lastInsertRowid);
+const me = u => ({ uid: u.uid, email: u.email || undefined, phone: u.phone || undefined, hasPassword: !!u.password_hash });
+const createUser = f => S('SELECT * FROM users WHERE id=?').get(S('INSERT INTO users(uid,phone,email,google_sub,password_hash,created_at) VALUES(?,?,?,?,?,?)').run(newUid(), f.phone || null, f.email || null, f.google_sub || null, f.password_hash || null, now()).lastInsertRowid);
+const scrypt = require('util').promisify(crypto.scrypt);
+const hashPw = async pw => { const salt = crypto.randomBytes(16); return 'scrypt$' + salt.toString('hex') + '$' + (await scrypt(pw, salt, 64)).toString('hex'); };
+const checkPw = async (pw, stored) => {
+  const [, sl, h] = String(stored || '').split('$');
+  if (!sl || !h) { await scrypt(pw, Buffer.alloc(16), 64); return false; }                 // same work for unknown numbers, so timing gives nothing away
+  return same((await scrypt(pw, Buffer.from(sl, 'hex'), 64)).toString('hex'), h);
+};
+const pwOk = p => typeof p === 'string' && p.length >= 8 && p.length <= 128;
 
 // Sends the one-time code. "telegram" = from YOUR dedicated Telegram account (API ID + hash). "console" = prints it (local testing only).
 async function sendOtp(phone, code) {
@@ -138,19 +155,33 @@ V.post('/auth/otp/request', limiter(15), async (req, res) => {
   res.json({ status: 'sent' });
 });
 
-V.post('/auth/otp/verify', limiter(30), (req, res) => {
+V.post('/auth/otp/verify', limiter(30), async (req, res) => {
   const b = req.body || {}, phone = String(b.phone || ''), code = String(b.code || ''), mode = b.mode;
   const bad = msg => res.status(400).json({ error: msg || 'Invalid or expired code. Please request a new one.' });
   if (!/^\+91[6-9]\d{9}$/.test(phone) || !/^\d{6}$/.test(code) || (mode !== 'register' && mode !== 'login')) return bad();
+  if (mode === 'register' && !pwOk(b.password)) return res.status(400).json({ error: 'Choose a password with 8 to 128 characters.' });   // checked before the code is used up
   const r = S('SELECT * FROM otps WHERE phone=?').get(phone);
   if (!r || !r.code_hash || r.expires_at < now()) return bad();
   if (r.tries >= 3) { S('UPDATE otps SET code_hash=NULL WHERE phone=?').run(phone); return bad(); }          // 3 wrong guesses destroy the code
   if (!same(hmac(phone + ':' + code), r.code_hash)) { S('UPDATE otps SET tries=tries+1 WHERE phone=?').run(phone); return bad('Wrong code. Please try again.'); }
   S('UPDATE otps SET code_hash=NULL, expires_at=0 WHERE phone=?').run(phone);                              // a code works once
   let u = S('SELECT * FROM users WHERE phone=?').get(phone);
-  if (mode === 'register') { if (u) return res.status(409).json({ error: 'This number is already registered. Please log in.' }); u = createUser({ phone }); }
+  if (mode === 'register') { if (u) return res.status(409).json({ error: 'This number is already registered. Please log in.' }); u = createUser({ phone, password_hash: await hashPw(b.password) }); }
   else if (!u) return res.status(404).json({ error: 'No account found for this number. Please register first.' });
-  startSession(req, res, u.id); res.json(me(u));
+  startSession(req, res, u.id, 'otp'); res.json(me(u));
+});
+
+// ---- Log in with phone + password (no code needed)
+const pwFails = new Map(); setInterval(() => pwFails.clear(), 900000).unref();
+V.post('/auth/login/password', limiter(30), async (req, res) => {
+  const b = req.body || {}, phone = String(b.phone || ''), pw = String(b.password || '').slice(0, 200);
+  const bad = () => res.status(401).json({ error: 'Wrong number or password. You can also log in with a Telegram code.' });
+  if (!/^\+91[6-9]\d{9}$/.test(phone)) return bad();
+  const t = now(), f = (pwFails.get(phone) || []).filter(x => t - x < 900000); pwFails.set(phone, f);
+  if (f.length >= 5) return res.status(429).json({ error: 'Too many wrong attempts. Wait 15 minutes, or log in with a Telegram code.' });
+  const u = S('SELECT * FROM users WHERE phone=?').get(phone);
+  if (!(await checkPw(pw, u && u.password_hash)) || !u) { f.push(t); return bad(); }
+  pwFails.delete(phone); startSession(req, res, u.id, 'password'); res.json(me(u));
 });
 
 // ---- Continue with Google: we check Google's signed token ourselves (signature, audience, expiry, verified email)
@@ -180,7 +211,7 @@ V.post('/auth/google', limiter(20), async (req, res) => {
   let u = S('SELECT * FROM users WHERE google_sub=?').get(g.sub) || S('SELECT * FROM users WHERE email=?').get(email);
   if (u && u.google_sub && u.google_sub !== g.sub) return fail();
   if (!u) u = createUser({ email, google_sub: g.sub }); else if (!u.google_sub) S('UPDATE users SET google_sub=? WHERE id=?').run(g.sub, u.id);
-  startSession(req, res, u.id); res.json(me(u));
+  startSession(req, res, u.id, 'google'); res.json(me(u));
 });
 V.post('/auth/logout', (req, res) => {
   const tok = cookieOf(req, 'bn_session'); if (tok) S('DELETE FROM sessions WHERE token_hash=?').run(sha(tok));
@@ -189,8 +220,17 @@ V.post('/auth/logout', (req, res) => {
 
 /* ============================ SECTION 5: USER API ============================ */
 V.get('/rates', (req, res) => res.json({ buy: CFG.BUY_RATE, sell: CFG.SELL_RATE, minBuyUsdt: CFG.MIN_BUY_USDT, maxBuyInr: CFG.MAX_BUY_INR, minSellUsdt: CFG.MIN_SELL_USDT, minWithdraw: CFG.MIN_WITHDRAW, googleClientId: CFG.GOOGLE_CLIENT_ID }));
-V.use(['/me', '/balance', '/history', '/buy', '/sell', '/withdraw', '/deposit'], requireAuth);
+V.use(['/me', '/account', '/balance', '/history', '/buy', '/sell', '/withdraw', '/deposit'], requireAuth);
 V.get('/me', (req, res) => res.json(me(req.user)));
+V.post('/account/password', limiter(10), async (req, res) => {
+  const b = req.body || {}, u = req.user, t = now(), cur = String(b.current || '').slice(0, 200);
+  if (!pwOk(b.next)) return res.status(400).json({ error: 'The new password must have 8 to 128 characters.' });
+  const freshCode = u.s_method === 'otp' && t - u.s_created < 600000;            // logged in with a Telegram code in the last 10 minutes (the "forgot password" path)
+  if (u.password_hash && !freshCode && !(await checkPw(cur, u.password_hash))) return res.status(400).json({ error: 'Your current password is wrong.' });
+  S('UPDATE users SET password_hash=? WHERE id=?').run(await hashPw(b.next), u.id);
+  S('DELETE FROM sessions WHERE user_id=? AND token_hash!=?').run(u.id, u.s_hash);   // every other device is logged out
+  res.json({ ok: true });
+});
 V.get('/balance', (req, res) => res.json({ usdt: usdt(balance(req.user.id)) }));
 V.get('/deposit', (req, res) => res.json(CFG.DEPOSIT_ADDRESS ? [{ short: 'BSC', name: 'BNB Smart Chain (BEP20)', address: CFG.DEPOSIT_ADDRESS }] : []));
 V.get('/history/:type', (req, res) => {
@@ -372,6 +412,7 @@ app.listen(CFG.PORT, err => {
   console.log(`BlockNexa running on http://localhost:${CFG.PORT}   (admin panel: /admin)`);
   console.log(`Database: ${DB_FILE}  (${c('SELECT COUNT(*) c FROM users')} users, ${c('SELECT COUNT(*) c FROM orders')} orders)`);
   console.log(`Buy ₹${CFG.BUY_RATE} (min ₹${CFG.MIN_BUY_INR}, max ₹${CFG.MAX_BUY_INR}) | Sell ₹${CFG.SELL_RATE} | min withdraw ${CFG.MIN_WITHDRAW} USDT`);
+  console.log(`Logins last ${CFG.SESSION_DAYS} days (renewed while people keep using the site)`);
   console.log(CFG.OTP_TRANSPORT === 'telegram' ? 'Login codes: sent from your Telegram account' : 'WARNING: login codes are only PRINTED here (OTP_TRANSPORT=console). Real users will not receive them. Set the Telegram values in .env.');
   console.log(CFG.GOOGLE_CLIENT_ID ? 'Google sign-in: ON' : 'Google sign-in: off (set GOOGLE_CLIENT_ID)');
   if (!CFG.UPI_ID) console.log('WARNING: UPI_ID is not set, so buying is switched off.');
