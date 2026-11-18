@@ -327,42 +327,11 @@
     };
   }
 
-  function downloadHistory(list, type) {
-    const columns = [
-      ['Request ID', x => x.id],
-      ['Type', x => KIND[x.kind]?.label || x.kind],
-      ['Status', x => ST[x.status]?.[1] || x.status],
-      ['Date', x => new Date(x.at).toISOString()],
-      ['USDT', x => Number(x.usdt).toFixed(6)],
-      ['INR', x => x.inr == null ? '' : Number(x.inr).toFixed(2)],
-      ['UPI ID', x => x.upi || ''],
-      ['Wallet address', x => x.address || ''],
-      ['Reason', x => x.reason || '']
-    ];
-    const cell = value => {
-      let text = String(value ?? '');
-      if (/^[\\s]*[=+@-]/.test(text)) text = "'" + text;
-      return '"' + text.replace(/"/g, '""') + '"';
-    };
-    const csv = [columns.map(([label]) => cell(label)).join(','), ...list.map(x => columns.map(([, get]) => cell(get(x))).join(','))].join('\\r\\n');
-    const blob = new Blob(['\\uFEFF', csv], { type: 'text/csv;charset=utf-8' });
-    const url = URL.createObjectURL(blob), link = document.createElement('a');
-    link.href = url;
-    link.download = `blocknexa-${type}-history-${new Date().toISOString().slice(0, 10)}.csv`;
-    document.body.appendChild(link);
-    link.click();
-    link.remove();
-    URL.revokeObjectURL(url);
-  }
-
   async function history(root, type) {
     const t = KIND[type] ? type : 'buy', names = { buy: 'Buy history', sell: 'Sell history', withdraw: 'Withdrawals' };
     screen(root, names[t], '<p class="empty">Loading…</p>');
     const list = await api().history(t);
-    const content = list.length ? list.map(row).join('') : '<p class="empty">Nothing here yet.</p>';
-    screen(root, names[t], `<button class="btn ghost" id="export-history" ${list.length ? '' : 'disabled'}>Download CSV</button>${content}`);
-    const exportButton = $('#export-history', root);
-    if (exportButton && list.length) exportButton.addEventListener('click', () => downloadHistory(list, t));
+    screen(root, names[t], list.length ? list.map(row).join('') : '<p class="empty">Nothing here yet.</p>');
   }
   function support(root) {
     screen(root, 'Contact support', `<div class="card"><p class="mut">Tell us what happened and share your order or request ID (for example #A7K2M9) so we can find it quickly.</p>
