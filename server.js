@@ -460,7 +460,7 @@ app.use('/admin', ipOk, express.static(ADMIN));
 app.get('/', (req, res) => res.sendFile(path.join(PUBLIC, 'blocknexa.html')));
 app.use(express.static(PUBLIC, { index: false }));      // (/admin is handled above, behind the optional IP lock)
 app.use((err, req, res, next) => res.status(400).json({ error: 'Bad request.' }));
-app.listen(CFG.PORT, err => {
+app.listen(CFG.PORT, '0.0.0.0', err => {
   if (err) { console.error(err.code === 'EADDRINUSE' ? `PORT ${CFG.PORT} IS ALREADY IN USE. Close the other server and try again.` : err); process.exit(1); }
   const c = q => S(q).get().c;
   console.log(`BlockNexa running on http://localhost:${CFG.PORT}   (admin panel: /admin)`);
