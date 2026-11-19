@@ -306,7 +306,8 @@ app.use('/api/v2', V);
 
 /* ============================ SECTION 6: ADMIN API ============================ */
 const A = express.Router();
-const ipOk = (req, res, next) => (CFG.ADMIN_IPS.length && !CFG.ADMIN_IPS.includes(req.ip)) ? res.sendStatus(404) : next();
+const cleanIp = ip => String(ip || '').replace(/^::ffff:/, '');
+const ipOk = (req, res, next) => (CFG.ADMIN_IPS.length && !CFG.ADMIN_IPS.map(cleanIp).includes(cleanIp(req.ip))) ? res.sendStatus(404) : next();
 const keyFails = new Map(); setInterval(() => keyFails.clear(), 900000).unref();
 const adminAuth = (req, res, next) => {
   if ((keyFails.get(req.ip) || 0) >= 10) return res.status(429).json({ error: 'Too many wrong keys. Try again in 15 minutes.' });
@@ -406,15 +407,19 @@ A.get('/backup', async (req, res) => {                                         /
   catch { fs.unlink(tmp, () => {}); res.status(500).json({ error: 'Backup failed.' }); }
 });
 
-// All users list (for Userbase tab)
+// All users list (for Userbase tab). ?q= searches user ID, email and phone; ?page= pages through 50 at a time.
 A.get('/users', (req, res) => {
   const page = Math.max(0, parseInt(req.query.page) || 0);
   const limit = 50;
-  const rows = S('SELECT * FROM users ORDER BY id DESC LIMIT ? OFFSET ?').all(limit, page * limit);
-  const total = S('SELECT COUNT(*) c FROM users').get().c;
+  const q = String(req.query.q || '').trim().slice(0, 80).toLowerCase().replace(/[%_\\]/g, '');
+  const where = q ? "WHERE LOWER(uid) LIKE ? OR LOWER(COALESCE(email,'')) LIKE ? OR COALESCE(phone,'') LIKE ?" : '';
+  const args = q ? Array(3).fill('%' + q + '%') : [];
+  const rows = S(`SELECT * FROM users ${where} ORDER BY id DESC LIMIT ? OFFSET ?`).all(...args, limit, page * limit);
+  const total = S(`SELECT COUNT(*) c FROM users ${where}`).get(...args).c;
   res.json({
     total,
     page,
+    q,
     users: rows.map(u => ({
       uid: u.uid,
       email: u.email || null,
@@ -455,9 +460,9 @@ app.use('/api/admin', A);
 
 /* ================================= SECTION 7: START ================================= */
 const PUBLIC = path.join(__dirname, 'public'), ADMIN = path.join(PUBLIC, 'admin');   // the site is public/, the admin panel is public/admin/
-app.get('/admin', ipOk, (req, res) => res.redirect('/admin/bn-admin.html'));
+app.get(['/admin', '/admin/'], ipOk, (req, res) => res.redirect('/admin/bn-admin.html'));
 app.use('/admin', ipOk, express.static(ADMIN));
-app.get('/', (req, res) => res.sendFile(path.join(PUBLIC, 'blocknexa.html')));
+app.get('/', (req, res) => res.sendFile('blocknexa.html', { root: PUBLIC }));   // root: works even if the project folder path has a dot-folder in it
 app.use(express.static(PUBLIC, { index: false }));      // (/admin is handled above, behind the optional IP lock)
 app.use((err, req, res, next) => res.status(400).json({ error: 'Bad request.' }));
 app.listen(CFG.PORT, err => {

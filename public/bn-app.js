@@ -24,7 +24,17 @@
     eye: 'M2 12s4-7 10-7 10 7 10 7-4 7-10 7S2 12 2 12zM12 15a3 3 0 100-6 3 3 0 000 6z', lock: 'M7 11V8a5 5 0 0110 0v3M5 11h14v9H5z',
     shield: 'M12 3l8 3v6c0 5-3.5 8-8 9-4.5-1-8-4-8-9V6z', cube: 'M12 3l8 4.5v9L12 21l-8-4.5v-9L12 3zM12 12l8-4.5M12 12v9M12 12L4 7.5', mail: 'M4 6h16v12H4zM4 7l8 6 8-6', users: 'M16 11a3 3 0 100-6 3 3 0 000 6zM8 11a3 3 0 100-6 3 3 0 000 6zM2 20a6 6 0 0112 0M14 20a6 6 0 018 0', help: 'M12 17h.01M9.1 9a3 3 0 115.2 2c-.8.8-2.3 1.2-2.3 3M12 21a9 9 0 100-18 9 9 0 000 18z', logout: 'M9 4H5a1 1 0 00-1 1v14a1 1 0 001 1h4M16 8l4 4-4 4M20 12H9', clock: 'M12 7v5l3 2M12 21a9 9 0 100-18 9 9 0 000 18z'
   };
-  const icon = (n, c = '') => `<svg class="ic ${c}" viewBox="0 0 24 24" aria-hidden="true"><path pathLength="100" d="${P[n]}"/></svg>`;
+  // every icon gets an i-<name> class, so the CSS can nudge it the way its action goes (buy down, sell up, withdraw right...)
+  const icon = (n, c = '') => `<svg class="ic i-${n} ${c}" viewBox="0 0 24 24" aria-hidden="true"><path pathLength="100" d="${P[n]}"/></svg>`;
+  // Hexagon press: a small hexagon spreads from the exact point a button is pressed. One listener for the whole app.
+  document.addEventListener('pointerdown', e => {
+    const b = e.target.closest('.btn, .chips button');
+    if (!b || b.disabled || matchMedia('(prefers-reduced-motion: reduce)').matches) return;
+    const r = b.getBoundingClientRect(), h = document.createElement('span');
+    h.className = 'hexrip'; h.style.left = (e.clientX - r.left) + 'px'; h.style.top = (e.clientY - r.top) + 'px';
+    b.appendChild(h); setTimeout(() => h.remove(), 650);
+  });
+  const LOCKS = '<i class="lock tl"></i><i class="lock br"></i>';   // the two corner brackets used by the popup and the toast
   const esc = s => String(s ?? '').replace(/[&<>"']/g, c => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' }[c]));
   const fmt = (n, d = 2) => Number(n).toLocaleString('en-IN', { minimumFractionDigits: d, maximumFractionDigits: d });
   const when = t => new Date(t).toLocaleString('en-IN', { day: 'numeric', month: 'short', hour: 'numeric', minute: '2-digit' });
@@ -34,7 +44,7 @@
   // Notification capsule: slides in from the top, hexagon badge, a thin line shows how long it stays.
   function toast(msg, bad) {
     const t = document.createElement('div'); t.className = 'toast' + (bad ? ' bad' : ''); t.setAttribute('role', bad ? 'alert' : 'status');
-    t.innerHTML = `<span class="tmark">${icon(bad ? 'x' : 'check')}</span><span>${esc(msg)}</span>`;
+    t.innerHTML = `${LOCKS}<span class="tmark">${icon(bad ? 'x' : 'check')}</span><span>${esc(msg)}</span>`;
     $('#toasts').appendChild(t);
     setTimeout(() => { t.classList.add('out'); setTimeout(() => t.remove(), 260); }, 3000);
   }
@@ -43,7 +53,7 @@
   function ask({ title, rows = [], note = '', ok = 'Confirm', cancel = 'Cancel', danger = false, tone = '', icon: ic = '' }) {
     return new Promise(resolve => {
       const m = $('#modal'), prev = document.activeElement, t = danger ? 'danger' : tone;
-      m.innerHTML = `<div class="mcard ${t}" role="dialog" aria-modal="true" aria-labelledby="mtitle">
+      m.innerHTML = `<div class="mcard ${t}" role="dialog" aria-modal="true" aria-labelledby="mtitle">${LOCKS}
         <div class="orb"><i class="hex r"></i><i class="hex r r2"></i><i class="hex"></i><i class="hex core"></i>${icon(ic || (t === 'danger' ? 'warn' : t === 'info' ? 'shield' : 'check'))}</div>
         <h3 id="mtitle">${esc(title)}</h3>
         ${rows.length ? `<div class="kv">${rows.map(r => `<div><span>${esc(r[0])}</span><b>${esc(r[1])}</b></div>`).join('')}</div>` : ''}
@@ -254,10 +264,10 @@
   function screen(root, title, body, back = '#/home') {
     root.innerHTML = `<div class="wrap"><div class="narrow"><div class="top"><a class="iconbtn" href="${back}" aria-label="Back">${icon('back')}</a><h2 class="ttl">${title}</h2><span style="width:42px"></span></div>${body}</div></div>`;
   }
-  function row(x) {
+  function row(x, i = 0) {
     const k = KIND[x.kind], [c, l] = ST[x.status];
     const detail = x.kind === 'buy' ? `₹${fmt(x.inr)} paid` : x.kind === 'sell' ? `₹${fmt(x.inr)} to your UPI` : `to ${short(x.address)}`;
-    return `<div class="row"><span class="rico ${k.tone}">${icon(k.ic)}</span><div class="rmid"><b>${k.label} <small>#${esc(x.id)}</small></b>
+    return `<div class="row" style="--i:${Math.min(i, 10)}"><span class="rico ${k.tone}">${icon(k.ic)}</span><div class="rmid"><b>${k.label} <small>#${esc(x.id)}</small></b>
       <small>${when(x.at)} · ${detail}</small>${x.reason ? `<small class="why">Reason: ${esc(x.reason)}</small>` : ''}</div>
       <div class="rend"><b>${sign[x.kind]}${fmt(x.usdt)} USDT</b><span class="badge ${c}">${l}</span></div></div>`;
   }
@@ -269,22 +279,26 @@
 
   async function home(root) {
     const [bal, rt, rec] = await Promise.all([api().balance(), api().rates(), api().history('all')]);
-    const q = (h, c, i, t) => `<a href="${h}" class="q ${c}"><span>${icon(i)}</span>${t}</a>`;
-    const tile = (t, i, tone, n, s) => `<a class="tile" href="#/history/${t}"><span class="rico ${tone}">${icon(i)}</span><b>${n}</b><small>${s}</small></a>`;
+    const q = (h, c, i, t) => `<a href="${h}" class="q ${c}"><span class="lk">${icon(i)}</span>${t}</a>`;
+    const tile = (t, i, tone, n, s) => `<a class="tile lk tn-${tone}" href="#/history/${t}"><span class="rico ${tone}">${icon(i)}</span><b>${n}</b><small>${s}</small></a>`;
+    const [whole, dec] = fmt(bal.usdt).split('.');
+    const blocks = Array.from({ length: 8 }, (_, n) => `<i style="--n:${n}"></i>`).join('');
     root.innerHTML = `<div class="wrap">
       <div class="top"><div class="brand"><span class="mark">${icon('cube')}</span>${esc(cfg.NAME)}</div>
         <div style="display:flex;gap:10px;align-items:center"><span class="pill"><i class="dot"></i>Sell <b class="flash">₹${+rt.sell}</b> · Buy <b>₹${+rt.buy}</b></span>
         <a class="iconbtn" href="#/account" aria-label="Account">${icon('user')}</a></div></div>
       <div class="home"><section>
-        <div class="wallet"><span class="lbl">Your balance</span><div class="big">${fmt(bal.usdt)}<small>USDT</small></div><span class="lbl">≈ ₹${fmt(bal.usdt * rt.sell)} at the sell rate</span></div>
+        <div class="wallet"><div class="wtop"><span class="lbl">Your balance</span><span class="chainpill"><i></i>USDT · BSC</span></div>
+          <div class="big">${whole}<span class="dec">.${dec}</span><small>USDT</small></div>
+          <div class="wfoot"><span class="lbl">≈ ₹${fmt(bal.usdt * rt.sell)} at the sell rate</span><span class="blocks" aria-hidden="true">${blocks}</span></div></div>
         <div class="quick">${q('#/buy', 'g', 'buy', 'Buy')}${q('#/sell', 'b', 'sell', 'Sell')}${q('#/deposit', '', 'dep', 'Deposit')}${q('#/withdraw', '', 'wd', 'Withdraw')}</div>
-        <a href="#/sell" class="ratecard"><div><span class="live"><i class="dot"></i>Live rate</span><h3>Sell your USDT for INR</h3><p>Paid in INR straight to your UPI ID</p></div>
+        <a href="#/sell" class="ratecard lk tn-g"><div><span class="live"><i class="dot"></i>Live rate</span><h3>Sell your USDT for INR</h3><p>Paid in INR straight to your UPI ID</p></div>
           <div class="rt"><b class="flash">₹${+rt.sell}</b><small>per USDT</small></div></a>
       </section><section>
         <h3 class="sec">Records &amp; community</h3>
-        <div class="tiles">${tile('buy', 'buy', 'g', 'Buy history', 'INR → USDT')}${tile('sell', 'sell', 'b', 'Sell history', 'USDT → INR')}${tile('withdraw', 'wd', 'l', 'Withdrawals', 'USDT → wallet')}<a class="tile" href="${esc(tg(cfg.COMMUNITY_TELEGRAM))}" target="_blank" rel="noopener"><span class="rico t">${icon('users')}</span><b>Join community</b><small>Telegram</small></a></div>
+        <div class="tiles">${tile('buy', 'buy', 'g', 'Buy history', 'INR → USDT')}${tile('sell', 'sell', 'b', 'Sell history', 'USDT → INR')}${tile('withdraw', 'wd', 'l', 'Withdrawals', 'USDT → wallet')}<a class="tile lk tn-t" href="${esc(tg(cfg.COMMUNITY_TELEGRAM))}" target="_blank" rel="noopener"><span class="rico t">${icon('users')}</span><b>Join community</b><small>Telegram</small></a></div>
         <h3 class="sec">Recent activity</h3><div>${rec.length ? rec.map(row).join('') : '<p class="empty">No activity yet.</p>'}</div>
-        <a class="row" href="#/support" style="margin-top:0"><span class="rico t">${icon('help')}</span><div class="rmid"><b>Need help?</b><small>Contact support</small></div></a>
+        <a class="row lk tn-t" href="#/support" style="margin-top:0"><span class="rico t">${icon('help')}</span><div class="rmid"><b>Need help?</b><small>Contact support</small></div></a>
       </section></div></div>`;
   }
 

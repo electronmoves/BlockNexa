@@ -167,62 +167,81 @@
     if (order) { if ($('#ok', m)) $('#ok', m).onclick = () => changeStatus(order, 'success'); if ($('#bad', m)) $('#bad', m).onclick = () => changeStatus(order, 'failed'); }
   }
   // ---------- userbase ----------
-  let ubPage = 0;
-  async function userbase(page) {
-    ubPage = page || 0;
+  // The search box and frame are drawn once; typing only redraws the table, so the box keeps focus.
+  let ubPage = 0, ubQ = '', ubSeq = 0, ubTimer = null;
+  function userbase(page) {
+    ubPage = 0; ubQ = '';
+    $('#main').innerHTML = `
+      <div class="card ub">
+        <div class="head"><div><h2>Userbase</h2><small id="ubCount">Loading…</small></div></div>
+        <label class="ub-search">
+          <svg viewBox="0 0 24 24" aria-hidden="true"><path d="M11 18a7 7 0 100-14 7 7 0 000 14zM20 20l-4-4"/></svg>
+          <input id="ubQ" type="search" placeholder="Search by user ID, phone or email" autocomplete="off" spellcheck="false" aria-label="Search users">
+          <kbd id="ubClear" hidden>Esc</kbd>
+        </label>
+        <div class="ub-wrap"><table class="ub-table">
+          <thead><tr><th>User ID</th><th>Email / Phone</th><th>Joined</th><th>Status</th><th>Action</th></tr></thead>
+          <tbody id="ubBody"></tbody></table></div>
+        <div class="ub-pages" id="ubPages"></div>
+      </div>`;
+    const box = $('#ubQ');
+    box.oninput = () => { clearTimeout(ubTimer); $('#ubClear').hidden = !box.value; ubTimer = setTimeout(() => loadUsers(0, box.value.trim()), 250); };
+    box.onkeydown = e => {
+      if (e.key === 'Enter') { clearTimeout(ubTimer); loadUsers(0, box.value.trim()); }
+      if (e.key === 'Escape' && box.value) { e.stopPropagation(); box.value = ''; box.oninput(); }
+    };
+    $('#ubClear').onclick = () => { box.value = ''; box.oninput(); box.focus(); };
+    box.focus();
+    return loadUsers(page || 0, '');
+  }
+  const mark = (s, q) => { const t = esc(s); if (!q) return t; const i = String(s).toLowerCase().indexOf(q.toLowerCase()); return i < 0 ? t : esc(String(s).slice(0, i)) + '<mark>' + esc(String(s).slice(i, i + q.length)) + '</mark>' + esc(String(s).slice(i + q.length)); };
+  async function loadUsers(page, q) {
+    const seq = ++ubSeq; ubPage = page; ubQ = q;
+    const body = $('#ubBody'); if (!body) return;
+    body.classList.add('busy');
     try {
-      const d = await api('/users?page=' + ubPage);
-      const totalPages = Math.ceil(d.total / 50);
-      const rows = d.users.map(u => `
-        <tr>
-          <td><button class="uid-link" data-uid="${esc(u.uid)}">${esc(u.uid)}</button></td>
-          <td>${esc(u.email || u.phone || '—')}</td>
+      const d = await api('/users?page=' + page + '&q=' + encodeURIComponent(q));
+      if (seq !== ubSeq || !$('#ubBody')) return;                     // an older, slower answer: ignore it
+      const totalPages = Math.max(1, Math.ceil(d.total / 50));
+      body.innerHTML = d.users.map((u, i) => `
+        <tr style="--i:${Math.min(i, 12)}">
+          <td><button class="uid-link" data-uid="${esc(u.uid)}">${mark(u.uid, q)}</button></td>
+          <td>${u.email || u.phone ? mark(u.email || u.phone, q) : '—'}</td>
           <td>${day(u.createdAt)}</td>
           <td>${u.deactivated
-            ? `<span class="deact-badge">Deactivated</span>${u.deactivateReason ? '<br><small style="color:var(--error);margin-top:4px;display:block">' + esc(u.deactivateReason) + '</small>' : ''}`
+            ? `<span class="deact-badge">Deactivated</span>${u.deactivateReason ? '<small class="ub-why">' + esc(u.deactivateReason) + '</small>' : ''}`
             : '<span class="active-badge">Active</span>'}</td>
-          <td>
-            ${u.deactivated
-              ? `<button class="btn ghost" style="padding:7px 12px;font-size:12px" data-reactivate="${esc(u.uid)}">Reactivate</button>`
-              : `<button class="btn danger" style="padding:7px 12px;font-size:12px" data-deactivate="${esc(u.uid)}">Deactivate</button>`}
-          </td>
-        </tr>`).join('');
-      $('#main').innerHTML = `
-        <div class="card">
-          <div class="head"><h2>Userbase</h2><small style="color:var(--text2)">${d.total} total users</small></div>
-          <div class="ub-wrap">
-            <table class="ub-table">
-              <thead><tr><th>User ID</th><th>Email / Phone</th><th>Joined</th><th>Status</th><th>Action</th></tr></thead>
-              <tbody>${rows || '<tr><td colspan="5" class="empty">No users yet.</td></tr>'}</tbody>
-            </table>
-          </div>
-          <div class="ub-pages">
-            ${ubPage > 0 ? '<button class="btn ghost" style="width:auto;padding:8px 16px" id="ubPrev">← Prev</button>' : ''}
-            <span style="color:var(--text2);font-size:13px">Page ${ubPage + 1} of ${Math.max(1, totalPages)}</span>
-            ${(ubPage + 1) < totalPages ? '<button class="btn ghost" style="width:auto;padding:8px 16px" id="ubNext">Next →</button>' : ''}
-          </div>
-        </div>`;
-      bind(); bindUserbase(d.users);
-    } catch(e) { toast(e.message, true); }
+          <td>${u.deactivated
+            ? `<button class="btn ghost ub-act" data-reactivate="${esc(u.uid)}">Reactivate</button>`
+            : `<button class="btn danger ub-act" data-deactivate="${esc(u.uid)}">Deactivate</button>`}</td>
+        </tr>`).join('') || `<tr><td colspan="5" class="empty">${q ? 'No users match “' + esc(q) + '”.' : 'No users yet.'}</td></tr>`;
+      $('#ubCount').textContent = q ? `${d.total} match${d.total === 1 ? '' : 'es'} for “${q}”` : `${d.total} total users`;
+      $('#ubPages').innerHTML = totalPages > 1 ? `
+        <button class="btn ghost" id="ubPrev" ${page > 0 ? '' : 'disabled'}>← Prev</button>
+        <span>Page ${page + 1} of ${totalPages}</span>
+        <button class="btn ghost" id="ubNext" ${page + 1 < totalPages ? '' : 'disabled'}>Next →</button>` : '';
+      bindUserbase();
+    } catch (e) { toast(e.message, true); }
+    finally { if (seq === ubSeq && body) body.classList.remove('busy'); }
   }
-  function bindUserbase(users) {
+  function bindUserbase() {
     const m = $('#main');
     m.querySelectorAll('[data-uid]').forEach(b => b.onclick = () => openUser(b.dataset.uid));
-    if ($('#ubPrev', m)) $('#ubPrev', m).onclick = () => userbase(ubPage - 1);
-    if ($('#ubNext', m)) $('#ubNext', m).onclick = () => userbase(ubPage + 1);
+    if ($('#ubPrev', m)) $('#ubPrev', m).onclick = () => loadUsers(ubPage - 1, ubQ);
+    if ($('#ubNext', m)) $('#ubNext', m).onclick = () => loadUsers(ubPage + 1, ubQ);
     m.querySelectorAll('[data-deactivate]').forEach(b => b.onclick = async () => {
       const uid = b.dataset.deactivate;
       const r = await ask({
         title: 'Deactivate account',
-        html: `<p>Deactivating <b>${esc(uid)}</b> will block this user from logging in. You can reactivate them anytime.</p>`,
+        html: `<p>Deactivating <b>${esc(uid)}</b> logs this user out everywhere and blocks every way of logging in. You can reactivate them anytime.</p>`,
         chips: ['Suspicious activity', 'Fraud detected', 'Policy violation', 'User request', 'Duplicate account'],
-        text: { placeholder: 'Reason for deactivation (required)', required: true },
+        text: { placeholder: 'Reason for deactivation (required, the user sees it)', required: true },
         ok: 'Deactivate account',
         danger: true
       });
       if (!r) return;
-      try { await api(`/user/${encodeURIComponent(uid)}/deactivate`, { method: 'POST', body: { reason: r.text } }); toast('Account deactivated'); userbase(ubPage); }
-      catch(e) { toast(e.message, true); }
+      try { await api(`/user/${encodeURIComponent(uid)}/deactivate`, { method: 'POST', body: { reason: r.text } }); toast('Account deactivated'); loadUsers(ubPage, ubQ); }
+      catch (e) { toast(e.message, true); }
     });
     m.querySelectorAll('[data-reactivate]').forEach(b => b.onclick = async () => {
       const uid = b.dataset.reactivate;
@@ -233,8 +252,8 @@
         ok: 'Reactivate'
       });
       if (!r) return;
-      try { await api(`/user/${encodeURIComponent(uid)}/reactivate`, { method: 'POST', body: { reason: r.text } }); toast('Account reactivated'); userbase(ubPage); }
-      catch(e) { toast(e.message, true); }
+      try { await api(`/user/${encodeURIComponent(uid)}/reactivate`, { method: 'POST', body: { reason: r.text } }); toast('Account reactivated'); loadUsers(ubPage, ubQ); }
+      catch (e) { toast(e.message, true); }
     });
   }
 
