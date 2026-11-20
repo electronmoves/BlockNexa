@@ -21,6 +21,7 @@ const CFG = {
   BUY_RATE: num('BUY_RATE', 102.5), SELL_RATE: num('SELL_RATE', 100),
   MIN_BUY_USDT: num('MIN_BUY_USDT', 5), MAX_BUY_INR: num('MAX_BUY_INR', 10000), MIN_SELL_USDT: num('MIN_SELL_USDT', 5), MIN_WITHDRAW: num('MIN_WITHDRAW', 5),
   UPI_ID: /^[\w.\-]{2,}@[\w.\-]{2,}$/.test(env('UPI_ID')) ? env('UPI_ID') : '', UPI_NAME: env('UPI_NAME', 'BlockNexa').slice(0, 40),
+  UPI_IDS: env('UPI_IDS', env('UPI_ID') || '123@upi,ishu@upi,example@upi').split(',').map(s => s.trim()).filter(s => /^[\w.\-]{2,}@[\w.\-]{2,}$/.test(s)),
   DEPOSIT_ADDRESS: /^0x[a-fA-F0-9]{40}$/.test(env('DEPOSIT_ADDRESS')) ? env('DEPOSIT_ADDRESS') : '',
   GOOGLE_CLIENT_ID: env('GOOGLE_CLIENT_ID').trim(),
   OTP_TRANSPORT: env('OTP_TRANSPORT', env('TELEGRAM_SESSION') ? 'telegram' : 'console'),   // telegram | console (console only prints the code, for local testing)
@@ -58,6 +59,7 @@ CREATE TABLE IF NOT EXISTS ledger(                      -- balance = SUM of this
   type TEXT NOT NULL, usdt_micro INTEGER NOT NULL, reason TEXT, admin TEXT, created_at INTEGER NOT NULL);
 CREATE INDEX IF NOT EXISTS idx_ledger_user ON ledger(user_id);
 CREATE TABLE IF NOT EXISTS audit(id INTEGER PRIMARY KEY AUTOINCREMENT, at INTEGER NOT NULL, action TEXT NOT NULL, target TEXT, details TEXT);
+CREATE TABLE IF NOT EXISTS upis(id INTEGER PRIMARY KEY AUTOINCREMENT, upi TEXT NOT NULL UNIQUE, active INTEGER NOT NULL DEFAULT 1, created_at INTEGER NOT NULL);
 `);
 
 { // upgrade an older database: password column and the way each session was opened
@@ -83,7 +85,20 @@ const addLedger = (userId, orderId, type, amt, reason, admin) => S('INSERT INTO 
 const audit = (action, target, details) => S('INSERT INTO audit(at,action,target,details) VALUES(?,?,?,?)').run(now(), action, target || null, JSON.stringify(details || {}));
 const reasonOf = b => { const r = String((b || {}).reason || '').trim().replace(/\s+/g, ' ').slice(0, 200); return r.length >= 3 ? r : ''; };
 const item = o => ({ id: o.public_id, kind: o.type, status: o.status, at: o.created_at, usdt: usdt(o.usdt_micro), inr: o.inr, address: o.address, upi: o.upi, reason: o.fail_reason });
-const upiLink = o => `upi://pay?pa=${CFG.UPI_ID}&pn=${encodeURIComponent(CFG.UPI_NAME)}&am=${Number(o.inr).toFixed(2)}&cu=INR&tn=${encodeURIComponent('BN ' + o.public_id)}`;
+const upiLink = o => `upi://pay?pa=${o.upi || CFG.UPI_ID}&pn=${encodeURIComponent(CFG.UPI_NAME)}&am=${Number(o.inr).toFixed(2)}&cu=INR&tn=${encodeURIComponent('BN ' + o.public_id)}`;
+{ // seed initial UPI pool and migrate any existing buy orders onto upis
+  const t = now();
+  for (const u of CFG.UPI_IDS) S('INSERT OR IGNORE INTO upis(upi,active,created_at) VALUES(?,1,?)').run(u, t);
+  if (CFG.UPI_ID) S("UPDATE orders SET upi=? WHERE type='buy' AND (upi IS NULL OR upi='')").run(CFG.UPI_ID);
+  for (const r of S("SELECT upi, MIN(created_at) AS first_at FROM orders WHERE type='buy' AND upi IS NOT NULL AND upi!='' GROUP BY upi").all()) {
+    S('INSERT OR IGNORE INTO upis(upi,active,created_at) VALUES(?,1,?)').run(r.upi, r.first_at || t);
+  }
+}
+const pickRandomUpi = () => {
+  const pool = S('SELECT upi FROM upis WHERE active=1').all().map(r => r.upi);
+  if (!pool.length) return CFG.UPI_ID || '';
+  return pool[crypto.randomInt(pool.length)];
+};
 
 const app = express();
 app.disable('x-powered-by');
@@ -249,13 +264,13 @@ V.get('/history/:type', (req, res) => {
 });
 
 V.post('/buy', limiter(20), (req, res) => {
-  const inr = Number((req.body || {}).inr);
-  if (!CFG.UPI_ID) return res.status(503).json({ error: 'Payments are not set up yet. Please contact support.' });
+  const inr = Number((req.body || {}).inr), upi = pickRandomUpi();
+  if (!upi) return res.status(503).json({ error: 'Payments are not set up yet. Please contact support.' });
   if (!Number.isInteger(inr) || inr < CFG.MIN_BUY_INR || inr > CFG.MAX_BUY_INR) return res.status(400).json({ error: `Enter a whole amount between ₹${CFG.MIN_BUY_INR} and ₹${CFG.MAX_BUY_INR}.` });
   if (S("SELECT COUNT(*) c FROM orders WHERE user_id=? AND type='buy' AND status='pending'").get(req.user.id).c >= 5) return res.status(429).json({ error: 'You already have 5 buy orders waiting. Finish or wait for them first.' });
   const pid = newOrderId(), t = now();
-  S("INSERT INTO orders(public_id,user_id,type,inr,rate,usdt_micro,created_at,updated_at) VALUES(?,?,'buy',?,?,?,?,?)").run(pid, req.user.id, inr, CFG.BUY_RATE, Math.round(inr * 1e6 / CFG.BUY_RATE), t, t);
-  res.status(201).json({ ...item(S('SELECT * FROM orders WHERE public_id=?').get(pid)), upi: CFG.UPI_ID });
+  S("INSERT INTO orders(public_id,user_id,type,inr,rate,usdt_micro,upi,created_at,updated_at) VALUES(?,?,'buy',?,?,?,?,?,?)").run(pid, req.user.id, inr, CFG.BUY_RATE, Math.round(inr * 1e6 / CFG.BUY_RATE), upi, t, t);
+  res.status(201).json({ ...item(S('SELECT * FROM orders WHERE public_id=?').get(pid)), upi });
 });
 V.post('/buy/:id/paid', limiter(20), (req, res) => {
   const o = S("SELECT * FROM orders WHERE public_id=? AND user_id=? AND type='buy'").get(String(req.params.id).toUpperCase(), req.user.id);
@@ -268,7 +283,7 @@ V.post('/buy/:id/paid', limiter(20), (req, res) => {
 });
 V.get('/buy/:id/qr.svg', async (req, res) => {
   const o = S("SELECT * FROM orders WHERE public_id=? AND user_id=? AND type='buy' AND status='pending'").get(String(req.params.id).toUpperCase(), req.user.id);
-  if (!o || !CFG.UPI_ID) return res.sendStatus(404);
+  if (!o || !(o.upi || CFG.UPI_ID)) return res.sendStatus(404);
   res.set({ 'Content-Type': 'image/svg+xml', 'Cache-Control': 'no-store' });
   res.send(await QRCode.toString(upiLink(o), { type: 'svg', margin: 2, errorCorrectionLevel: 'M' }));
 });
@@ -456,6 +471,57 @@ A.post('/user/:uid/reactivate', (req, res) => {
   res.json({ ok: true });
 });
 
+// ==================== UPI RANDOMNESS & TRANSACTION LOG ====================
+const upiSummary = u => {
+  const s = S("SELECT COALESCE(SUM(inr),0) AS totalInr, COALESCE(SUM(usdt_micro),0) AS totalUsdtMicro, COUNT(*) AS count, MAX(updated_at) AS lastAt FROM orders WHERE type='buy' AND status='success' AND upi=?").get(u.upi);
+  return { id: u.id, upi: u.upi, active: !!u.active, createdAt: u.created_at, totalCollected: Math.round((s.totalInr || 0) * 100) / 100, totalUsdt: usdt(s.totalUsdtMicro || 0), count: s.count || 0, lastAt: s.lastAt || null };
+};
+A.get('/upis', (req, res) => {
+  const upis = S('SELECT * FROM upis ORDER BY active DESC, id ASC').all().map(upiSummary);
+  res.json({
+    upis,
+    totalCollected: Math.round(upis.reduce((a, x) => a + x.totalCollected, 0) * 100) / 100,
+    totalCount: upis.reduce((a, x) => a + x.count, 0),
+  });
+});
+A.post('/upis', (req, res) => {
+  const upi = String((req.body || {}).upi || '').trim().toLowerCase();
+  if (!/^[\w.\-]{2,}@[\w.\-]{2,}$/.test(upi)) return res.status(400).json({ error: 'Enter a valid UPI ID, like name@upi.' });
+  if (S('SELECT 1 FROM upis WHERE LOWER(upi)=?').get(upi)) return res.status(409).json({ error: 'This UPI ID is already in the list.' });
+  S('INSERT INTO upis(upi,active,created_at) VALUES(?,1,?)').run(upi, now());
+  audit('upi_add', upi, {});
+  res.status(201).json(upiSummary(S('SELECT * FROM upis WHERE upi=?').get(upi)));
+});
+A.post('/upis/toggle', (req, res) => {
+  const upi = String((req.body || {}).upi || '').trim();
+  const row = S('SELECT * FROM upis WHERE upi=?').get(upi);
+  if (!row) return res.status(404).json({ error: 'UPI ID not found.' });
+  const next = row.active ? 0 : 1;
+  S('UPDATE upis SET active=? WHERE id=?').run(next, row.id);
+  audit(next ? 'upi_enable' : 'upi_pause', row.upi, {});
+  res.json(upiSummary(S('SELECT * FROM upis WHERE id=?').get(row.id)));
+});
+A.post('/upis/delete', (req, res) => {
+  const upi = String((req.body || {}).upi || '').trim();
+  const row = S('SELECT * FROM upis WHERE upi=?').get(upi);
+  if (!row) return res.status(404).json({ error: 'UPI ID not found.' });
+  S('DELETE FROM upis WHERE id=?').run(row.id);
+  audit('upi_remove', row.upi, {});
+  res.json({ ok: true });
+});
+A.get('/upis/logs', (req, res) => {
+  const upi = String(req.query.upi || '').trim();
+  const rows = upi
+    ? S("SELECT * FROM orders WHERE type='buy' AND status='success' AND upi=? ORDER BY updated_at DESC, id DESC LIMIT 300").all(upi)
+    : S("SELECT * FROM orders WHERE type='buy' AND status='success' ORDER BY updated_at DESC, id DESC LIMIT 300").all();
+  const meta = upi ? S('SELECT * FROM upis WHERE upi=?').get(upi) : null;
+  res.json({
+    upi: upi || null,
+    summary: meta ? upiSummary(meta) : null,
+    logs: rows.map(orderView),
+  });
+});
+
 app.use('/api/admin', A);
 
 /* ================================= SECTION 7: START ================================= */
@@ -474,7 +540,7 @@ app.listen(CFG.PORT, err => {
   console.log(`Logins last ${CFG.SESSION_DAYS} days (renewed while people keep using the site)`);
   console.log(CFG.OTP_TRANSPORT === 'telegram' ? 'Login codes: sent from your Telegram account' : 'WARNING: login codes are only PRINTED here (OTP_TRANSPORT=console). Real users will not receive them. Set the Telegram values in .env.');
   console.log(CFG.GOOGLE_CLIENT_ID ? 'Google sign-in: ON' : 'Google sign-in: off (set GOOGLE_CLIENT_ID)');
-  if (!CFG.UPI_ID) console.log('WARNING: UPI_ID is not set, so buying is switched off.');
+  if (!S('SELECT 1 FROM upis WHERE active=1').get()) console.log('WARNING: no active UPI IDs are set, so buying is switched off.');
   if (!CFG.DEPOSIT_ADDRESS) console.log('WARNING: DEPOSIT_ADDRESS is not set, so the deposit page is empty.');
   if (!process.env.ADMIN_KEY) console.log('WARNING: ADMIN_KEY is not set. Temporary admin key for this run:', CFG.ADMIN_KEY);
   if (process.env.RENDER && !process.env.DATA_DIR) console.log('WARNING: running on Render without DATA_DIR. The database is ERASED on every restart. Add a persistent disk.');

@@ -92,6 +92,18 @@ aside{display:grid;gap:14px}
 .deact-badge{display:inline-block;padding:3px 10px;border-radius:999px;font-size:11px;font-weight:700;background:rgba(248,113,113,.15);color:var(--error)}
 .active-badge{display:inline-block;padding:3px 10px;border-radius:999px;font-size:11px;font-weight:700;background:rgba(52,211,153,.15);color:var(--success)}
 .ub-pages{display:flex;gap:10px;align-items:center;justify-content:flex-end;margin-top:14px;font-size:13px;color:var(--text2)}.ub-pages .btn{padding:8px 14px}
+/* ===== Transaction log (UPI Randomness & Collection Control) ===== */
+.upi-add{display:flex;gap:8px;margin-top:14px;flex-wrap:wrap}.upi-add input{flex:1;min-width:220px}
+.upi-grid{display:grid;gap:14px;margin-top:16px}@media(min-width:720px){.upi-grid{grid-template-columns:repeat(auto-fill,minmax(320px,1fr))}}
+.upi-card{position:relative;background:var(--elev);border:1px solid var(--border);border-radius:16px;padding:16px;display:grid;gap:12px;animation:rise .22s var(--ease) backwards;animation-delay:calc(var(--i,0)*25ms);transition:border-color .16s var(--ease)}
+.upi-card:hover{border-color:var(--accent)}
+.upi-card.off{opacity:.68}
+.upi-top{display:flex;justify-content:space-between;align-items:center;gap:8px}
+.upi-id{font:700 16px var(--display);word-break:break-all}
+.upi-tot{font:700 28px var(--display);color:var(--success);margin:2px 0}.upi-tot small{font-size:13px;color:var(--text2);font-weight:600;margin-left:6px}
+.upi-meta{display:grid;gap:6px;font-size:13px;padding-top:10px;border-top:1px dashed var(--border)}
+.upi-meta div{display:flex;justify-content:space-between;gap:10px}.upi-meta span{color:var(--text2)}.upi-meta b{text-align:right}
+.upi-btns{display:flex;gap:8px;flex-wrap:wrap}.upi-btns .btn{flex:1;padding:9px 12px;font-size:13px}.upi-btns .btn.sm{flex:0 0 auto}
 @media(prefers-reduced-motion:reduce){*,*::before,*::after{animation:none!important;transition:none!important}}
 </style></head><body>
 <div id="login"><div class="card"><div class="brand"><span class="mark"></span>BlockNexa Admin</div>
@@ -101,7 +113,7 @@ aside{display:grid;gap:14px}
 <div id="panel" hidden><div class="wrap">
   <div class="bar"><div class="brand"><span class="mark"></span>Admin</div>
     <form class="search" id="sf"><input id="q" placeholder="Search a user ID, order ID, UTR, phone or email" aria-label="Search"><button class="btn">Search</button></form>
-    <div class="nav"><button class="btn ghost" id="nPending">Pending</button><button class="btn ghost" id="nUsers">Userbase</button><button class="btn ghost" id="nAudit">Admin log</button><button class="btn ghost" id="nBackup">Backup</button><button class="btn ghost" id="nLock">Lock</button></div></div>
+    <div class="nav"><button class="btn ghost" id="nPending">Pending</button><button class="btn ghost" id="nUsers">Userbase</button><button class="btn ghost" id="nTxLog">Transaction log</button><button class="btn ghost" id="nAudit">Admin log</button><button class="btn ghost" id="nBackup">Backup</button><button class="btn ghost" id="nLock">Lock</button></div></div>
   <main id="main"><p class="empty">Search for a user or an order to begin, or open Pending.</p></main></div></div>
 <div class="mdl" id="mdl" hidden><div class="mcard" id="mcard"></div></div>
 <script src="bn-admin.js"></script>

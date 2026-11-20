@@ -257,8 +257,116 @@
     });
   }
 
+  // ---------- transaction log (UPI randomness & collection control) ----------
+  async function txLog() {
+    try {
+      const d = await api('/upis');
+      const activeCount = d.upis.filter(u => u.active).length;
+      const cards = d.upis.map((u, i) => `
+        <div class="upi-card ${u.active ? '' : 'off'}" style="--i:${Math.min(i, 12)}">
+          <div class="upi-top">
+            <span class="upi-id">${esc(u.upi)}</span>
+            ${u.active ? '<span class="active-badge">Active in rotation</span>' : '<span class="deact-badge">Paused</span>'}
+          </div>
+          <div>
+            <small class="mut">Total collected</small>
+            <div class="upi-tot">₹${f2(u.totalCollected)}<small>${u.count} payment${u.count === 1 ? '' : 's'} · ${f2(u.totalUsdt)} USDT</small></div>
+          </div>
+          <div class="upi-meta">
+            <div><span>UPI name</span><b>${esc(u.upi)}</b></div>
+            <div><span>Total collected</span><b>₹${f2(u.totalCollected)} (${u.count})</b></div>
+            <div><span>Activation date</span><b>${day(u.createdAt)} · ${clock(u.createdAt)}</b></div>
+            <div><span>Last payment</span><b>${u.lastAt ? day(u.lastAt) + ' · ' + clock(u.lastAt) : 'No payments yet'}</b></div>
+          </div>
+          <div class="upi-btns">
+            <button class="btn" data-upi-logs="${esc(u.upi)}">See all logs (${u.count})</button>
+            <button class="btn ghost sm" data-upi-toggle="${esc(u.upi)}">${u.active ? 'Pause' : 'Activate'}</button>
+            <button class="btn ghost sm" data-upi-del="${esc(u.upi)}" aria-label="Remove UPI">Remove</button>
+          </div>
+        </div>`).join('');
+      $('#main').innerHTML = `
+        <div class="card">
+          <div class="head">
+            <div>
+              <h2>Transaction log · UPI Randomness Control</h2>
+              <small>${activeCount} active UPI${activeCount === 1 ? '' : 's'} in random rotation · ₹${f2(d.totalCollected)} total collected across ${d.totalCount} successful buy payment${d.totalCount === 1 ? '' : 's'}</small>
+            </div>
+            <button class="btn ghost" id="allUpiLogs">See all logs (${d.totalCount})</button>
+          </div>
+          <form class="upi-add" id="upiAddForm">
+            <input id="newUpi" placeholder="Add a UPI ID to random rotation (e.g. merchant@upi)" autocomplete="off" spellcheck="false" aria-label="New UPI ID">
+            <button class="btn" type="submit">+ Add UPI ID</button>
+          </form>
+          <div class="upi-grid">${cards || '<p class="empty">No UPI IDs configured yet. Add one above.</p>'}</div>
+        </div>`;
+      bindTxLog();
+    } catch (e) { toast(e.message, true); }
+  }
+  async function showUpiLogs(upi) {
+    try {
+      const d = await api('/upis/logs' + (upi ? '?upi=' + encodeURIComponent(upi) : ''));
+      window._upiLogs = d.logs;
+      const sum = d.summary;
+      const rows = d.logs.map((o, i) => `
+        <tr style="--i:${Math.min(i, 12)}">
+          <td><button class="uid-link" data-ul-oid="${esc(o.id)}">#${esc(o.id)}</button></td>
+          <td><button class="uid-link" data-uid="${esc(o.user.uid)}">${esc(o.user.uid)}</button><small style="display:block">${esc(o.user.email || o.user.phone || '')}</small></td>
+          <td><b>${esc(o.upi || '—')}</b></td>
+          <td><b style="color:var(--success)">₹${f2(o.inr)}</b><small style="display:block">${f2(o.usdt)} USDT @ ₹${o.rate}</small></td>
+          <td><span style="font-family:ui-monospace,Consolas,monospace">${esc(o.utr || '—')}</span></td>
+          <td>${day(o.updatedAt)}<small style="display:block">${clock(o.updatedAt)}</small></td>
+          <td><span class="badge success">Success</span></td>
+        </tr>`).join('');
+      $('#main').innerHTML = `
+        <div class="card">
+          <div class="head">
+            <div>
+              <h2>${upi ? 'UPI Logs · ' + esc(upi) : 'All Successful UPI Payments'}</h2>
+              <small>${sum
+                ? `UPI name: ${esc(sum.upi)} · Total collected: ₹${f2(sum.totalCollected)} (${sum.count} payment${sum.count === 1 ? '' : 's'}) · Activation date: ${day(sum.createdAt)}`
+                : `${d.logs.length} successful payment${d.logs.length === 1 ? '' : 's'}`}</small>
+            </div>
+            <button class="btn ghost" id="backTxLog">← Back to UPI control</button>
+          </div>
+          <div class="ub-wrap">
+            <table class="ub-table">
+              <thead><tr><th>Order ID</th><th>User</th><th>UPI ID</th><th>Amount Paid</th><th>UTR</th><th>Paid At</th><th>Status</th></tr></thead>
+              <tbody>${rows || '<tr><td colspan="7" class="empty">No successful payments recorded for this UPI yet.</td></tr>'}</tbody>
+            </table>
+          </div>
+        </div>`;
+      const m = $('#main');
+      $('#backTxLog', m).onclick = txLog;
+      m.querySelectorAll('[data-uid]').forEach(b => b.onclick = () => openUser(b.dataset.uid));
+      m.querySelectorAll('[data-ul-oid]').forEach(b => b.onclick = () => showOrder(window._upiLogs.find(x => x.id === b.dataset.ulOid)));
+    } catch (e) { toast(e.message, true); }
+  }
+  function bindTxLog() {
+    const m = $('#main');
+    if ($('#allUpiLogs', m)) $('#allUpiLogs', m).onclick = () => showUpiLogs('');
+    if ($('#upiAddForm', m)) $('#upiAddForm', m).onsubmit = async e => {
+      e.preventDefault();
+      const v = $('#newUpi', m).value.trim();
+      if (!v) return;
+      try { await api('/upis', { method: 'POST', body: { upi: v } }); toast('UPI ID added to rotation'); txLog(); }
+      catch (err) { toast(err.message, true); }
+    };
+    m.querySelectorAll('[data-upi-logs]').forEach(b => b.onclick = () => showUpiLogs(b.dataset.upiLogs));
+    m.querySelectorAll('[data-upi-toggle]').forEach(b => b.onclick = async () => {
+      try { const r = await api('/upis/toggle', { method: 'POST', body: { upi: b.dataset.upiToggle } }); toast(r.active ? 'UPI activated in rotation' : 'UPI paused'); txLog(); }
+      catch (err) { toast(err.message, true); }
+    });
+    m.querySelectorAll('[data-upi-del]').forEach(b => b.onclick = async () => {
+      const u = b.dataset.upiDel;
+      const r = await ask({ title: 'Remove UPI ID', html: `<p>Remove <b>${esc(u)}</b> from the rotation pool? Past transaction logs for this UPI will remain intact.</p>`, ok: 'Remove', danger: true });
+      if (!r) return;
+      try { await api('/upis/delete', { method: 'POST', body: { upi: u } }); toast('UPI removed'); txLog(); }
+      catch (err) { toast(err.message, true); }
+    });
+  }
+
   $('#enter').onclick = enter; $('#key').onkeydown = e => { if (e.key === 'Enter') enter(); };
   $('#sf').onsubmit = e => { e.preventDefault(); find($('#q').value.trim()); };
-  $('#nPending').onclick = pending; $('#nUsers').onclick = () => userbase(0); $('#nAudit').onclick = auditLog; $('#nBackup').onclick = backup; $('#nLock').onclick = lock;
+  $('#nPending').onclick = pending; $('#nUsers').onclick = () => userbase(0); $('#nTxLog').onclick = txLog; $('#nAudit').onclick = auditLog; $('#nBackup').onclick = backup; $('#nLock').onclick = lock;
   if (KEY) api('/ping').then(() => { $('#login').hidden = true; $('#panel').hidden = false; }).catch(() => {});
 })();
