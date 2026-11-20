@@ -68,6 +68,7 @@ CREATE TABLE IF NOT EXISTS notifications(
 CREATE INDEX IF NOT EXISTS idx_notif_user ON notifications(user_id, id);
 CREATE TABLE IF NOT EXISTS notification_reads(
   user_id INTEGER PRIMARY KEY REFERENCES users(id), last_read_at INTEGER NOT NULL DEFAULT 0);
+CREATE TABLE IF NOT EXISTS settings(key TEXT PRIMARY KEY, value TEXT NOT NULL);
 `);
 
 { // upgrade an older database: password column and the way each session was opened
@@ -93,6 +94,8 @@ const addLedger = (userId, orderId, type, amt, reason, admin) => S('INSERT INTO 
 const audit = (action, target, details) => S('INSERT INTO audit(at,action,target,details) VALUES(?,?,?,?)').run(now(), action, target || null, JSON.stringify(details || {}));
 const reasonOf = b => { const r = String((b || {}).reason || '').trim().replace(/\s+/g, ' ').slice(0, 200); return r.length >= 3 ? r : ''; };
 const item = o => ({ id: o.public_id, kind: o.type, status: o.status, at: o.created_at, usdt: usdt(o.usdt_micro), inr: o.inr, address: o.address, upi: o.upi, reason: o.fail_reason });
+const buySellEnabled = () => { const r = S("SELECT value FROM settings WHERE key='buy_sell_enabled'").get(); return !r || r.value !== '0'; };
+const BUY_SELL_OFF_MSG = "Buy And Sell Services are currently disabled. We'll notify you.";
 const upiLink = o => `upi://pay?pa=${o.upi || CFG.UPI_ID}&pn=${encodeURIComponent(CFG.UPI_NAME)}&am=${Number(o.inr).toFixed(2)}&cu=INR&tn=${encodeURIComponent('BN ' + o.public_id)}`;
 { // seed initial UPI pool (only when upis table is empty) and migrate any legacy buy orders onto upis
   const t = now();
@@ -256,7 +259,7 @@ V.post('/auth/logout', (req, res) => {
 });
 
 /* ============================ SECTION 5: USER API ============================ */
-V.get('/rates', (req, res) => res.json({ buy: CFG.BUY_RATE, sell: CFG.SELL_RATE, minBuyUsdt: CFG.MIN_BUY_USDT, maxBuyInr: CFG.MAX_BUY_INR, minSellUsdt: CFG.MIN_SELL_USDT, minWithdraw: CFG.MIN_WITHDRAW, googleClientId: CFG.GOOGLE_CLIENT_ID }));
+V.get('/rates', (req, res) => res.json({ buy: CFG.BUY_RATE, sell: CFG.SELL_RATE, minBuyUsdt: CFG.MIN_BUY_USDT, maxBuyInr: CFG.MAX_BUY_INR, minSellUsdt: CFG.MIN_SELL_USDT, minWithdraw: CFG.MIN_WITHDRAW, googleClientId: CFG.GOOGLE_CLIENT_ID, buySellEnabled: buySellEnabled() }));
 V.use(['/me', '/account', '/balance', '/history', '/buy', '/sell', '/withdraw', '/deposit', '/notifications'], requireAuth);
 V.get('/me', (req, res) => res.json(me(req.user)));
 V.post('/account/password', limiter(10), async (req, res) => {
@@ -289,6 +292,7 @@ V.get('/history/:type', (req, res) => {
 });
 
 V.post('/buy', limiter(20), (req, res) => {
+  if (!buySellEnabled()) return res.status(503).json({ error: BUY_SELL_OFF_MSG });
   const inr = Number((req.body || {}).inr), upi = pickRandomUpi();
   if (!upi) return res.status(503).json({ error: 'Payments are not set up yet. Please contact support.' });
   if (!Number.isInteger(inr) || inr < CFG.MIN_BUY_INR || inr > CFG.MAX_BUY_INR) return res.status(400).json({ error: `Enter a whole amount between ₹${CFG.MIN_BUY_INR} and ₹${CFG.MAX_BUY_INR}.` });
@@ -326,6 +330,7 @@ const createOut = db.transaction((user, type, m, x) => {
   return { order: S('SELECT * FROM orders WHERE id=?').get(r.lastInsertRowid) };
 });
 V.post('/sell', limiter(20), (req, res) => {
+  if (!buySellEnabled()) return res.status(503).json({ error: BUY_SELL_OFF_MSG });
   const b = req.body || {}, v = Number(b.usdt), upi = String(b.upi || '').trim();
   if (!(v >= CFG.MIN_SELL_USDT)) return res.status(400).json({ error: `Minimum sale is ${CFG.MIN_SELL_USDT} USDT.` });
   if (!/^[\w.\-]{2,}@[\w.\-]{2,}$/.test(upi)) return res.status(400).json({ error: 'Enter a valid UPI ID, like name@bank.' });
@@ -535,6 +540,15 @@ A.post('/notifications/:id/delete', (req, res) => {
   if (!Number.isInteger(id)) return res.status(400).json({ error: 'Invalid ID.' });
   S('DELETE FROM notifications WHERE id=?').run(id);
   res.json({ ok: true });
+});
+
+// ==================== GLOBAL SERVICE SETTINGS ====================
+A.get('/settings', (req, res) => res.json({ buySellEnabled: buySellEnabled() }));
+A.post('/settings/buy-sell', (req, res) => {
+  const enabled = !!(req.body || {}).enabled;
+  S("INSERT INTO settings(key,value) VALUES('buy_sell_enabled',?) ON CONFLICT(key) DO UPDATE SET value=excluded.value").run(enabled ? '1' : '0');
+  audit(enabled ? 'enable_buy_sell' : 'disable_buy_sell', null, {});
+  res.json({ buySellEnabled: enabled });
 });
 
 // ==================== UPI RANDOMNESS & TRANSACTION LOG ====================

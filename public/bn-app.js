@@ -58,12 +58,12 @@
         <h3 id="mtitle">${esc(title)}</h3>
         ${rows.length ? `<div class="kv">${rows.map(r => `<div><span>${esc(r[0])}</span><b>${esc(r[1])}</b></div>`).join('')}</div>` : ''}
         ${note ? `<p class="mnote">${esc(note)}</p>` : ''}
-        <div class="mbtns"><button class="btn ghost" id="mno">${esc(cancel)}</button><button class="btn" id="myes">${esc(ok)}</button></div></div>`;
+        <div class="mbtns">${cancel ? `<button class="btn ghost" id="mno">${esc(cancel)}</button>` : ''}<button class="btn" id="myes">${esc(ok)}</button></div></div>`;
       m.classList.remove('out'); m.hidden = false;
       const key = e => { if (e.key === 'Escape') done(false); };
       const done = v => { document.removeEventListener('keydown', key); m.classList.add('out'); setTimeout(() => { m.hidden = true; m.classList.remove('out'); }, 170); if (prev && prev.focus) prev.focus(); resolve(v); };
       document.addEventListener('keydown', key);
-      $('#mno').onclick = () => done(false); $('#myes').onclick = () => done(true); m.onclick = e => { if (e.target === m) done(false); };
+      if ($('#mno')) $('#mno').onclick = () => done(false); $('#myes').onclick = () => done(true); m.onclick = e => { if (e.target === m) done(false); };
       $('#myes').focus();
     });
   }
@@ -301,10 +301,18 @@
         <h3 class="sec">Recent activity</h3><div>${rec.length ? rec.map(row).join('') : '<p class="empty">No activity yet.</p>'}</div>
         <a class="row lk tn-t" href="#/support" style="margin-top:0"><span class="rico t">${icon('help')}</span><div class="rmid"><b>Need help?</b><small>Contact support</small></div></a>
       </section></div></div>`;
+    if (rt.buySellEnabled === false) {
+      root.querySelectorAll('a[href="#/buy"], a[href="#/sell"]').forEach(a => a.onclick = e => { e.preventDefault(); buySellOffAlert(); });
+    }
   }
+  const buySellOffAlert = () => ask({ title: 'Service Unavailable', note: "Buy And Sell Services are currently disabled. We'll notify you.", ok: 'OK', cancel: '', tone: 'danger', icon: 'warn' });
 
   async function buy(root) {
     const rt = await api().rates(), min = Math.ceil(rt.minBuyUsdt * rt.buy);
+    if (rt.buySellEnabled === false) {
+      screen(root, 'Buy USDT', `<div class="card center"><p class="err" style="margin-top:0">Buy And Sell Services are currently disabled. We'll notify you.</p><a class="btn ghost" href="#/deposit">Deposit USDT instead</a><a class="btn ghost" href="#/home">Back to home</a></div>`);
+      return buySellOffAlert();
+    }
     screen(root, 'Buy USDT', `<div class="card"><p class="mut">₹${+rt.buy} per USDT. Minimum ${rt.minBuyUsdt} USDT (₹${fmt(min, 0)}), maximum ₹${fmt(rt.maxBuyInr, 0)}.</p>
       <label class="field"><span class="pre">₹</span><input id="amt" type="number" inputmode="numeric" placeholder="0" aria-label="Amount in rupees"></label>
       <div class="chips">${[1000, 2500, 5000].map(v => `<button data-v="${v}">₹${fmt(v, 0)}</button>`).join('')}</div>
@@ -339,6 +347,10 @@
 
   async function sell(root) {
     const [rt, bal] = await Promise.all([api().rates(), api().balance()]);
+    if (rt.buySellEnabled === false) {
+      screen(root, 'Sell USDT', `<div class="card center"><p class="err" style="margin-top:0">Buy And Sell Services are currently disabled. We'll notify you.</p><a class="btn ghost" href="#/deposit">Deposit USDT instead</a><a class="btn ghost" href="#/home">Back to home</a></div>`);
+      return buySellOffAlert();
+    }
     screen(root, 'Sell USDT', `<div class="card"><p class="mut">Sell at <b style="color:var(--success)">₹${+rt.sell}</b> per USDT. Available: ${fmt(bal.usdt)} USDT. Minimum ${rt.minSellUsdt} USDT.</p>
       <label class="field"><input id="amt" type="number" inputmode="decimal" placeholder="Amount in USDT" aria-label="USDT amount"><button class="mini" id="max">Max</button></label>
       <label class="field"><input id="upi" class="sm" placeholder="Your UPI ID (to receive INR)" autocomplete="off" spellcheck="false" aria-label="Your UPI ID"></label>

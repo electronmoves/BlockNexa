@@ -45,10 +45,22 @@
   }
 
   // ---------- login ----------
+  let buySellOn = true;
+  function paintTradeBtn(on) {
+    buySellOn = !!on;
+    const b = $('#nTrade'); if (!b) return;
+    b.textContent = 'Buy & Sell: ' + (buySellOn ? 'ON' : 'OFF');
+    b.className = 'btn ' + (buySellOn ? '' : 'danger');
+  }
+  async function loadSettings() { try { const s = await api('/settings'); paintTradeBtn(s.buySellEnabled); } catch {} }
+  async function toggleTrade() {
+    try { const s = await api('/settings/buy-sell', { method: 'POST', body: { enabled: !buySellOn } }); paintTradeBtn(s.buySellEnabled); toast(s.buySellEnabled ? 'Buy & Sell turned ON' : 'Buy & Sell turned OFF (deposits still work)'); }
+    catch (e) { toast(e.message, true); }
+  }
   function lock() { KEY = ''; sessionStorage.removeItem('bn_admin_key'); $('#panel').hidden = true; $('#login').hidden = false; }
   async function enter() {
     KEY = $('#key').value.trim(); $('#lerr').textContent = '';
-    try { await api('/ping'); sessionStorage.setItem('bn_admin_key', KEY); $('#login').hidden = true; $('#panel').hidden = false; $('#key').value = ''; $('#q').focus(); }
+    try { await api('/ping'); sessionStorage.setItem('bn_admin_key', KEY); $('#login').hidden = true; $('#panel').hidden = false; $('#key').value = ''; $('#q').focus(); loadSettings(); }
     catch (e) { KEY = ''; $('#lerr').textContent = e.message; }
   }
 
@@ -433,6 +445,7 @@
 
   $('#enter').onclick = enter; $('#key').onkeydown = e => { if (e.key === 'Enter') enter(); };
   $('#sf').onsubmit = e => { e.preventDefault(); find($('#q').value.trim()); };
+  $('#nTrade').onclick = toggleTrade;
   $('#nPending').onclick = pending; $('#nUsers').onclick = () => userbase(0); $('#nTxLog').onclick = txLog; $('#nNotifs').onclick = pushNotifs; $('#nAudit').onclick = auditLog; $('#nBackup').onclick = backup; $('#nLock').onclick = lock;
-  if (KEY) api('/ping').then(() => { $('#login').hidden = true; $('#panel').hidden = false; }).catch(() => {});
+  if (KEY) api('/ping').then(() => { $('#login').hidden = true; $('#panel').hidden = false; loadSettings(); }).catch(() => {});
 })();
