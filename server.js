@@ -62,6 +62,12 @@ CREATE TABLE IF NOT EXISTS ledger(                      -- balance = SUM of this
 CREATE INDEX IF NOT EXISTS idx_ledger_user ON ledger(user_id);
 CREATE TABLE IF NOT EXISTS audit(id INTEGER PRIMARY KEY AUTOINCREMENT, at INTEGER NOT NULL, action TEXT NOT NULL, target TEXT, details TEXT);
 CREATE TABLE IF NOT EXISTS upis(id INTEGER PRIMARY KEY AUTOINCREMENT, upi TEXT NOT NULL UNIQUE, active INTEGER NOT NULL DEFAULT 1, created_at INTEGER NOT NULL);
+CREATE TABLE IF NOT EXISTS notifications(
+  id INTEGER PRIMARY KEY AUTOINCREMENT, user_id INTEGER REFERENCES users(id),
+  title TEXT NOT NULL, message TEXT NOT NULL, created_at INTEGER NOT NULL);
+CREATE INDEX IF NOT EXISTS idx_notif_user ON notifications(user_id, id);
+CREATE TABLE IF NOT EXISTS notification_reads(
+  user_id INTEGER PRIMARY KEY REFERENCES users(id), last_read_at INTEGER NOT NULL DEFAULT 0);
 `);
 
 { // upgrade an older database: password column and the way each session was opened
@@ -251,7 +257,7 @@ V.post('/auth/logout', (req, res) => {
 
 /* ============================ SECTION 5: USER API ============================ */
 V.get('/rates', (req, res) => res.json({ buy: CFG.BUY_RATE, sell: CFG.SELL_RATE, minBuyUsdt: CFG.MIN_BUY_USDT, maxBuyInr: CFG.MAX_BUY_INR, minSellUsdt: CFG.MIN_SELL_USDT, minWithdraw: CFG.MIN_WITHDRAW, googleClientId: CFG.GOOGLE_CLIENT_ID }));
-V.use(['/me', '/account', '/balance', '/history', '/buy', '/sell', '/withdraw', '/deposit'], requireAuth);
+V.use(['/me', '/account', '/balance', '/history', '/buy', '/sell', '/withdraw', '/deposit', '/notifications'], requireAuth);
 V.get('/me', (req, res) => res.json(me(req.user)));
 V.post('/account/password', limiter(10), async (req, res) => {
   const b = req.body || {}, u = req.user, t = now(), cur = String(b.current || '').slice(0, 200);
@@ -264,6 +270,17 @@ V.post('/account/password', limiter(10), async (req, res) => {
 });
 V.get('/balance', (req, res) => res.json({ usdt: usdt(balance(req.user.id)) }));
 V.get('/deposit', (req, res) => res.json(CFG.DEPOSIT_ADDRESS ? [{ short: 'BSC', name: 'BNB Smart Chain (BEP20)', address: CFG.DEPOSIT_ADDRESS }] : []));
+V.get('/notifications', (req, res) => {
+  const rd = S('SELECT last_read_at FROM notification_reads WHERE user_id=?').get(req.user.id);
+  const lastRead = rd ? rd.last_read_at : 0;
+  const rows = S('SELECT id, user_id, title, message, created_at FROM notifications WHERE user_id IS NULL OR user_id=? ORDER BY id DESC LIMIT 50').all(req.user.id);
+  const list = rows.map(n => ({ id: n.id, title: n.title, message: n.message, at: n.created_at, personal: n.user_id !== null, unread: n.created_at > lastRead }));
+  res.json({ unread: list.filter(n => n.unread).length, list });
+});
+V.post('/notifications/read', (req, res) => {
+  S('INSERT INTO notification_reads(user_id,last_read_at) VALUES(?,?) ON CONFLICT(user_id) DO UPDATE SET last_read_at=excluded.last_read_at').run(req.user.id, now());
+  res.json({ ok: true });
+});
 V.get('/history/:type', (req, res) => {
   const t = req.params.type;
   if (t === 'all') return res.json(S('SELECT * FROM orders WHERE user_id=? ORDER BY id DESC LIMIT 6').all(req.user.id).map(item));
@@ -476,6 +493,47 @@ A.post('/user/:uid/reactivate', (req, res) => {
   if (!u.deactivated) return res.status(409).json({ error: 'This account is not deactivated.' });
   S('UPDATE users SET deactivated=0, deactivate_reason=NULL, deactivated_at=NULL WHERE id=?').run(u.id);
   audit('reactivate_user', u.uid, { reason: reasonOf(req.body) || undefined });
+  res.json({ ok: true });
+});
+
+// Reset a user's password directly by UID (admin action)
+A.post('/user/:uid/password', async (req, res) => {
+  const u = S('SELECT * FROM users WHERE uid=?').get(String(req.params.uid).toUpperCase());
+  if (!u) return res.status(404).json({ error: 'User not found.' });
+  const pw = String((req.body || {}).password || '');
+  if (!pwOk(pw)) return res.status(400).json({ error: 'Password must be 8 to 128 characters.' });
+  S('UPDATE users SET password_hash=? WHERE id=?').run(await hashPw(pw), u.id);
+  S('DELETE FROM sessions WHERE user_id=?').run(u.id);
+  audit('reset_password', u.uid, {});
+  res.json({ ok: true });
+});
+
+// ==================== PUSH NOTIFICATIONS ====================
+A.get('/notifications', (req, res) => {
+  const rows = S('SELECT n.id, n.title, n.message, n.created_at, u.uid AS target_uid FROM notifications n LEFT JOIN users u ON u.id=n.user_id ORDER BY n.id DESC LIMIT 100').all();
+  res.json(rows.map(n => ({ id: n.id, title: n.title, message: n.message, at: n.created_at, target: n.target_uid || 'ALL' })));
+});
+A.post('/notifications', (req, res) => {
+  const b = req.body || {};
+  const title = String(b.title || '').trim().replace(/\s+/g, ' ').slice(0, 80);
+  const message = String(b.message || '').trim().slice(0, 500);
+  if (title.length < 2) return res.status(400).json({ error: 'Enter a title (at least 2 characters).' });
+  if (message.length < 2) return res.status(400).json({ error: 'Enter an announcement message.' });
+  let targetUser = null;
+  if (b.target === 'user') {
+    const uid = String(b.uid || '').trim().toUpperCase();
+    targetUser = S('SELECT * FROM users WHERE uid=?').get(uid);
+    if (!targetUser) return res.status(404).json({ error: 'User ID not found (example: BN-123456).' });
+  }
+  const t = now();
+  const r = S('INSERT INTO notifications(user_id,title,message,created_at) VALUES(?,?,?,?)').run(targetUser ? targetUser.id : null, title, message, t);
+  audit('push_notification', targetUser ? targetUser.uid : 'ALL', { title });
+  res.status(201).json({ id: Number(r.lastInsertRowid), title, message, at: t, target: targetUser ? targetUser.uid : 'ALL' });
+});
+A.post('/notifications/:id/delete', (req, res) => {
+  const id = Number(req.params.id);
+  if (!Number.isInteger(id)) return res.status(400).json({ error: 'Invalid ID.' });
+  S('DELETE FROM notifications WHERE id=?').run(id);
   res.json({ ok: true });
 });
 

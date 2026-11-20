@@ -22,7 +22,7 @@
     user: 'M12 12a4 4 0 100-8 4 4 0 000 8zM4 21a8 8 0 0116 0', send: 'M21 3L3 10.5l7 2.5 2.5 7L21 3zM10 13l11-10',
     warn: 'M12 9v4M12 17h.01M10.3 3.9L2.4 18a2 2 0 001.7 3h15.8a2 2 0 001.7-3L13.7 3.9a2 2 0 00-3.4 0z',
     eye: 'M2 12s4-7 10-7 10 7 10 7-4 7-10 7S2 12 2 12zM12 15a3 3 0 100-6 3 3 0 000 6z', lock: 'M7 11V8a5 5 0 0110 0v3M5 11h14v9H5z',
-    shield: 'M12 3l8 3v6c0 5-3.5 8-8 9-4.5-1-8-4-8-9V6z', cube: 'M12 3l8 4.5v9L12 21l-8-4.5v-9L12 3zM12 12l8-4.5M12 12v9M12 12L4 7.5', mail: 'M4 6h16v12H4zM4 7l8 6 8-6', users: 'M16 11a3 3 0 100-6 3 3 0 000 6zM8 11a3 3 0 100-6 3 3 0 000 6zM2 20a6 6 0 0112 0M14 20a6 6 0 018 0', help: 'M12 17h.01M9.1 9a3 3 0 115.2 2c-.8.8-2.3 1.2-2.3 3M12 21a9 9 0 100-18 9 9 0 000 18z', logout: 'M9 4H5a1 1 0 00-1 1v14a1 1 0 001 1h4M16 8l4 4-4 4M20 12H9', clock: 'M12 7v5l3 2M12 21a9 9 0 100-18 9 9 0 000 18z'
+    shield: 'M12 3l8 3v6c0 5-3.5 8-8 9-4.5-1-8-4-8-9V6z', cube: 'M12 3l8 4.5v9L12 21l-8-4.5v-9L12 3zM12 12l8-4.5M12 12v9M12 12L4 7.5', mail: 'M4 6h16v12H4zM4 7l8 6 8-6', users: 'M16 11a3 3 0 100-6 3 3 0 000 6zM8 11a3 3 0 100-6 3 3 0 000 6zM2 20a6 6 0 0112 0M14 20a6 6 0 018 0', help: 'M12 17h.01M9.1 9a3 3 0 115.2 2c-.8.8-2.3 1.2-2.3 3M12 21a9 9 0 100-18 9 9 0 000 18z', logout: 'M9 4H5a1 1 0 00-1 1v14a1 1 0 001 1h4M16 8l4 4-4 4M20 12H9', clock: 'M12 7v5l3 2M12 21a9 9 0 100-18 9 9 0 000 18z', bell: 'M18 8A6 6 0 006 8c0 7-3 9-3 9h18s-3-2-3-9M13.7 21a2 2 0 01-3.4 0'
   };
   // every icon gets an i-<name> class, so the CSS can nudge it the way its action goes (buy down, sell up, withdraw right...)
   const icon = (n, c = '') => `<svg class="ic i-${n} ${c}" viewBox="0 0 24 24" aria-hidden="true"><path pathLength="100" d="${P[n]}"/></svg>`;
@@ -121,7 +121,8 @@
     setPassword: b => req('POST', '/account/password', b),
     rates: () => req('GET', '/rates'), balance: () => req('GET', '/balance'), history: t => req('GET', '/history/' + t),
     buyCreate: inr => req('POST', '/buy', { inr }), buyPaid: (id, utr) => req('POST', `/buy/${id}/paid`, { utr }),
-    sellCreate: b => req('POST', '/sell', b), withdraw: b => req('POST', '/withdraw', { chain: 'bsc', ...b }), deposit: () => req('GET', '/deposit')
+    sellCreate: b => req('POST', '/sell', b), withdraw: b => req('POST', '/withdraw', { chain: 'bsc', ...b }), deposit: () => req('GET', '/deposit'),
+    notifications: () => req('GET', '/notifications'), notificationsRead: () => req('POST', '/notifications/read')
   };
   BN.api = live;
 })();
@@ -278,7 +279,7 @@
   }
 
   async function home(root) {
-    const [bal, rt, rec] = await Promise.all([api().balance(), api().rates(), api().history('all')]);
+    const [bal, rt, rec, notifs] = await Promise.all([api().balance(), api().rates(), api().history('all'), api().notifications().catch(() => ({ unread: 0, list: [] }))]);
     const q = (h, c, i, t) => `<a href="${h}" class="q ${c}"><span class="lk">${icon(i)}</span>${t}</a>`;
     const tile = (t, i, tone, n, s) => `<a class="tile lk tn-${tone}" href="#/history/${t}"><span class="rico ${tone}">${icon(i)}</span><b>${n}</b><small>${s}</small></a>`;
     const [whole, dec] = fmt(bal.usdt).split('.');
@@ -286,7 +287,7 @@
     root.innerHTML = `<div class="wrap">
       <div class="top htop"><div class="brand"><span class="mark">${icon('cube')}</span>${esc(cfg.NAME)}</div>
         <span class="pill"><i class="dot"></i>Sell <b class="flash">₹${+rt.sell}</b> · Buy <b>₹${+rt.buy}</b></span>
-        <div class="top-acts"><a class="iconbtn" href="#/support" aria-label="Support">${icon('help')}</a><a class="iconbtn" href="#/account" aria-label="Account">${icon('user')}</a></div></div>
+        <div class="top-acts"><a class="iconbtn" href="#/notifications" aria-label="Notifications">${icon('bell')}${notifs.unread ? `<i class="nbadge">${notifs.unread > 9 ? '9+' : notifs.unread}</i>` : ''}</a><a class="iconbtn" href="#/support" aria-label="Support">${icon('help')}</a><a class="iconbtn" href="#/account" aria-label="Account">${icon('user')}</a></div></div>
       <div class="home"><section>
         <div class="wallet"><div class="wtop"><span class="lbl">Your balance</span><span class="chainpill"><i></i>USDT · BSC</span></div>
           <div class="big">${whole}<span class="dec">.${dec}</span><small>USDT</small></div>
@@ -426,7 +427,19 @@
       catch (x) { err.textContent = msg(x); e.target.disabled = false; }
     };
   }
-  BN.screens = { home, buy, sell, deposit, withdraw, history, support, account, password };
+  async function notifications(root) {
+    screen(root, 'Notifications', '<p class="empty">Loading…</p>');
+    const d = await api().notifications();
+    if (d.unread) api().notificationsRead().catch(() => {});
+    const body = d.list.length ? d.list.map((n, i) => `
+      <div class="ncard ${n.unread ? 'unr' : ''}" style="--i:${Math.min(i, 10)}">
+        <div class="ntop"><b>${esc(n.title)}</b><span class="badge ${n.personal ? 'ok' : 'wait'}">${n.personal ? 'Personal' : 'Announcement'}</span></div>
+        <p>${esc(n.message)}</p>
+        <small>${when(n.at)}</small>
+      </div>`).join('') : '<div class="card"><p class="empty">No notifications yet.</p></div>';
+    screen(root, 'Notifications', body);
+  }
+  BN.screens = { home, buy, sell, deposit, withdraw, history, support, account, password, notifications };
 })();
 
 /* ============================================================

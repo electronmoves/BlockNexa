@@ -79,6 +79,10 @@
         <div class="card"><b>Withdrawals and sales</b>
           ${u.suspended ? `<p class="why" style="margin:8px 0">Suspended ${day(u.suspendedAt)} · ${esc(u.suspendReason)}</p><button class="btn ghost block" id="unsusp">Lift suspension</button>`
                         : `<p class="mut" style="margin:8px 0">Allowed. Suspend if you see unusual activity.</p><button class="btn danger block" id="susp">Suspend withdrawals</button>`}</div>
+        <div class="card"><b>Change password</b>
+          <p class="mut" style="margin:8px 0">Set a new login password for this user (8+ characters). Logs them out everywhere.</p>
+          <input id="newPw" type="text" minlength="8" maxlength="128" placeholder="New password (8+ characters)" autocomplete="off">
+          <button class="btn block" id="setPw">Change password</button></div>
         <div class="card"><b>Recent changes</b>${[...audit.map(a => `<small style="display:block;margin-top:8px">${day(a.at)} ${clock(a.at)} · ${esc(a.action.replace(/_/g, ' '))}${a.details.reason ? ': ' + esc(a.details.reason) : ''}${a.details.change !== undefined ? ' (' + (a.details.change > 0 ? '+' : '') + f2(a.details.change) + ' USDT)' : ''}</small>`)].join('') || '<small style="display:block;margin-top:8px">No admin actions yet.</small>'}</div>
       </aside></div>`;
     bind();
@@ -136,6 +140,14 @@
     if (!r) return;
     try { await api(`/user/${cur.user.uid}/unsuspend`, { method: 'POST', body: { reason: r.text } }); toast('Suspension lifted'); openUser(cur.user.uid); } catch (e) { toast(e.message, true); }
   }
+  async function resetPassword() {
+    const pw = ($('#newPw') ? $('#newPw').value : '').trim();
+    if (pw.length < 8 || pw.length > 128) return toast('Enter a password with 8 to 128 characters.', true);
+    const r = await ask({ title: 'Change user password', html: `<p>Set a new password for <b>${esc(cur.user.uid)}</b>? Their active sessions will be logged out.</p>`, ok: 'Change password' });
+    if (!r) return;
+    try { await api(`/user/${cur.user.uid}/password`, { method: 'POST', body: { password: pw } }); toast('Password updated'); openUser(cur.user.uid); }
+    catch (e) { toast(e.message, true); }
+  }
 
   // ---------- pending + log + backup ----------
   async function pending() {
@@ -163,7 +175,7 @@
     m.querySelectorAll('[data-oid]').forEach(b => b.onclick = () => showOrder(cur.history.find(x => x.id === b.dataset.oid)));
     m.querySelectorAll('[data-pid]').forEach(b => b.onclick = () => showOrder(window._pending.find(x => x.id === b.dataset.pid)));
     m.querySelectorAll('[data-f]').forEach(b => b.onclick = () => { const [g, v] = b.dataset.f.split(':'); view[g] = v; renderUser(); });
-    if ($('#eb', m)) $('#eb', m).onclick = editBalance; if ($('#susp', m)) $('#susp', m).onclick = suspend; if ($('#unsusp', m)) $('#unsusp', m).onclick = unsuspend;
+    if ($('#eb', m)) $('#eb', m).onclick = editBalance; if ($('#susp', m)) $('#susp', m).onclick = suspend; if ($('#unsusp', m)) $('#unsusp', m).onclick = unsuspend; if ($('#setPw', m)) $('#setPw', m).onclick = resetPassword;
     if (order) { if ($('#ok', m)) $('#ok', m).onclick = () => changeStatus(order, 'success'); if ($('#bad', m)) $('#bad', m).onclick = () => changeStatus(order, 'failed'); }
   }
   // ---------- userbase ----------
@@ -370,8 +382,57 @@
     });
   }
 
+  // ---------- push notifications ----------
+  async function pushNotifs() {
+    try {
+      const list = await api('/notifications');
+      const items = list.map(n => `
+        <div class="row" style="cursor:default">
+          <span class="t ${n.target === 'ALL' ? 'buy' : 'sell'}">${n.target === 'ALL' ? 'All users' : esc(n.target)}</span>
+          <span class="m"><b>${esc(n.title)}</b><small>${esc(n.message)}</small><small>${day(n.at)} ${clock(n.at)}</small></span>
+          <button class="btn ghost ub-act" data-del-notif="${n.id}">Delete</button>
+        </div>`).join('');
+      $('#main').innerHTML = `
+        <div class="cols">
+          <section>
+            <div class="card">
+              <div class="head"><h2>Push Notification</h2><small>Send an announcement to everyone or a specific user ID</small></div>
+              <form id="nf" style="display:grid;gap:12px;margin-top:14px">
+                <div><label class="mut" for="nTarget">Send to</label>
+                  <select id="nTarget" style="margin-top:6px"><option value="all">All users (broadcast)</option><option value="user">Specific user ID</option></select></div>
+                <div id="nUidWrap" hidden><label class="mut" for="nUid">User ID</label>
+                  <input id="nUid" placeholder="e.g. BN-123456" autocomplete="off" style="margin-top:6px"></div>
+                <div><label class="mut" for="nTitle">Title</label>
+                  <input id="nTitle" maxlength="80" placeholder="Announcement title" style="margin-top:6px"></div>
+                <div><label class="mut" for="nMsg">Message</label>
+                  <textarea id="nMsg" rows="3" maxlength="500" placeholder="Write the announcement for users…" style="margin-top:6px"></textarea></div>
+                <button class="btn" type="submit">Send notification</button>
+              </form>
+            </div>
+          </section>
+          <aside>
+            <div class="card"><b>Sent notifications (${list.length})</b>
+              <div style="margin-top:8px">${items || '<p class="empty">No notifications pushed yet.</p>'}</div>
+            </div>
+          </aside>
+        </div>`;
+      const m = $('#main');
+      $('#nTarget', m).onchange = e => { $('#nUidWrap', m).hidden = e.target.value !== 'user'; };
+      $('#nf', m).onsubmit = async e => {
+        e.preventDefault();
+        const target = $('#nTarget', m).value, uid = $('#nUid', m).value.trim(), title = $('#nTitle', m).value.trim(), message = $('#nMsg', m).value.trim();
+        try { await api('/notifications', { method: 'POST', body: { target, uid, title, message } }); toast('Notification pushed'); pushNotifs(); }
+        catch (err) { toast(err.message, true); }
+      };
+      m.querySelectorAll('[data-del-notif]').forEach(b => b.onclick = async () => {
+        try { await api(`/notifications/${b.dataset.delNotif}/delete`, { method: 'POST' }); toast('Notification removed'); pushNotifs(); }
+        catch (err) { toast(err.message, true); }
+      });
+    } catch (e) { toast(e.message, true); }
+  }
+
   $('#enter').onclick = enter; $('#key').onkeydown = e => { if (e.key === 'Enter') enter(); };
   $('#sf').onsubmit = e => { e.preventDefault(); find($('#q').value.trim()); };
-  $('#nPending').onclick = pending; $('#nUsers').onclick = () => userbase(0); $('#nTxLog').onclick = txLog; $('#nAudit').onclick = auditLog; $('#nBackup').onclick = backup; $('#nLock').onclick = lock;
+  $('#nPending').onclick = pending; $('#nUsers').onclick = () => userbase(0); $('#nTxLog').onclick = txLog; $('#nNotifs').onclick = pushNotifs; $('#nAudit').onclick = auditLog; $('#nBackup').onclick = backup; $('#nLock').onclick = lock;
   if (KEY) api('/ping').then(() => { $('#login').hidden = true; $('#panel').hidden = false; }).catch(() => {});
 })();

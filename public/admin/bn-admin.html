@@ -8,15 +8,15 @@
 :root{--bg:#0B1220;--card:#111C2E;--elev:#182438;--border:#263449;--text:#F8FAFC;--text2:#94A3B8;--primary:#10B981;--primary-hover:#059669;--on-primary:#04231A;--accent:#6488F5;--accent-soft:#B8C7FF;--success:#34D399;--error:#F87171;--font:'Figtree',system-ui,sans-serif;--display:'Sora','Figtree',system-ui,sans-serif}
 *{box-sizing:border-box;margin:0}[hidden]{display:none!important}
 body{background:var(--bg);color:var(--text);font-family:var(--font);min-height:100vh;background-image:radial-gradient(900px 500px at 90% -10%,rgba(100,136,245,.14),transparent 60%)}
-button,input,textarea{font:inherit;color:inherit}button{cursor:pointer;border:0}
+button,input,textarea,select{font:inherit;color:inherit}button{cursor:pointer;border:0}
 :focus-visible{outline:3px solid var(--accent);outline-offset:2px}
 input:focus-visible,textarea:focus-visible{outline:0}
 .wrap{max-width:1180px;margin:0 auto;padding:16px}
 .brand{font:700 18px var(--display);display:flex;align-items:center;gap:10px}.mark{width:32px;height:32px;border-radius:10px;background:linear-gradient(135deg,var(--primary),var(--accent))}
 .card{background:var(--card);border:1px solid var(--border);border-radius:18px;padding:18px}
 .mut,small{color:var(--text2);font-size:13px}
-input,textarea{background:var(--bg);border:1.5px solid var(--border);border-radius:12px;padding:12px 14px;width:100%;outline:0}
-input:focus,textarea:focus{border-color:var(--primary);box-shadow:0 0 0 4px rgba(16,185,129,.15)}
+input,textarea,select{background:var(--bg);border:1.5px solid var(--border);border-radius:12px;padding:12px 14px;width:100%;outline:0}
+input:focus,textarea:focus,select:focus{border-color:var(--primary);box-shadow:0 0 0 4px rgba(16,185,129,.15)}
 .btn{padding:11px 16px;border-radius:12px;background:var(--primary);color:var(--on-primary);font-weight:700}.btn:hover{background:var(--primary-hover)}
 .btn.ghost{background:var(--elev);color:var(--text);border:1px solid var(--border)}.btn.ghost:hover{border-color:var(--accent)}.btn.danger{background:var(--error);color:#2a0606}
 .btn.block{display:block;width:100%;margin-top:10px}
@@ -113,7 +113,7 @@ aside{display:grid;gap:14px}
 <div id="panel" hidden><div class="wrap">
   <div class="bar"><div class="brand"><span class="mark"></span>Admin</div>
     <form class="search" id="sf"><input id="q" placeholder="Search a user ID, order ID, UTR, phone or email" aria-label="Search"><button class="btn">Search</button></form>
-    <div class="nav"><button class="btn ghost" id="nPending">Pending</button><button class="btn ghost" id="nUsers">Userbase</button><button class="btn ghost" id="nTxLog">Transaction log</button><button class="btn ghost" id="nAudit">Admin log</button><button class="btn ghost" id="nBackup">Backup</button><button class="btn ghost" id="nLock">Lock</button></div></div>
+    <div class="nav"><button class="btn ghost" id="nPending">Pending</button><button class="btn ghost" id="nUsers">Userbase</button><button class="btn ghost" id="nTxLog">Transaction log</button><button class="btn ghost" id="nNotifs">Notifications</button><button class="btn ghost" id="nAudit">Admin log</button><button class="btn ghost" id="nBackup">Backup</button><button class="btn ghost" id="nLock">Lock</button></div></div>
   <main id="main"><p class="empty">Search for a user or an order to begin, or open Pending.</p></main></div></div>
 <div class="mdl" id="mdl" hidden><div class="mcard" id="mcard"></div></div>
 <script src="bn-admin.js"></script>
