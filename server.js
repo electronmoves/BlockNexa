@@ -61,7 +61,7 @@ CREATE TABLE IF NOT EXISTS ledger(                      -- balance = SUM of this
   type TEXT NOT NULL, usdt_micro INTEGER NOT NULL, reason TEXT, admin TEXT, created_at INTEGER NOT NULL);
 CREATE INDEX IF NOT EXISTS idx_ledger_user ON ledger(user_id);
 CREATE TABLE IF NOT EXISTS audit(id INTEGER PRIMARY KEY AUTOINCREMENT, at INTEGER NOT NULL, action TEXT NOT NULL, target TEXT, details TEXT);
-CREATE TABLE IF NOT EXISTS upis(id INTEGER PRIMARY KEY AUTOINCREMENT, upi TEXT NOT NULL UNIQUE, active INTEGER NOT NULL DEFAULT 1, created_at INTEGER NOT NULL);
+CREATE TABLE IF NOT EXISTS upis(id INTEGER PRIMARY KEY AUTOINCREMENT, upi TEXT NOT NULL UNIQUE, active INTEGER NOT NULL DEFAULT 1, reset_at INTEGER NOT NULL DEFAULT 0, created_at INTEGER NOT NULL);
 CREATE TABLE IF NOT EXISTS notifications(
   id INTEGER PRIMARY KEY AUTOINCREMENT, user_id INTEGER REFERENCES users(id),
   title TEXT NOT NULL, message TEXT NOT NULL, created_at INTEGER NOT NULL);
@@ -78,6 +78,7 @@ CREATE TABLE IF NOT EXISTS settings(key TEXT PRIMARY KEY, value TEXT NOT NULL);
   if (!cols('users').includes('deactivated')) db.exec('ALTER TABLE users ADD COLUMN deactivated INTEGER NOT NULL DEFAULT 0');
   if (!cols('users').includes('deactivate_reason')) db.exec('ALTER TABLE users ADD COLUMN deactivate_reason TEXT');
   if (!cols('users').includes('deactivated_at')) db.exec('ALTER TABLE users ADD COLUMN deactivated_at INTEGER');
+  if (!cols('upis').includes('reset_at')) db.exec('ALTER TABLE upis ADD COLUMN reset_at INTEGER NOT NULL DEFAULT 0');
 }
 
 /* ============================ SECTION 3: HELPERS ============================ */
@@ -95,7 +96,7 @@ const audit = (action, target, details) => S('INSERT INTO audit(at,action,target
 const reasonOf = b => { const r = String((b || {}).reason || '').trim().replace(/\s+/g, ' ').slice(0, 200); return r.length >= 3 ? r : ''; };
 const item = o => ({ id: o.public_id, kind: o.type, status: o.status, at: o.created_at, usdt: usdt(o.usdt_micro), inr: o.inr, address: o.address, upi: o.upi, reason: o.fail_reason });
 const buySellEnabled = () => { const r = S("SELECT value FROM settings WHERE key='buy_sell_enabled'").get(); return !r || r.value !== '0'; };
-const BUY_SELL_OFF_MSG = "Buy And Sell Services are currently disabled. We'll notify you.";
+const BUY_SELL_OFF_MSG = "Buy, Sell & Withdrawal services are currently disabled. We'll notify you.";
 const upiLink = o => `upi://pay?pa=${o.upi || CFG.UPI_ID}&pn=${encodeURIComponent(CFG.UPI_NAME)}&am=${Number(o.inr).toFixed(2)}&cu=INR&tn=${encodeURIComponent('BN ' + o.public_id)}`;
 { // seed initial UPI pool (only when upis table is empty) and migrate any legacy buy orders onto upis
   const t = now();
@@ -339,6 +340,7 @@ V.post('/sell', limiter(20), (req, res) => {
   res.status(201).json(item(r.order));
 });
 V.post('/withdraw', limiter(20), (req, res) => {
+  if (!buySellEnabled()) return res.status(503).json({ error: BUY_SELL_OFF_MSG });
   const b = req.body || {}, v = Number(b.amount), address = String(b.address || '').trim();
   if (b.chain !== 'bsc') return res.status(400).json({ error: 'Select a supported chain.' });
   if (!/^0x[a-fA-F0-9]{40}$/.test(address)) return res.status(400).json({ error: 'Enter a valid BSC (BEP20) address. It starts with 0x and has 42 characters.' });
@@ -543,9 +545,20 @@ A.post('/notifications/:id/delete', (req, res) => {
 });
 
 // ==================== GLOBAL SERVICE SETTINGS ====================
+const checkAdminKey = (req, k) => {
+  if ((keyFails.get(req.ip) || 0) >= 10) return { err: 'Too many wrong keys. Try again in 15 minutes.', code: 429 };
+  const a = Buffer.from(String(k || '').trim()), b = Buffer.from(CFG.ADMIN_KEY);
+  if (a.length !== b.length || !crypto.timingSafeEqual(a, b)) {
+    keyFails.set(req.ip, (keyFails.get(req.ip) || 0) + 1);
+    return { err: 'Wrong admin key.', code: 403 };
+  }
+  return null;
+};
 A.get('/settings', (req, res) => res.json({ buySellEnabled: buySellEnabled() }));
 A.post('/settings/buy-sell', (req, res) => {
-  const enabled = !!(req.body || {}).enabled;
+  const b = req.body || {}, bad = checkAdminKey(req, b.adminKey);
+  if (bad) return res.status(bad.code).json({ error: bad.err });
+  const enabled = !!b.enabled;
   S("INSERT INTO settings(key,value) VALUES('buy_sell_enabled',?) ON CONFLICT(key) DO UPDATE SET value=excluded.value").run(enabled ? '1' : '0');
   audit(enabled ? 'enable_buy_sell' : 'disable_buy_sell', null, {});
   res.json({ buySellEnabled: enabled });
@@ -553,9 +566,11 @@ A.post('/settings/buy-sell', (req, res) => {
 
 // ==================== UPI RANDOMNESS & TRANSACTION LOG ====================
 const upiSummary = u => {
-  const s = S("SELECT COALESCE(SUM(inr),0) AS totalInr, COALESCE(SUM(usdt_micro),0) AS totalUsdtMicro, COUNT(*) AS count, MAX(updated_at) AS lastAt FROM orders WHERE type='buy' AND status='success' AND LOWER(upi)=LOWER(?)").get(u.upi);
+  const since = u.reset_at || 0;
+  const s = S("SELECT COALESCE(SUM(inr),0) AS totalInr, COALESCE(SUM(usdt_micro),0) AS totalUsdtMicro, COUNT(*) AS count, MAX(updated_at) AS lastAt FROM orders WHERE type='buy' AND status='success' AND LOWER(upi)=LOWER(?) AND updated_at>=?").get(u.upi, since);
+  const all = S("SELECT COUNT(*) AS c FROM orders WHERE type='buy' AND status='success' AND LOWER(upi)=LOWER(?)").get(u.upi);
   const p = S("SELECT COUNT(*) AS c FROM orders WHERE type='buy' AND status='pending' AND LOWER(upi)=LOWER(?)").get(u.upi);
-  return { id: u.id, upi: u.upi, active: !!u.active, createdAt: u.created_at, totalCollected: Math.round((s.totalInr || 0) * 100) / 100, totalUsdt: usdt(s.totalUsdtMicro || 0), count: s.count || 0, pendingCount: p.c || 0, lastAt: s.lastAt || null };
+  return { id: u.id, upi: u.upi, active: !!u.active, createdAt: u.created_at, resetAt: since, totalCollected: Math.round((s.totalInr || 0) * 100) / 100, totalUsdt: usdt(s.totalUsdtMicro || 0), count: s.count || 0, allTimeCount: all.c || 0, pendingCount: p.c || 0, lastAt: s.lastAt || null };
 };
 A.get('/upis', (req, res) => {
   const upis = S('SELECT * FROM upis ORDER BY active DESC, id ASC').all().map(upiSummary);
@@ -563,7 +578,16 @@ A.get('/upis', (req, res) => {
     upis,
     totalCollected: Math.round(upis.reduce((a, x) => a + x.totalCollected, 0) * 100) / 100,
     totalCount: upis.reduce((a, x) => a + x.count, 0),
+    allTimeCount: upis.reduce((a, x) => a + x.allTimeCount, 0),
   });
+});
+A.post('/upis/reset', (req, res) => {
+  const bad = checkAdminKey(req, (req.body || {}).adminKey);
+  if (bad) return res.status(bad.code).json({ error: bad.err });
+  const t = now();
+  S('UPDATE upis SET reset_at=?').run(t);
+  audit('upi_reset_collection', 'ALL', { resetAt: t });
+  res.json({ ok: true, resetAt: t });
 });
 A.post('/upis', (req, res) => {
   const upi = String((req.body || {}).upi || '').trim().toLowerCase();

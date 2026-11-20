@@ -26,6 +26,7 @@
         ${o.num ? `<label class="mut" for="mn">${esc(o.num.label)}</label><input id="mn" type="number" step="0.01" min="0" value="${esc(o.num.value)}" style="margin-top:6px"><div id="prev" class="mut" style="margin:8px 0"></div>` : ''}
         ${o.chips ? `<div class="chips">${o.chips.map(t => `<button type="button" class="chip">${esc(t)}</button>`).join('')}</div>` : ''}
         ${o.text ? `<textarea id="mf" rows="2" maxlength="200" placeholder="${esc(o.text.placeholder || '')}"></textarea>` : ''}
+        ${o.secret ? `<label class="mut" for="ms" style="display:block;margin-top:10px">${esc(o.secret.label || 'Admin key')}</label><input id="ms" type="password" autocomplete="off" placeholder="${esc(o.secret.placeholder || 'Enter admin key')}" style="margin-top:6px">` : ''}
         <p class="merr" id="merr"></p>
         <div class="mbtns"><button class="btn ghost" id="mno">Cancel</button><button class="btn ${o.danger ? 'danger' : ''}" id="myes">${esc(o.ok || 'Confirm')}</button></div>`;
       m.hidden = false;
@@ -33,14 +34,16 @@
       const key = e => { if (e.key === 'Escape') done(null); }; document.addEventListener('keydown', key);
       c.querySelectorAll('.chip').forEach(b => b.onclick = () => { $('#mf').value = b.textContent; $('#mf').focus(); });
       if (o.num) { const upd = () => { $('#prev').innerHTML = o.num.preview ? o.num.preview(+$('#mn').value) : ''; }; $('#mn').oninput = upd; upd(); }
+      if (o.secret) $('#ms').onkeydown = e => { if (e.key === 'Enter') $('#myes').click(); };
       $('#mno').onclick = () => done(null);
       $('#myes').onclick = () => {
-        const text = o.text ? $('#mf').value.trim() : '', num = o.num ? $('#mn').value : '';
+        const text = o.text ? $('#mf').value.trim() : '', num = o.num ? $('#mn').value : '', secret = o.secret ? $('#ms').value.trim() : '';
         if (o.text && o.text.required && text.length < 3) return $('#merr').textContent = 'Write a short reason (at least 3 characters).';
         if (o.num && (num === '' || !(+num >= 0))) return $('#merr').textContent = 'Enter a valid number.';
-        done({ text, num });
+        if (o.secret && !secret) return $('#merr').textContent = 'Enter your admin key to confirm.';
+        done({ text, num, secret });
       };
-      (o.num ? $('#mn') : o.text ? $('#mf') : $('#myes')).focus();
+      (o.num ? $('#mn') : o.text ? $('#mf') : o.secret ? $('#ms') : $('#myes')).focus();
     });
   }
 
@@ -54,7 +57,18 @@
   }
   async function loadSettings() { try { const s = await api('/settings'); paintTradeBtn(s.buySellEnabled); } catch {} }
   async function toggleTrade() {
-    try { const s = await api('/settings/buy-sell', { method: 'POST', body: { enabled: !buySellOn } }); paintTradeBtn(s.buySellEnabled); toast(s.buySellEnabled ? 'Buy & Sell turned ON' : 'Buy & Sell turned OFF (deposits still work)'); }
+    const next = !buySellOn;
+    const r = await ask({
+      title: next ? 'Turn Buy, Sell & Withdrawals ON?' : 'Turn Buy, Sell & Withdrawals OFF?',
+      html: next
+        ? '<p>Users will be able to buy, sell, and withdraw USDT again.</p>'
+        : '<p>All users will be blocked from <b>Buy</b>, <b>Sell</b>, and <b>Withdrawals</b>. <b>Deposits</b> will still work.</p>',
+      secret: { label: 'Enter admin key to confirm', placeholder: 'Admin key' },
+      ok: next ? 'Yes, turn ON' : 'Yes, turn OFF',
+      danger: !next
+    });
+    if (!r) return;
+    try { const s = await api('/settings/buy-sell', { method: 'POST', body: { enabled: next, adminKey: r.secret } }); paintTradeBtn(s.buySellEnabled); toast(s.buySellEnabled ? 'Buy, Sell & Withdrawals turned ON' : 'Buy, Sell & Withdrawals turned OFF (deposits still work)'); }
     catch (e) { toast(e.message, true); }
   }
   function lock() { KEY = ''; sessionStorage.removeItem('bn_admin_key'); $('#panel').hidden = true; $('#login').hidden = false; }
@@ -303,7 +317,7 @@
             <div><span>Last payment</span><b>${u.lastAt ? day(u.lastAt) + ' · ' + clock(u.lastAt) : 'No payments yet'}</b></div>
           </div>
           <div class="upi-btns">
-            <button class="btn" data-upi-logs="${esc(u.upi)}">See all logs (${u.count})</button>
+            <button class="btn" data-upi-logs="${esc(u.upi)}">See all logs (${u.allTimeCount})</button>
             <button class="btn ghost sm" data-upi-only="${esc(u.upi)}" title="Pause all other UPIs and use only this one">Use only</button>
             <button class="btn ghost sm" data-upi-toggle="${esc(u.upi)}">${u.active ? 'Pause' : 'Activate'}</button>
             <button class="btn ghost sm" data-upi-del="${esc(u.upi)}" aria-label="Remove UPI">Remove</button>
@@ -314,9 +328,12 @@
           <div class="head">
             <div>
               <h2>Transaction log · UPI Randomness Control</h2>
-              <small>${activeCount} active UPI${activeCount === 1 ? '' : 's'} in random rotation · ₹${f2(d.totalCollected)} total collected across ${d.totalCount} successful buy payment${d.totalCount === 1 ? '' : 's'}</small>
+              <small>${activeCount} active UPI${activeCount === 1 ? '' : 's'} in random rotation · ₹${f2(d.totalCollected)} collected since last reset (${d.totalCount} payment${d.totalCount === 1 ? '' : 's'} · ${d.allTimeCount} all-time)</small>
             </div>
-            <button class="btn ghost" id="allUpiLogs">See all logs (${d.totalCount})</button>
+            <div style="display:flex;gap:8px;flex-wrap:wrap">
+              <button class="btn danger" id="resetTodayUpi">Reset collection</button>
+              <button class="btn ghost" id="allUpiLogs">See all logs (${d.allTimeCount})</button>
+            </div>
           </div>
           <form class="upi-add" id="upiAddForm">
             <input id="newUpi" placeholder="Add a UPI ID to random rotation (e.g. merchant@upi)" autocomplete="off" spellcheck="false" aria-label="New UPI ID">
@@ -369,6 +386,18 @@
   function bindTxLog() {
     const m = $('#main');
     if ($('#allUpiLogs', m)) $('#allUpiLogs', m).onclick = () => showUpiLogs('');
+    if ($('#resetTodayUpi', m)) $('#resetTodayUpi', m).onclick = async () => {
+      const r = await ask({
+        title: 'Reset today’s collection',
+        html: '<p>Resets every UPI card’s <b>Total collected</b> counter back to <b>₹0.00</b> for a fresh start.</p><p class="mut">No payment logs are deleted — all past orders remain visible in <b>See all logs</b>.</p>',
+        secret: { label: 'Enter admin key to confirm', placeholder: 'Admin key' },
+        ok: 'Reset to ₹0.00',
+        danger: true
+      });
+      if (!r) return;
+      try { await api('/upis/reset', { method: 'POST', body: { adminKey: r.secret } }); toast('Collection counters reset to ₹0.00'); txLog(); }
+      catch (err) { toast(err.message, true); }
+    };
     if ($('#upiAddForm', m)) $('#upiAddForm', m).onsubmit = async e => {
       e.preventDefault();
       const v = $('#newUpi', m).value.trim();

@@ -302,15 +302,15 @@
         <a class="row lk tn-t" href="#/support" style="margin-top:0"><span class="rico t">${icon('help')}</span><div class="rmid"><b>Need help?</b><small>Contact support</small></div></a>
       </section></div></div>`;
     if (rt.buySellEnabled === false) {
-      root.querySelectorAll('a[href="#/buy"], a[href="#/sell"]').forEach(a => a.onclick = e => { e.preventDefault(); buySellOffAlert(); });
+      root.querySelectorAll('a[href="#/buy"], a[href="#/sell"], a[href="#/withdraw"]').forEach(a => a.onclick = e => { e.preventDefault(); buySellOffAlert(); });
     }
   }
-  const buySellOffAlert = () => ask({ title: 'Service Unavailable', note: "Buy And Sell Services are currently disabled. We'll notify you.", ok: 'OK', cancel: '', tone: 'danger', icon: 'warn' });
+  const buySellOffAlert = () => ask({ title: 'Service Unavailable', note: "Buy, Sell & Withdrawal services are currently disabled. We'll notify you.", ok: 'OK', cancel: '', tone: 'danger', icon: 'warn' });
 
   async function buy(root) {
     const rt = await api().rates(), min = Math.ceil(rt.minBuyUsdt * rt.buy);
     if (rt.buySellEnabled === false) {
-      screen(root, 'Buy USDT', `<div class="card center"><p class="err" style="margin-top:0">Buy And Sell Services are currently disabled. We'll notify you.</p><a class="btn ghost" href="#/deposit">Deposit USDT instead</a><a class="btn ghost" href="#/home">Back to home</a></div>`);
+      screen(root, 'Buy USDT', `<div class="card center"><p class="err" style="margin-top:0">Buy, Sell &amp; Withdrawal services are currently disabled. We'll notify you.</p><a class="btn ghost" href="#/deposit">Deposit USDT instead</a><a class="btn ghost" href="#/home">Back to home</a></div>`);
       return buySellOffAlert();
     }
     screen(root, 'Buy USDT', `<div class="card"><p class="mut">₹${+rt.buy} per USDT. Minimum ${rt.minBuyUsdt} USDT (₹${fmt(min, 0)}), maximum ₹${fmt(rt.maxBuyInr, 0)}.</p>
@@ -348,7 +348,7 @@
   async function sell(root) {
     const [rt, bal] = await Promise.all([api().rates(), api().balance()]);
     if (rt.buySellEnabled === false) {
-      screen(root, 'Sell USDT', `<div class="card center"><p class="err" style="margin-top:0">Buy And Sell Services are currently disabled. We'll notify you.</p><a class="btn ghost" href="#/deposit">Deposit USDT instead</a><a class="btn ghost" href="#/home">Back to home</a></div>`);
+      screen(root, 'Sell USDT', `<div class="card center"><p class="err" style="margin-top:0">Buy, Sell &amp; Withdrawal services are currently disabled. We'll notify you.</p><a class="btn ghost" href="#/deposit">Deposit USDT instead</a><a class="btn ghost" href="#/home">Back to home</a></div>`);
       return buySellOffAlert();
     }
     screen(root, 'Sell USDT', `<div class="card"><p class="mut">Sell at <b style="color:var(--success)">₹${+rt.sell}</b> per USDT. Available: ${fmt(bal.usdt)} USDT. Minimum ${rt.minSellUsdt} USDT.</p>
@@ -381,6 +381,10 @@
 
   async function withdraw(root) {
     const [bal, rt] = await Promise.all([api().balance(), api().rates()]), low = bal.usdt < rt.minWithdraw;
+    if (rt.buySellEnabled === false) {
+      screen(root, 'Withdraw USDT', `<div class="card center"><p class="err" style="margin-top:0">Buy, Sell &amp; Withdrawal services are currently disabled. We'll notify you.</p><a class="btn ghost" href="#/deposit">Deposit USDT instead</a><a class="btn ghost" href="#/home">Back to home</a></div>`);
+      return buySellOffAlert();
+    }
     screen(root, 'Withdraw USDT', `<div class="card"><p class="mut">Select your chain</p>
       <div class="row" style="border-color:var(--primary);cursor:default"><span class="rico l">${icon('wd')}</span><div class="rmid"><b>BSC</b><small>BNB Smart Chain (BEP20)</small></div><span class="badge ok">Selected</span></div>
       <div class="kv"><div><span>Available</span><b>${fmt(bal.usdt)} USDT</b></div></div>
