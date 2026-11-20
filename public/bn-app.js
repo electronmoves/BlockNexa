@@ -284,9 +284,9 @@
     const [whole, dec] = fmt(bal.usdt).split('.');
     const blocks = Array.from({ length: 8 }, (_, n) => `<i style="--n:${n}"></i>`).join('');
     root.innerHTML = `<div class="wrap">
-      <div class="top"><div class="brand"><span class="mark">${icon('cube')}</span>${esc(cfg.NAME)}</div>
-        <div style="display:flex;gap:10px;align-items:center"><span class="pill"><i class="dot"></i>Sell <b class="flash">₹${+rt.sell}</b> · Buy <b>₹${+rt.buy}</b></span>
-        <a class="iconbtn" href="#/account" aria-label="Account">${icon('user')}</a></div></div>
+      <div class="top htop"><div class="brand"><span class="mark">${icon('cube')}</span>${esc(cfg.NAME)}</div>
+        <span class="pill"><i class="dot"></i>Sell <b class="flash">₹${+rt.sell}</b> · Buy <b>₹${+rt.buy}</b></span>
+        <div class="top-acts"><a class="iconbtn" href="#/support" aria-label="Support">${icon('help')}</a><a class="iconbtn" href="#/account" aria-label="Account">${icon('user')}</a></div></div>
       <div class="home"><section>
         <div class="wallet"><div class="wtop"><span class="lbl">Your balance</span><span class="chainpill"><i></i>USDT · BSC</span></div>
           <div class="big">${whole}<span class="dec">.${dec}</span><small>USDT</small></div>
