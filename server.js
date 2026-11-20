@@ -26,7 +26,7 @@ const CFG = {
   GOOGLE_CLIENT_ID: env('GOOGLE_CLIENT_ID').trim(),
   OTP_TRANSPORT: env('OTP_TRANSPORT', env('TELEGRAM_SESSION') ? 'telegram' : 'console'),   // telegram | console (console only prints the code, for local testing)
   OTP_COOLDOWN_MS: num('OTP_COOLDOWN_SEC', 30) * 1000,
-  ADMIN_KEY: env('ADMIN_KEY') || crypto.randomBytes(18).toString('hex'),
+  ADMIN_KEY: env('ADMIN_KEY').trim() || crypto.randomBytes(18).toString('hex'),
   ADMIN_IPS: env('ADMIN_IPS').split(',').map(s => s.trim()).filter(Boolean),                // optional: only these IPs may use the admin panel
   APP_SECRET: env('APP_SECRET') || crypto.randomBytes(32).toString('hex'),
   SESSION_DAYS: Math.max(7, num('SESSION_DAYS', 30)),                                       // how long a login lasts (never less than 7 days)
@@ -559,6 +559,7 @@ app.listen(CFG.PORT, err => {
   console.log(CFG.GOOGLE_CLIENT_ID ? 'Google sign-in: ON' : 'Google sign-in: off (set GOOGLE_CLIENT_ID)');
   if (!S('SELECT 1 FROM upis WHERE active=1').get()) console.log('WARNING: no active UPI IDs are set, so buying is switched off.');
   if (!CFG.DEPOSIT_ADDRESS) console.log('WARNING: DEPOSIT_ADDRESS is not set, so the deposit page is empty.');
-  if (!process.env.ADMIN_KEY) console.log('WARNING: ADMIN_KEY is not set. Temporary admin key for this run:', CFG.ADMIN_KEY);
+  if (!env('ADMIN_KEY').trim()) console.log('WARNING: ADMIN_KEY is not set. Temporary admin key for this run:', CFG.ADMIN_KEY);
+  else console.log(`Admin key: configured from environment (${CFG.ADMIN_KEY.length} chars)`);
   if (process.env.RENDER && !process.env.DATA_DIR) console.log('WARNING: running on Render without DATA_DIR. The database is ERASED on every restart. Add a persistent disk.');
 });
