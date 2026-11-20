@@ -20,8 +20,8 @@ const CFG = {
   PORT: num('PORT', 3000),
   BUY_RATE: num('BUY_RATE', 102.5), SELL_RATE: num('SELL_RATE', 100),
   MIN_BUY_USDT: num('MIN_BUY_USDT', 5), MAX_BUY_INR: num('MAX_BUY_INR', 10000), MIN_SELL_USDT: num('MIN_SELL_USDT', 5), MIN_WITHDRAW: num('MIN_WITHDRAW', 5),
-  UPI_ID: /^[\w.\-]{2,}@[\w.\-]{2,}$/.test(env('UPI_ID')) ? env('UPI_ID') : '', UPI_NAME: env('UPI_NAME', 'BlockNexa').slice(0, 40),
-  UPI_IDS: env('UPI_IDS', env('UPI_ID') || '123@upi,ishu@upi,example@upi').split(',').map(s => s.trim()).filter(s => /^[\w.\-]{2,}@[\w.\-]{2,}$/.test(s)),
+  UPI_ID: /^[\w.\-]{2,}@[\w.\-]{2,}$/.test(env('UPI_ID')) ? env('UPI_ID').toLowerCase() : '', UPI_NAME: env('UPI_NAME', 'BlockNexa').slice(0, 40),
+  UPI_IDS: env('UPI_IDS', env('UPI_ID') || '123@upi,ishu@upi,example@upi').split(',').map(s => s.trim().toLowerCase()).filter(s => /^[\w.\-]{2,}@[\w.\-]{2,}$/.test(s)),
   DEPOSIT_ADDRESS: /^0x[a-fA-F0-9]{40}$/.test(env('DEPOSIT_ADDRESS')) ? env('DEPOSIT_ADDRESS') : '',
   GOOGLE_CLIENT_ID: env('GOOGLE_CLIENT_ID').trim(),
   OTP_TRANSPORT: env('OTP_TRANSPORT', env('TELEGRAM_SESSION') ? 'telegram' : 'console'),   // telegram | console (console only prints the code, for local testing)
@@ -86,18 +86,24 @@ const audit = (action, target, details) => S('INSERT INTO audit(at,action,target
 const reasonOf = b => { const r = String((b || {}).reason || '').trim().replace(/\s+/g, ' ').slice(0, 200); return r.length >= 3 ? r : ''; };
 const item = o => ({ id: o.public_id, kind: o.type, status: o.status, at: o.created_at, usdt: usdt(o.usdt_micro), inr: o.inr, address: o.address, upi: o.upi, reason: o.fail_reason });
 const upiLink = o => `upi://pay?pa=${o.upi || CFG.UPI_ID}&pn=${encodeURIComponent(CFG.UPI_NAME)}&am=${Number(o.inr).toFixed(2)}&cu=INR&tn=${encodeURIComponent('BN ' + o.public_id)}`;
-{ // seed initial UPI pool and migrate any existing buy orders onto upis
+{ // seed initial UPI pool (only when upis table is empty) and migrate any legacy buy orders onto upis
   const t = now();
-  for (const u of CFG.UPI_IDS) S('INSERT OR IGNORE INTO upis(upi,active,created_at) VALUES(?,1,?)').run(u, t);
   if (CFG.UPI_ID) S("UPDATE orders SET upi=? WHERE type='buy' AND (upi IS NULL OR upi='')").run(CFG.UPI_ID);
-  for (const r of S("SELECT upi, MIN(created_at) AS first_at FROM orders WHERE type='buy' AND upi IS NOT NULL AND upi!='' GROUP BY upi").all()) {
-    S('INSERT OR IGNORE INTO upis(upi,active,created_at) VALUES(?,1,?)').run(r.upi, r.first_at || t);
+  if (!S('SELECT 1 FROM upis LIMIT 1').get()) {
+    for (const u of CFG.UPI_IDS) S('INSERT OR IGNORE INTO upis(upi,active,created_at) VALUES(?,1,?)').run(u, t);
+    for (const r of S("SELECT LOWER(upi) AS upi, MIN(created_at) AS first_at FROM orders WHERE type='buy' AND upi IS NOT NULL AND upi!='' GROUP BY LOWER(upi)").all()) {
+      S('INSERT OR IGNORE INTO upis(upi,active,created_at) VALUES(?,1,?)').run(r.upi, r.first_at || t);
+    }
   }
 }
+let lastPickedUpi = '';
 const pickRandomUpi = () => {
   const pool = S('SELECT upi FROM upis WHERE active=1').all().map(r => r.upi);
   if (!pool.length) return CFG.UPI_ID || '';
-  return pool[crypto.randomInt(pool.length)];
+  if (pool.length === 1) return (lastPickedUpi = pool[0]);
+  const choices = pool.filter(u => u !== lastPickedUpi);
+  const picked = choices[crypto.randomInt(choices.length)];
+  return (lastPickedUpi = picked);
 };
 
 const app = express();
@@ -473,8 +479,9 @@ A.post('/user/:uid/reactivate', (req, res) => {
 
 // ==================== UPI RANDOMNESS & TRANSACTION LOG ====================
 const upiSummary = u => {
-  const s = S("SELECT COALESCE(SUM(inr),0) AS totalInr, COALESCE(SUM(usdt_micro),0) AS totalUsdtMicro, COUNT(*) AS count, MAX(updated_at) AS lastAt FROM orders WHERE type='buy' AND status='success' AND upi=?").get(u.upi);
-  return { id: u.id, upi: u.upi, active: !!u.active, createdAt: u.created_at, totalCollected: Math.round((s.totalInr || 0) * 100) / 100, totalUsdt: usdt(s.totalUsdtMicro || 0), count: s.count || 0, lastAt: s.lastAt || null };
+  const s = S("SELECT COALESCE(SUM(inr),0) AS totalInr, COALESCE(SUM(usdt_micro),0) AS totalUsdtMicro, COUNT(*) AS count, MAX(updated_at) AS lastAt FROM orders WHERE type='buy' AND status='success' AND LOWER(upi)=LOWER(?)").get(u.upi);
+  const p = S("SELECT COUNT(*) AS c FROM orders WHERE type='buy' AND status='pending' AND LOWER(upi)=LOWER(?)").get(u.upi);
+  return { id: u.id, upi: u.upi, active: !!u.active, createdAt: u.created_at, totalCollected: Math.round((s.totalInr || 0) * 100) / 100, totalUsdt: usdt(s.totalUsdtMicro || 0), count: s.count || 0, pendingCount: p.c || 0, lastAt: s.lastAt || null };
 };
 A.get('/upis', (req, res) => {
   const upis = S('SELECT * FROM upis ORDER BY active DESC, id ASC').all().map(upiSummary);
@@ -488,13 +495,23 @@ A.post('/upis', (req, res) => {
   const upi = String((req.body || {}).upi || '').trim().toLowerCase();
   if (!/^[\w.\-]{2,}@[\w.\-]{2,}$/.test(upi)) return res.status(400).json({ error: 'Enter a valid UPI ID, like name@upi.' });
   if (S('SELECT 1 FROM upis WHERE LOWER(upi)=?').get(upi)) return res.status(409).json({ error: 'This UPI ID is already in the list.' });
-  S('INSERT INTO upis(upi,active,created_at) VALUES(?,1,?)').run(upi, now());
-  audit('upi_add', upi, {});
-  res.status(201).json(upiSummary(S('SELECT * FROM upis WHERE upi=?').get(upi)));
+  const t = now(), exclusive = !!(req.body || {}).exclusive;
+  if (exclusive) S('UPDATE upis SET active=0').run();
+  S('INSERT INTO upis(upi,active,created_at) VALUES(?,1,?)').run(upi, t);
+  audit('upi_add', upi, { exclusive });
+  res.status(201).json(upiSummary(S('SELECT * FROM upis WHERE LOWER(upi)=?').get(upi)));
+});
+A.post('/upis/only', (req, res) => {
+  const upi = String((req.body || {}).upi || '').trim().toLowerCase();
+  const row = S('SELECT * FROM upis WHERE LOWER(upi)=?').get(upi);
+  if (!row) return res.status(404).json({ error: 'UPI ID not found.' });
+  S('UPDATE upis SET active = CASE WHEN id=? THEN 1 ELSE 0 END').run(row.id);
+  audit('upi_use_only', row.upi, {});
+  res.json(upiSummary(S('SELECT * FROM upis WHERE id=?').get(row.id)));
 });
 A.post('/upis/toggle', (req, res) => {
-  const upi = String((req.body || {}).upi || '').trim();
-  const row = S('SELECT * FROM upis WHERE upi=?').get(upi);
+  const upi = String((req.body || {}).upi || '').trim().toLowerCase();
+  const row = S('SELECT * FROM upis WHERE LOWER(upi)=?').get(upi);
   if (!row) return res.status(404).json({ error: 'UPI ID not found.' });
   const next = row.active ? 0 : 1;
   S('UPDATE upis SET active=? WHERE id=?').run(next, row.id);
@@ -502,8 +519,8 @@ A.post('/upis/toggle', (req, res) => {
   res.json(upiSummary(S('SELECT * FROM upis WHERE id=?').get(row.id)));
 });
 A.post('/upis/delete', (req, res) => {
-  const upi = String((req.body || {}).upi || '').trim();
-  const row = S('SELECT * FROM upis WHERE upi=?').get(upi);
+  const upi = String((req.body || {}).upi || '').trim().toLowerCase();
+  const row = S('SELECT * FROM upis WHERE LOWER(upi)=?').get(upi);
   if (!row) return res.status(404).json({ error: 'UPI ID not found.' });
   S('DELETE FROM upis WHERE id=?').run(row.id);
   audit('upi_remove', row.upi, {});
@@ -512,9 +529,9 @@ A.post('/upis/delete', (req, res) => {
 A.get('/upis/logs', (req, res) => {
   const upi = String(req.query.upi || '').trim();
   const rows = upi
-    ? S("SELECT * FROM orders WHERE type='buy' AND status='success' AND upi=? ORDER BY updated_at DESC, id DESC LIMIT 300").all(upi)
+    ? S("SELECT * FROM orders WHERE type='buy' AND status='success' AND LOWER(upi)=LOWER(?) ORDER BY updated_at DESC, id DESC LIMIT 300").all(upi)
     : S("SELECT * FROM orders WHERE type='buy' AND status='success' ORDER BY updated_at DESC, id DESC LIMIT 300").all();
-  const meta = upi ? S('SELECT * FROM upis WHERE upi=?').get(upi) : null;
+  const meta = upi ? S('SELECT * FROM upis WHERE LOWER(upi)=LOWER(?)').get(upi) : null;
   res.json({
     upi: upi || null,
     summary: meta ? upiSummary(meta) : null,

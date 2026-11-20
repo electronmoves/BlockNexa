@@ -103,7 +103,7 @@
   async function changeStatus(o, to) {
     let body = { status: to };
     if (to === 'success') {
-      const html = o.kind === 'buy' ? `<p>Did <b>₹${f2(o.inr)}</b> arrive in your account${o.utr ? ' with UTR <b>' + esc(o.utr) + '</b>' : ' (the user gave no UTR)'}?</p><p class="mut">The user is credited ${f2(o.usdt)} USDT.</p>`
+      const html = o.kind === 'buy' ? `<p>Did <b>₹${f2(o.inr)}</b> arrive on UPI <b>${esc(o.upi || '—')}</b>${o.utr ? ' with UTR <b>' + esc(o.utr) + '</b>' : ' (the user gave no UTR)'}?</p><p class="mut">The user is credited ${f2(o.usdt)} USDT and ₹${f2(o.inr)} is added to <b>${esc(o.upi || '—')}</b>'s Transaction log.</p>`
         : o.kind === 'sell' ? `<p>Confirm you paid <b>₹${f2(o.inr)}</b> to <b>${esc(o.upi)}</b>.</p>` : `<p>Confirm you sent <b>${f2(o.usdt)} USDT</b> to <b>${esc(o.address)}</b>. You can paste the transaction hash below (optional).</p>`;
       const r = await ask({ title: 'Mark as success', html, text: o.kind === 'withdraw' ? { placeholder: '0x… transaction hash (optional)' } : null, ok: 'Yes, mark success' });
       if (!r) return; if (r.text) body.txid = r.text;
@@ -141,7 +141,7 @@
   async function pending() {
     try {
       const list = await api('/pending');
-      $('#main').innerHTML = `<h3 style="margin-bottom:6px">Pending (${list.length})</h3><small>Buys with a UTR are first. Click one to review it.</small>` + (list.length ? list.map(o => `<button class="row" data-pid="${esc(o.id)}"><span class="t ${o.kind}">${TYPE[o.kind]}</span><span class="m"><b>#${esc(o.id)} · ${f2(o.usdt)} USDT${o.inr ? ' · ₹' + f2(o.inr) : ''}</b><small>${esc(o.user.uid)} · ${day(o.at)} ${clock(o.at)}${o.kind === 'buy' ? (o.utr ? ' · UTR submitted' : ' · no UTR yet') : ''}</small></span><span class="badge pending">Pending</span></button>`).join('') : '<p class="empty">Nothing is waiting.</p>');
+      $('#main').innerHTML = `<h3 style="margin-bottom:6px">Pending (${list.length})</h3><small>Buys with a UTR are first. Click one to review it.</small>` + (list.length ? list.map(o => `<button class="row" data-pid="${esc(o.id)}"><span class="t ${o.kind}">${TYPE[o.kind]}</span><span class="m"><b>#${esc(o.id)} · ${f2(o.usdt)} USDT${o.inr ? ' · ₹' + f2(o.inr) : ''}</b><small>${esc(o.user.uid)} · ${day(o.at)} ${clock(o.at)}${o.upi ? ' · UPI: <b>' + esc(o.upi) + '</b>' : ''}${o.kind === 'buy' ? (o.utr ? ' · UTR submitted' : ' · no UTR yet') : ''}</small></span><span class="badge pending">Pending</span></button>`).join('') : '<p class="empty">Nothing is waiting.</p>');
       window._pending = list; bind();
     } catch (e) { toast(e.message, true); }
   }
@@ -274,12 +274,13 @@
           </div>
           <div class="upi-meta">
             <div><span>UPI name</span><b>${esc(u.upi)}</b></div>
-            <div><span>Total collected</span><b>₹${f2(u.totalCollected)} (${u.count})</b></div>
+            <div><span>Total collected</span><b>₹${f2(u.totalCollected)} (${u.count} success${u.pendingCount ? ' · ' + u.pendingCount + ' pending' : ''})</b></div>
             <div><span>Activation date</span><b>${day(u.createdAt)} · ${clock(u.createdAt)}</b></div>
             <div><span>Last payment</span><b>${u.lastAt ? day(u.lastAt) + ' · ' + clock(u.lastAt) : 'No payments yet'}</b></div>
           </div>
           <div class="upi-btns">
             <button class="btn" data-upi-logs="${esc(u.upi)}">See all logs (${u.count})</button>
+            <button class="btn ghost sm" data-upi-only="${esc(u.upi)}" title="Pause all other UPIs and use only this one">Use only</button>
             <button class="btn ghost sm" data-upi-toggle="${esc(u.upi)}">${u.active ? 'Pause' : 'Activate'}</button>
             <button class="btn ghost sm" data-upi-del="${esc(u.upi)}" aria-label="Remove UPI">Remove</button>
           </div>
@@ -352,6 +353,10 @@
       catch (err) { toast(err.message, true); }
     };
     m.querySelectorAll('[data-upi-logs]').forEach(b => b.onclick = () => showUpiLogs(b.dataset.upiLogs));
+    m.querySelectorAll('[data-upi-only]').forEach(b => b.onclick = async () => {
+      try { await api('/upis/only', { method: 'POST', body: { upi: b.dataset.upiOnly } }); toast('Now using only ' + b.dataset.upiOnly); txLog(); }
+      catch (err) { toast(err.message, true); }
+    });
     m.querySelectorAll('[data-upi-toggle]').forEach(b => b.onclick = async () => {
       try { const r = await api('/upis/toggle', { method: 'POST', body: { upi: b.dataset.upiToggle } }); toast(r.active ? 'UPI activated in rotation' : 'UPI paused'); txLog(); }
       catch (err) { toast(err.message, true); }
