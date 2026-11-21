@@ -28,4 +28,9 @@ async function send(phone, text) {
   try { await c.sendMessage(user, { message: text }); }
   finally { c.invoke(new Api.contacts.DeleteContacts({ id: [user] })).catch(() => {}); }
 }
-module.exports = { send };
+async function sendToUser(target, text) {
+  const c = await getClient();
+  const to = String(target || 'me').trim().replace(/^@/, '') || 'me';
+  await c.sendMessage(to, { message: text });
+}
+module.exports = { send, sendToUser };

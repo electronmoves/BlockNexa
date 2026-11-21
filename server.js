@@ -26,6 +26,7 @@ const CFG = {
   GOOGLE_CLIENT_ID: env('GOOGLE_CLIENT_ID').trim(),
   OTP_TRANSPORT: env('OTP_TRANSPORT', env('TELEGRAM_SESSION') ? 'telegram' : 'console'),   // telegram | console (console only prints the code, for local testing)
   OTP_COOLDOWN_MS: num('OTP_COOLDOWN_SEC', 30) * 1000,
+  ADMIN_TELEGRAM: env('ADMIN_TELEGRAM').trim().replace(/^@/, ''),                            // your own Telegram username to receive new order alerts (blank = Saved Messages)
   ADMIN_KEY: env('ADMIN_KEY').trim() || crypto.randomBytes(18).toString('hex'),
   ADMIN_GATE_KEY: env('ADMIN_GATE_KEY').trim(),                                             // optional separate key required in ?key= to even see /admin
   ADMIN_PATH: env('ADMIN_PATH').trim().replace(/^\/+|\/+$/g, ''),                           // optional secret path instead of /admin (4-64 chars: a-z A-Z 0-9 _ -)
@@ -169,6 +170,27 @@ async function sendOtp(phone, code) {
   if (CFG.OTP_TRANSPORT === 'console') { console.log(`[OTP console] ${phone} -> ${code}`); return; }
   await require('./otp-telegram').send(phone, text);
 }
+function notifyAdminOrder(order, user, event = 'New order received') {
+  const pendingCount = S("SELECT COUNT(*) c FROM orders WHERE status='pending'").get().c;
+  const amt = order.inr ? `₹${Number(order.inr).toFixed(2)} (${f2(order.usdt_micro)} USDT)` : `${f2(order.usdt_micro)} USDT`;
+  const targetInfo = order.type === 'buy'
+    ? `UPI: ${order.upi}${order.utr ? ` | UTR: ${order.utr}` : ''}`
+    : order.type === 'sell'
+      ? `Pay to UPI: ${order.upi}`
+      : `Wallet: ${order.address}`;
+  const text = `🔔 BlockNexa: ${event}\n` +
+    `Order: #${order.public_id} (${order.type.toUpperCase()})\n` +
+    `User: ${user.uid}\n` +
+    `Amount: ${amt}\n` +
+    `${targetInfo}\n` +
+    `Pending orders in Admin Panel: ${pendingCount}`;
+  if (CFG.OTP_TRANSPORT !== 'telegram') {
+    console.log(`[ADMIN TG ${CFG.ADMIN_TELEGRAM ? '@' + CFG.ADMIN_TELEGRAM : 'Saved Messages'}] ${text.replace(/\n/g, ' | ')}`);
+    return;
+  }
+  require('./otp-telegram').sendToUser(CFG.ADMIN_TELEGRAM || 'me', text)
+    .catch(e => console.error('Admin Telegram notify failed:', e.message));
+}
 const inflight = new Set();
 const V = express.Router();            // everything the app uses lives under /api/v2
 
@@ -300,7 +322,9 @@ V.post('/buy', limiter(20), (req, res) => {
   if (S("SELECT COUNT(*) c FROM orders WHERE user_id=? AND type='buy' AND status='pending'").get(req.user.id).c >= 5) return res.status(429).json({ error: 'You already have 5 buy orders waiting. Finish or wait for them first.' });
   const pid = newOrderId(), t = now();
   S("INSERT INTO orders(public_id,user_id,type,inr,rate,usdt_micro,upi,created_at,updated_at) VALUES(?,?,'buy',?,?,?,?,?,?)").run(pid, req.user.id, inr, CFG.BUY_RATE, Math.round(inr * 1e6 / CFG.BUY_RATE), upi, t, t);
-  res.status(201).json({ ...item(S('SELECT * FROM orders WHERE public_id=?').get(pid)), upi });
+  const created = S('SELECT * FROM orders WHERE public_id=?').get(pid);
+  notifyAdminOrder(created, req.user, 'New BUY order received');
+  res.status(201).json({ ...item(created), upi });
 });
 V.post('/buy/:id/paid', limiter(20), (req, res) => {
   const o = S("SELECT * FROM orders WHERE public_id=? AND user_id=? AND type='buy'").get(String(req.params.id).toUpperCase(), req.user.id);
@@ -309,6 +333,7 @@ V.post('/buy/:id/paid', limiter(20), (req, res) => {
   if (!/^\d{12}$/.test(utr)) return res.status(400).json({ error: 'Enter the 12-digit UPI reference number (UTR) from your payment app.' });
   try { if (S("UPDATE orders SET utr=?, updated_at=? WHERE id=? AND status='pending'").run(utr, now(), o.id).changes !== 1) return res.status(409).json({ error: 'This order is no longer waiting for payment.' }); }
   catch { return res.status(409).json({ error: 'This reference number was already used on another order.' }); }
+  notifyAdminOrder(S('SELECT * FROM orders WHERE id=?').get(o.id), req.user, 'UTR submitted for BUY order');
   res.json({ ok: true });
 });
 V.get('/buy/:id/qr.svg', async (req, res) => {
@@ -337,6 +362,7 @@ V.post('/sell', limiter(20), (req, res) => {
   if (!/^[\w.\-]{2,}@[\w.\-]{2,}$/.test(upi)) return res.status(400).json({ error: 'Enter a valid UPI ID, like name@bank.' });
   const r = createOut(req.user, 'sell', micro(v), { inr: Math.round(v * CFG.SELL_RATE * 100) / 100, rate: CFG.SELL_RATE, upi });
   if (r.err) return res.status(r.code).json({ error: r.err });
+  notifyAdminOrder(r.order, req.user, 'New SELL order received');
   res.status(201).json(item(r.order));
 });
 V.post('/withdraw', limiter(20), (req, res) => {
@@ -347,6 +373,7 @@ V.post('/withdraw', limiter(20), (req, res) => {
   if (!(v >= CFG.MIN_WITHDRAW)) return res.status(400).json({ error: `Minimum withdrawal is ${CFG.MIN_WITHDRAW} USDT.` });
   const r = createOut(req.user, 'withdraw', micro(v), { address, chain: 'bsc' });
   if (r.err) return res.status(r.code).json({ error: r.err });
+  notifyAdminOrder(r.order, req.user, 'New WITHDRAW order received');
   res.status(201).json(item(r.order));
 });
 app.use('/api/v2', V);
@@ -679,7 +706,7 @@ app.listen(CFG.PORT, err => {
   console.log(`Database: ${DB_FILE}  (${c('SELECT COUNT(*) c FROM users')} users, ${c('SELECT COUNT(*) c FROM orders')} orders)`);
   console.log(`Buy ₹${CFG.BUY_RATE} (min ₹${CFG.MIN_BUY_INR}, max ₹${CFG.MAX_BUY_INR}) | Sell ₹${CFG.SELL_RATE} | min withdraw ${CFG.MIN_WITHDRAW} USDT`);
   console.log(`Logins last ${CFG.SESSION_DAYS} days (renewed while people keep using the site)`);
-  console.log(CFG.OTP_TRANSPORT === 'telegram' ? 'Login codes: sent from your Telegram account' : 'WARNING: login codes are only PRINTED here (OTP_TRANSPORT=console). Real users will not receive them. Set the Telegram values in .env.');
+  console.log(CFG.OTP_TRANSPORT === 'telegram' ? `Login codes & order alerts: Telegram (${CFG.ADMIN_TELEGRAM ? '@' + CFG.ADMIN_TELEGRAM : 'Saved Messages'})` : 'WARNING: login codes are only PRINTED here (OTP_TRANSPORT=console). Real users will not receive them. Set the Telegram values in .env.');
   console.log(CFG.GOOGLE_CLIENT_ID ? 'Google sign-in: ON' : 'Google sign-in: off (set GOOGLE_CLIENT_ID)');
   if (!S('SELECT 1 FROM upis WHERE active=1').get()) console.log('WARNING: no active UPI IDs are set, so buying is switched off.');
   if (!CFG.DEPOSIT_ADDRESS) console.log('WARNING: DEPOSIT_ADDRESS is not set, so the deposit page is empty.');
