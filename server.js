@@ -28,8 +28,8 @@ const CFG = {
   OTP_COOLDOWN_MS: num('OTP_COOLDOWN_SEC', 30) * 1000,
   ADMIN_TELEGRAM: env('ADMIN_TELEGRAM').trim().replace(/^@/, ''),                            // your own Telegram username to receive new order alerts (blank = Saved Messages)
   ADMIN_KEY: env('ADMIN_KEY').trim() || crypto.randomBytes(18).toString('hex'),
-  ADMIN_GATE_KEY: env('ADMIN_GATE_KEY').trim(),                                             // optional separate key required in ?key= to even see /admin
-  ADMIN_PATH: env('ADMIN_PATH').trim().replace(/^\/+|\/+$/g, ''),                           // optional secret path instead of /admin (4-64 chars: a-z A-Z 0-9 _ -)
+  ADMIN_GATE_KEY: env('ADMIN_GATE_KEY').trim(),                                             // optional extra ?key= required on the secret admin route
+  ADMIN_PATH: env('ADMIN_PATH', 'tsjsigjijgdigj77sf7sf4').trim().replace(/^\/+|\/+$/g, ''), // secret admin URL path (/admin is always 404)
   ADMIN_IPS: env('ADMIN_IPS').split(',').map(s => s.trim()).filter(Boolean),                // optional: only these IPs may use the admin panel
   APP_SECRET: env('APP_SECRET') || crypto.randomBytes(32).toString('hex'),
   SESSION_DAYS: Math.max(7, num('SESSION_DAYS', 30)),                                       // how long a login lasts (never less than 7 days)
@@ -668,7 +668,7 @@ app.use('/api/admin', A);
 
 /* ================================= SECTION 7: START ================================= */
 const PUBLIC = path.join(__dirname, 'public'), ADMIN = path.join(PUBLIC, 'admin');   // the site is public/, the admin panel is public/admin/
-const ADMIN_ROUTE = /^[a-zA-Z0-9_-]{4,64}$/.test(CFG.ADMIN_PATH) ? '/' + CFG.ADMIN_PATH : '/admin';
+const ADMIN_ROUTE = /^[a-zA-Z0-9_-]{8,64}$/.test(CFG.ADMIN_PATH) && CFG.ADMIN_PATH.toLowerCase() !== 'admin' ? '/' + CFG.ADMIN_PATH : '/tsjsigjijgdigj77sf7sf4';
 const GATE_KEY = CFG.ADMIN_GATE_KEY || CFG.ADMIN_KEY;
 const GATE_MS = 12 * 3600 * 1000;
 const gateSig = exp => hmac('admin-gate:' + GATE_KEY + ':' + exp);
@@ -680,7 +680,7 @@ const hasGateCookie = req => {
   return Number.isFinite(exp) && exp > now() && /^[a-f0-9]{64}$/.test(sig) && same(sig, gateSig(expStr));
 };
 const adminGate = (req, res, next) => {
-  if (CFG.ADMIN_PATH && ADMIN_ROUTE !== '/admin' && !CFG.ADMIN_GATE_KEY) return next();
+  if (!CFG.ADMIN_GATE_KEY) return next();   // secret route itself is the gate unless ADMIN_GATE_KEY is also set
   if (hasGateCookie(req)) return next();
   const k = typeof req.query.key === 'string' ? req.query.key.trim() : '';
   if (k && (keyFails.get(req.ip) || 0) < 10) {
@@ -694,15 +694,16 @@ const adminGate = (req, res, next) => {
   }
   return res.sendStatus(404);
 };
+app.use('/admin', (req, res) => res.sendStatus(404));                                   // /admin and /admin/* are ALWAYS 404 (never exposed via public/)
 app.get([ADMIN_ROUTE, ADMIN_ROUTE + '/'], ipOk, adminGate, (req, res) => res.redirect(ADMIN_ROUTE + '/bn-admin.html'));
 app.use(ADMIN_ROUTE, ipOk, adminGate, express.static(ADMIN));
 app.get('/', (req, res) => res.sendFile('blocknexa.html', { root: PUBLIC }));   // root: works even if the project folder path has a dot-folder in it
-app.use(express.static(PUBLIC, { index: false }));      // (/admin is handled above, behind the key gate & optional IP lock)
+app.use(express.static(PUBLIC, { index: false }));      // (/admin is blocked above; admin static is only served on ADMIN_ROUTE)
 app.use((err, req, res, next) => res.status(400).json({ error: 'Bad request.' }));
 app.listen(CFG.PORT, err => {
   if (err) { console.error(err.code === 'EADDRINUSE' ? `PORT ${CFG.PORT} IS ALREADY IN USE. Close the other server and try again.` : err); process.exit(1); }
   const c = q => S(q).get().c;
-  console.log(`BlockNexa running on http://localhost:${CFG.PORT}   (admin panel: ${ADMIN_ROUTE}${(ADMIN_ROUTE === '/admin' || CFG.ADMIN_GATE_KEY) ? '?key=YOUR_KEY' : ''})`);
+  console.log(`BlockNexa running on http://localhost:${CFG.PORT}   (admin panel: ${ADMIN_ROUTE}${CFG.ADMIN_GATE_KEY ? '?key=YOUR_GATE_KEY' : ''})`);
   console.log(`Database: ${DB_FILE}  (${c('SELECT COUNT(*) c FROM users')} users, ${c('SELECT COUNT(*) c FROM orders')} orders)`);
   console.log(`Buy ₹${CFG.BUY_RATE} (min ₹${CFG.MIN_BUY_INR}, max ₹${CFG.MAX_BUY_INR}) | Sell ₹${CFG.SELL_RATE} | min withdraw ${CFG.MIN_WITHDRAW} USDT`);
   console.log(`Logins last ${CFG.SESSION_DAYS} days (renewed while people keep using the site)`);
