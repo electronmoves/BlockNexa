@@ -80,6 +80,8 @@ CREATE TABLE IF NOT EXISTS settings(key TEXT PRIMARY KEY, value TEXT NOT NULL);
   if (!cols('users').includes('deactivate_reason')) db.exec('ALTER TABLE users ADD COLUMN deactivate_reason TEXT');
   if (!cols('users').includes('deactivated_at')) db.exec('ALTER TABLE users ADD COLUMN deactivated_at INTEGER');
   if (!cols('upis').includes('reset_at')) db.exec('ALTER TABLE upis ADD COLUMN reset_at INTEGER NOT NULL DEFAULT 0');
+  if (!cols('orders').includes('expires_at')) db.exec('ALTER TABLE orders ADD COLUMN expires_at INTEGER');
+  if (!cols('orders').includes('timer_ends_at')) db.exec('ALTER TABLE orders ADD COLUMN timer_ends_at INTEGER');
 }
 
 /* ============================ SECTION 3: HELPERS ============================ */
@@ -95,9 +97,18 @@ const balance = userId => S('SELECT COALESCE(SUM(usdt_micro),0) b FROM ledger WH
 const addLedger = (userId, orderId, type, amt, reason, admin) => S('INSERT INTO ledger(user_id,order_id,type,usdt_micro,reason,admin,created_at) VALUES(?,?,?,?,?,?,?)').run(userId, orderId, type, amt, reason || null, admin || null, now());
 const audit = (action, target, details) => S('INSERT INTO audit(at,action,target,details) VALUES(?,?,?,?)').run(now(), action, target || null, JSON.stringify(details || {}));
 const reasonOf = b => { const r = String((b || {}).reason || '').trim().replace(/\s+/g, ' ').slice(0, 200); return r.length >= 3 ? r : ''; };
-const item = o => ({ id: o.public_id, kind: o.type, status: o.status, at: o.created_at, usdt: usdt(o.usdt_micro), inr: o.inr, address: o.address, upi: o.upi, reason: o.fail_reason });
+const item = o => ({ id: o.public_id, kind: o.type, status: o.status, at: o.created_at, usdt: usdt(o.usdt_micro), inr: o.inr, address: o.address, upi: o.upi, reason: o.fail_reason, expiresAt: o.expires_at || undefined, timerEndsAt: o.timer_ends_at || undefined });
 const buySellEnabled = () => { const r = S("SELECT value FROM settings WHERE key='buy_sell_enabled'").get(); return !r || r.value !== '0'; };
+const buySellReason = () => { const r = S("SELECT value FROM settings WHERE key='buy_sell_reason'").get(); return (r && r.value) || ''; };
 const BUY_SELL_OFF_MSG = "Buy, Sell & Withdrawal services are currently disabled. We'll notify you.";
+const buySellOffMsg = () => buySellReason() || BUY_SELL_OFF_MSG;
+const BUY_EXPIRE_MS = 5 * 60 * 1000;
+const WITHDRAW_TIMER_MS = 60 * 60 * 1000;
+const expireOrders = () => {
+  const t = now();
+  S("UPDATE orders SET status='failed', fail_reason='Order expired after 5 minutes without approval.', updated_at=? WHERE type='buy' AND status='pending' AND expires_at IS NOT NULL AND expires_at<=?").run(t, t);
+};
+setInterval(expireOrders, 15000).unref();
 const upiLink = o => `upi://pay?pa=${o.upi || CFG.UPI_ID}&pn=${encodeURIComponent(CFG.UPI_NAME)}&am=${Number(o.inr).toFixed(2)}&cu=INR&tn=${encodeURIComponent('BN ' + o.public_id)}`;
 { // seed initial UPI pool (only when upis table is empty) and migrate any legacy buy orders onto upis
   const t = now();
@@ -282,7 +293,7 @@ V.post('/auth/logout', (req, res) => {
 });
 
 /* ============================ SECTION 5: USER API ============================ */
-V.get('/rates', (req, res) => res.json({ buy: CFG.BUY_RATE, sell: CFG.SELL_RATE, minBuyUsdt: CFG.MIN_BUY_USDT, maxBuyInr: CFG.MAX_BUY_INR, minSellUsdt: CFG.MIN_SELL_USDT, minWithdraw: CFG.MIN_WITHDRAW, googleClientId: CFG.GOOGLE_CLIENT_ID, buySellEnabled: buySellEnabled() }));
+V.get('/rates', (req, res) => res.json({ buy: CFG.BUY_RATE, sell: CFG.SELL_RATE, minBuyUsdt: CFG.MIN_BUY_USDT, maxBuyInr: CFG.MAX_BUY_INR, minSellUsdt: CFG.MIN_SELL_USDT, minWithdraw: CFG.MIN_WITHDRAW, googleClientId: CFG.GOOGLE_CLIENT_ID, buySellEnabled: buySellEnabled(), buySellReason: buySellReason() }));
 V.use(['/me', '/account', '/balance', '/history', '/buy', '/sell', '/withdraw', '/deposit', '/notifications'], requireAuth);
 V.get('/me', (req, res) => res.json(me(req.user)));
 V.post('/account/password', limiter(10), async (req, res) => {
@@ -308,6 +319,7 @@ V.post('/notifications/read', (req, res) => {
   res.json({ ok: true });
 });
 V.get('/history/:type', (req, res) => {
+  expireOrders();
   const t = req.params.type;
   if (t === 'all') return res.json(S('SELECT * FROM orders WHERE user_id=? ORDER BY id DESC LIMIT 6').all(req.user.id).map(item));
   if (!['buy', 'sell', 'withdraw'].includes(t)) return res.status(404).json({ error: 'Not found.' });
@@ -315,20 +327,23 @@ V.get('/history/:type', (req, res) => {
 });
 
 V.post('/buy', limiter(20), (req, res) => {
-  if (!buySellEnabled()) return res.status(503).json({ error: BUY_SELL_OFF_MSG });
+  expireOrders();
+  if (!buySellEnabled()) return res.status(503).json({ error: buySellOffMsg() });
   const inr = Number((req.body || {}).inr), upi = pickRandomUpi();
   if (!upi) return res.status(503).json({ error: 'Payments are not set up yet. Please contact support.' });
   if (!Number.isInteger(inr) || inr < CFG.MIN_BUY_INR || inr > CFG.MAX_BUY_INR) return res.status(400).json({ error: `Enter a whole amount between ₹${CFG.MIN_BUY_INR} and ₹${CFG.MAX_BUY_INR}.` });
   if (S("SELECT COUNT(*) c FROM orders WHERE user_id=? AND type='buy' AND status='pending'").get(req.user.id).c >= 5) return res.status(429).json({ error: 'You already have 5 buy orders waiting. Finish or wait for them first.' });
-  const pid = newOrderId(), t = now();
-  S("INSERT INTO orders(public_id,user_id,type,inr,rate,usdt_micro,upi,created_at,updated_at) VALUES(?,?,'buy',?,?,?,?,?,?)").run(pid, req.user.id, inr, CFG.BUY_RATE, Math.round(inr * 1e6 / CFG.BUY_RATE), upi, t, t);
+  const pid = newOrderId(), t = now(), exp = t + BUY_EXPIRE_MS;
+  S("INSERT INTO orders(public_id,user_id,type,inr,rate,usdt_micro,upi,expires_at,created_at,updated_at) VALUES(?,?,'buy',?,?,?,?,?,?,?)").run(pid, req.user.id, inr, CFG.BUY_RATE, Math.round(inr * 1e6 / CFG.BUY_RATE), upi, exp, t, t);
   const created = S('SELECT * FROM orders WHERE public_id=?').get(pid);
   notifyAdminOrder(created, req.user, 'New BUY order received');
   res.status(201).json({ ...item(created), upi });
 });
 V.post('/buy/:id/paid', limiter(20), (req, res) => {
+  expireOrders();
   const o = S("SELECT * FROM orders WHERE public_id=? AND user_id=? AND type='buy'").get(String(req.params.id).toUpperCase(), req.user.id);
   if (!o) return res.status(404).json({ error: 'Order not found.' });
+  if (o.status !== 'pending') return res.status(409).json({ error: o.fail_reason || 'This order is no longer waiting for payment.' });
   const utr = String((req.body || {}).utr || '').trim();
   if (!/^\d{12}$/.test(utr)) return res.status(400).json({ error: 'Enter the 12-digit UPI reference number (UTR) from your payment app.' });
   try { if (S("UPDATE orders SET utr=?, updated_at=? WHERE id=? AND status='pending'").run(utr, now(), o.id).changes !== 1) return res.status(409).json({ error: 'This order is no longer waiting for payment.' }); }
@@ -356,7 +371,7 @@ const createOut = db.transaction((user, type, m, x) => {
   return { order: S('SELECT * FROM orders WHERE id=?').get(r.lastInsertRowid) };
 });
 V.post('/sell', limiter(20), (req, res) => {
-  if (!buySellEnabled()) return res.status(503).json({ error: BUY_SELL_OFF_MSG });
+  if (!buySellEnabled()) return res.status(503).json({ error: buySellOffMsg() });
   const b = req.body || {}, v = Number(b.usdt), upi = String(b.upi || '').trim();
   if (!(v >= CFG.MIN_SELL_USDT)) return res.status(400).json({ error: `Minimum sale is ${CFG.MIN_SELL_USDT} USDT.` });
   if (!/^[\w.\-]{2,}@[\w.\-]{2,}$/.test(upi)) return res.status(400).json({ error: 'Enter a valid UPI ID, like name@bank.' });
@@ -366,7 +381,7 @@ V.post('/sell', limiter(20), (req, res) => {
   res.status(201).json(item(r.order));
 });
 V.post('/withdraw', limiter(20), (req, res) => {
-  if (!buySellEnabled()) return res.status(503).json({ error: BUY_SELL_OFF_MSG });
+  if (!buySellEnabled()) return res.status(503).json({ error: buySellOffMsg() });
   const b = req.body || {}, v = Number(b.amount), address = String(b.address || '').trim();
   if (b.chain !== 'bsc') return res.status(400).json({ error: 'Select a supported chain.' });
   if (!/^0x[a-fA-F0-9]{40}$/.test(address)) return res.status(400).json({ error: 'Enter a valid BSC (BEP20) address. It starts with 0x and has 42 characters.' });
@@ -409,6 +424,7 @@ A.get('/find', (req, res) => {
   res.json(list.length ? { kind: 'users', users: list.map(x => ({ uid: x.uid, email: x.email, phone: x.phone })) } : { kind: 'none' });
 });
 A.get('/user/:uid', (req, res) => {
+  expireOrders();
   const u = S('SELECT * FROM users WHERE uid=?').get(String(req.params.uid).toUpperCase());
   if (!u) return res.status(404).json({ error: 'User not found.' });
   res.json({
@@ -418,7 +434,7 @@ A.get('/user/:uid', (req, res) => {
     audit: S('SELECT at, action, details FROM audit WHERE target=? ORDER BY id DESC LIMIT 20').all(u.uid).map(x => ({ at: x.at, action: x.action, details: JSON.parse(x.details || '{}') })),
   });
 });
-A.get('/pending', (req, res) => res.json(S("SELECT * FROM orders WHERE status='pending' ORDER BY (utr IS NULL AND type='buy'), id").all().map(orderView)));
+A.get('/pending', (req, res) => { expireOrders(); res.json(S("SELECT * FROM orders WHERE status='pending' ORDER BY (utr IS NULL AND type='buy'), id").all().map(orderView)); });
 A.get('/audit', (req, res) => res.json(S('SELECT at, action, target, details FROM audit ORDER BY id DESC LIMIT 100').all().map(x => ({ at: x.at, action: x.action, target: x.target, details: JSON.parse(x.details || '{}') }))));
 
 // Change an order's status. Money moves are written to the ledger inside one transaction, so nothing can be credited twice.
@@ -446,6 +462,15 @@ A.post('/orders/:id/status', (req, res) => {
   const r = setStatus(String(req.params.id).toUpperCase(), to, reason, txid);
   if (r.err) return res.status(r.code).json({ error: r.err });
   res.json({ order: orderView(r.order) });
+});
+A.post('/orders/:id/timer', (req, res) => {
+  const pid = String(req.params.id).toUpperCase(), o = S('SELECT * FROM orders WHERE public_id=?').get(pid);
+  if (!o) return res.status(404).json({ error: 'Order not found.' });
+  if (o.type !== 'withdraw' || o.status !== 'pending') return res.status(409).json({ error: 'Timer can only be set on pending withdrawals.' });
+  const t = now(), endsAt = t + WITHDRAW_TIMER_MS;
+  S('UPDATE orders SET timer_ends_at=?, updated_at=? WHERE id=?').run(endsAt, t, o.id);
+  audit('withdraw_timer_set', S('SELECT uid FROM users WHERE id=?').get(o.user_id).uid, { order: o.public_id, endsAt });
+  res.json({ order: orderView(S('SELECT * FROM orders WHERE id=?').get(o.id)) });
 });
 
 const editBalance = db.transaction((u, newMicro, expectedMicro, reason) => {
@@ -581,14 +606,16 @@ const checkAdminKey = (req, k) => {
   }
   return null;
 };
-A.get('/settings', (req, res) => res.json({ buySellEnabled: buySellEnabled() }));
+A.get('/settings', (req, res) => res.json({ buySellEnabled: buySellEnabled(), buySellReason: buySellReason() }));
 A.post('/settings/buy-sell', (req, res) => {
   const b = req.body || {}, bad = checkAdminKey(req, b.adminKey);
   if (bad) return res.status(bad.code).json({ error: bad.err });
   const enabled = !!b.enabled;
+  const reason = enabled ? '' : String(b.reason || '').trim().replace(/\s+/g, ' ').slice(0, 200);
   S("INSERT INTO settings(key,value) VALUES('buy_sell_enabled',?) ON CONFLICT(key) DO UPDATE SET value=excluded.value").run(enabled ? '1' : '0');
-  audit(enabled ? 'enable_buy_sell' : 'disable_buy_sell', null, {});
-  res.json({ buySellEnabled: enabled });
+  S("INSERT INTO settings(key,value) VALUES('buy_sell_reason',?) ON CONFLICT(key) DO UPDATE SET value=excluded.value").run(reason);
+  audit(enabled ? 'enable_buy_sell' : 'disable_buy_sell', null, reason ? { reason } : {});
+  res.json({ buySellEnabled: enabled, buySellReason: reason });
 });
 
 // ==================== UPI RANDOMNESS & TRANSACTION LOG ====================

@@ -63,12 +63,14 @@
       html: next
         ? '<p>Users will be able to buy, sell, and withdraw USDT again.</p>'
         : '<p>All users will be blocked from <b>Buy</b>, <b>Sell</b>, and <b>Withdrawals</b>. <b>Deposits</b> will still work.</p>',
+      chips: next ? null : ['Back in 15 minutes', 'Back in 30 minutes', 'Back in 50 minutes', 'Under maintenance'],
+      text: next ? null : { placeholder: 'Reason shown to users (e.g. Buy & Sell will be on after 50 minutes)' },
       secret: { label: 'Enter admin key to confirm', placeholder: 'Admin key' },
       ok: next ? 'Yes, turn ON' : 'Yes, turn OFF',
       danger: !next
     });
     if (!r) return;
-    try { const s = await api('/settings/buy-sell', { method: 'POST', body: { enabled: next, adminKey: r.secret } }); paintTradeBtn(s.buySellEnabled); toast(s.buySellEnabled ? 'Buy, Sell & Withdrawals turned ON' : 'Buy, Sell & Withdrawals turned OFF (deposits still work)'); }
+    try { const s = await api('/settings/buy-sell', { method: 'POST', body: { enabled: next, reason: r.text, adminKey: r.secret } }); paintTradeBtn(s.buySellEnabled); toast(s.buySellEnabled ? 'Buy, Sell & Withdrawals turned ON' : 'Buy, Sell & Withdrawals turned OFF (deposits still work)'); }
     catch (e) { toast(e.message, true); }
   }
   function lock() { KEY = ''; sessionStorage.removeItem('bn_admin_key'); $('#panel').hidden = true; $('#login').hidden = false; }
@@ -119,14 +121,19 @@
   function showOrder(o) {
     const can = s => o.kind === 'buy' ? o.status !== s : o.status === 'pending';
     const kv = (k, v) => v === undefined || v === null || v === '' ? '' : `<div><span>${k}</span><b>${v}</b></div>`;
-    $('#main').innerHTML = `<div style="max-width:620px;margin:0 auto"><div class="card"><div class="head"><h2>Order #${esc(o.id)}</h2><span class="badge ${o.status}">${STAT[o.status]}</span></div>
+    const wdLabel = o.kind === 'withdraw' && o.status === 'pending' ? (o.timerEndsAt ? 'Processing' : 'Pending') : STAT[o.status];
+    const wdMins = o.timerEndsAt ? Math.max(0, Math.ceil((o.timerEndsAt - Date.now()) / 60000)) : 0;
+    const wdTimerText = o.kind === 'withdraw' && o.status === 'pending'
+      ? (o.timerEndsAt ? (wdMins > 0 ? `${wdMins} min remaining (Processing)` : 'Timer finished (Processing)') : 'Not set (shows Pending to user)') : '';
+    $('#main').innerHTML = `<div style="max-width:620px;margin:0 auto"><div class="card"><div class="head"><h2>Order #${esc(o.id)}</h2><span class="badge ${o.status}">${wdLabel}</span></div>
       <div class="kv">
         ${kv('Type', TYPE[o.kind])}${kv('Amount', (o.inr ? '₹' + f2(o.inr) + ' → ' : '') + f2(o.usdt) + ' USDT')}${kv('Rate', o.rate ? '₹' + o.rate + ' per USDT' : '')}
         ${kv('UTR', o.utr ? esc(o.utr) : o.kind === 'buy' ? 'Not submitted yet' : '')}${kv('Paid to UPI', esc(o.upi))}${kv('Wallet', esc(o.address))}${kv('Chain', esc(o.chain && o.chain.toUpperCase()))}${kv('Transaction hash', esc(o.txid))}
+        ${kv('Withdraw timer', wdTimerText)}
         ${kv('User ID', `<button class="link" data-uid="${esc(o.user.uid)}">${esc(o.user.uid)}</button>`)}${kv('User email', esc(o.user.email))}${kv('User phone', esc(o.user.phone))}
         ${kv('Date', day(o.at))}${kv('Time', clock(o.at))}${kv('Last update', day(o.updatedAt) + ' ' + clock(o.updatedAt))}${o.reason ? `<div><span>Failure reason</span><b class="why">${esc(o.reason)}</b></div>` : ''}
       </div>
-      <div style="display:flex;gap:10px;margin-top:16px">${can('success') ? '<button class="btn" id="ok">Mark success</button>' : ''}${can('failed') ? '<button class="btn danger" id="bad">Mark failed</button>' : ''}</div>
+      <div style="display:flex;gap:10px;margin-top:16px;flex-wrap:wrap">${o.kind === 'withdraw' && o.status === 'pending' && !o.timerEndsAt ? '<button class="btn ghost" id="setTimer">Set 60 min timer</button>' : ''}${can('success') ? '<button class="btn" id="ok">Mark success</button>' : ''}${can('failed') ? '<button class="btn danger" id="bad">Mark failed</button>' : ''}</div>
       ${o.kind !== 'buy' && o.status !== 'pending' ? '<p class="mut" style="margin-top:12px">Finished sells and withdrawals are locked. Use Edit balance on the user to correct anything.</p>' : ''}</div></div>`;
     bind(o);
   }
@@ -179,7 +186,8 @@
   async function pending() {
     try {
       const list = await api('/pending');
-      $('#main').innerHTML = `<h3 style="margin-bottom:6px">Pending (${list.length})</h3><small>Buys with a UTR are first. Click one to review it.</small>` + (list.length ? list.map(o => `<button class="row" data-pid="${esc(o.id)}"><span class="t ${o.kind}">${TYPE[o.kind]}</span><span class="m"><b>#${esc(o.id)} · ${f2(o.usdt)} USDT${o.inr ? ' · ₹' + f2(o.inr) : ''}</b><small>${esc(o.user.uid)} · ${day(o.at)} ${clock(o.at)}${o.upi ? ' · UPI: <b>' + esc(o.upi) + '</b>' : ''}${o.kind === 'buy' ? (o.utr ? ' · UTR submitted' : ' · no UTR yet') : ''}</small></span><span class="badge pending">Pending</span></button>`).join('') : '<p class="empty">Nothing is waiting.</p>');
+      const lbl = o => o.kind === 'withdraw' ? (o.timerEndsAt ? `Processing (${Math.max(1, Math.ceil((o.timerEndsAt - Date.now()) / 60000))}m)` : 'Pending') : 'Pending';
+      $('#main').innerHTML = `<h3 style="margin-bottom:6px">Pending (${list.length})</h3><small>Buys with a UTR are first. Click one to review it.</small>` + (list.length ? list.map(o => `<button class="row" data-pid="${esc(o.id)}"><span class="t ${o.kind}">${TYPE[o.kind]}</span><span class="m"><b>#${esc(o.id)} · ${f2(o.usdt)} USDT${o.inr ? ' · ₹' + f2(o.inr) : ''}</b><small>${esc(o.user.uid)} · ${day(o.at)} ${clock(o.at)}${o.upi ? ' · UPI: <b>' + esc(o.upi) + '</b>' : ''}${o.kind === 'buy' ? (o.utr ? ' · UTR submitted' : ' · no UTR yet') : ''}</small></span><span class="badge pending">${lbl(o)}</span></button>`).join('') : '<p class="empty">Nothing is waiting.</p>');
       window._pending = list; bind();
     } catch (e) { toast(e.message, true); }
   }
@@ -202,7 +210,14 @@
     m.querySelectorAll('[data-pid]').forEach(b => b.onclick = () => showOrder(window._pending.find(x => x.id === b.dataset.pid)));
     m.querySelectorAll('[data-f]').forEach(b => b.onclick = () => { const [g, v] = b.dataset.f.split(':'); view[g] = v; renderUser(); });
     if ($('#eb', m)) $('#eb', m).onclick = editBalance; if ($('#susp', m)) $('#susp', m).onclick = suspend; if ($('#unsusp', m)) $('#unsusp', m).onclick = unsuspend; if ($('#setPw', m)) $('#setPw', m).onclick = resetPassword;
-    if (order) { if ($('#ok', m)) $('#ok', m).onclick = () => changeStatus(order, 'success'); if ($('#bad', m)) $('#bad', m).onclick = () => changeStatus(order, 'failed'); }
+    if (order) {
+      if ($('#setTimer', m)) $('#setTimer', m).onclick = async () => {
+        try { const d = await api(`/orders/${order.id}/timer`, { method: 'POST' }); toast('60 min timer set — status is now Processing'); showOrder(d.order); }
+        catch (e) { toast(e.message, true); }
+      };
+      if ($('#ok', m)) $('#ok', m).onclick = () => changeStatus(order, 'success');
+      if ($('#bad', m)) $('#bad', m).onclick = () => changeStatus(order, 'failed');
+    }
   }
   // ---------- userbase ----------
   // The search box and frame are drawn once; typing only redraws the table, so the box keeps focus.

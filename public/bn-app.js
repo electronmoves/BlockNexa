@@ -266,8 +266,12 @@
     root.innerHTML = `<div class="wrap"><div class="narrow"><div class="top"><a class="iconbtn" href="${back}" aria-label="Back">${icon('back')}</a><h2 class="ttl">${title}</h2><span style="width:42px"></span></div>${body}</div></div>`;
   }
   function row(x, i = 0) {
-    const k = KIND[x.kind], [c, l] = ST[x.status];
-    const detail = x.kind === 'buy' ? `₹${fmt(x.inr)} paid` : x.kind === 'sell' ? `₹${fmt(x.inr)} to your UPI` : `to ${short(x.address)}`;
+    const k = KIND[x.kind];
+    let [c, l] = ST[x.status];
+    if (x.kind === 'withdraw' && x.status === 'pending') l = x.timerEndsAt ? 'Processing' : 'Pending';
+    const rem = (x.status === 'pending' && x.kind === 'withdraw' && x.timerEndsAt)
+      ? Math.max(0, Math.ceil((x.timerEndsAt - Date.now()) / 60000)) : 0;
+    const detail = x.kind === 'buy' ? `₹${fmt(x.inr)} paid` : x.kind === 'sell' ? `₹${fmt(x.inr)} to your UPI` : `to ${short(x.address)}${rem ? ` · ~${rem}m left` : ''}`;
     return `<div class="row" style="--i:${Math.min(i, 10)}"><span class="rico ${k.tone}">${icon(k.ic)}</span><div class="rmid"><b>${k.label} <small>#${esc(x.id)}</small></b>
       <small>${when(x.at)} · ${detail}</small>${x.reason ? `<small class="why">Reason: ${esc(x.reason)}</small>` : ''}</div>
       <div class="rend"><b>${sign[x.kind]}${fmt(x.usdt)} USDT</b><span class="badge ${c}">${l}</span></div></div>`;
@@ -297,21 +301,23 @@
           <div class="rt"><b class="flash">₹${+rt.sell}</b><small>per USDT</small></div></a>
       </section><section>
         <h3 class="sec">Records &amp; community</h3>
-        <div class="tiles">${tile('buy', 'buy', 'g', 'Buy history', 'INR → USDT')}${tile('sell', 'sell', 'b', 'Sell history', 'USDT → INR')}${tile('withdraw', 'wd', 'l', 'Withdrawals', 'USDT → wallet')}<a class="tile lk tn-t" href="${esc(tg(cfg.COMMUNITY_TELEGRAM))}" target="_blank" rel="noopener"><span class="rico t">${icon('users')}</span><b>Join community</b><small>Telegram</small></a></div>
+        <div class="tiles">${tile('buy', 'buy', 'g', 'Buy history', 'INR → USDT')}${tile('sell', 'sell', 'b', 'Sell history', 'USDT → INR')}${tile('withdraw', 'wd', 'l', 'Withdrawals', 'USDT → wallet')}<button type="button" class="tile lk tn-t" id="commBtn"><span class="rico t">${icon('users')}</span><b>Join community</b><small>Coming soon</small></button></div>
         <h3 class="sec">Recent activity</h3><div>${rec.length ? rec.map(row).join('') : '<p class="empty">No activity yet.</p>'}</div>
         <a class="row lk tn-t" href="#/support" style="margin-top:0"><span class="rico t">${icon('help')}</span><div class="rmid"><b>Need help?</b><small>Contact support</small></div></a>
       </section></div></div>`;
+    $('#commBtn', root).onclick = communitySoonAlert;
     if (rt.buySellEnabled === false) {
-      root.querySelectorAll('a[href="#/buy"], a[href="#/sell"], a[href="#/withdraw"]').forEach(a => a.onclick = e => { e.preventDefault(); buySellOffAlert(); });
+      root.querySelectorAll('a[href="#/buy"], a[href="#/sell"], a[href="#/withdraw"]').forEach(a => a.onclick = e => { e.preventDefault(); buySellOffAlert(rt.buySellReason); });
     }
   }
-  const buySellOffAlert = () => ask({ title: 'Service Unavailable', note: "Buy, Sell & Withdrawal services are currently disabled. We'll notify you.", ok: 'OK', cancel: '', tone: 'danger', icon: 'warn' });
+  const buySellOffAlert = r => ask({ title: 'Service Unavailable', note: r || "Buy, Sell & Withdrawal services are currently disabled. We'll notify you.", ok: 'OK', cancel: '', tone: 'danger', icon: 'warn' });
+  const communitySoonAlert = () => ask({ title: 'Community Arriving Soon', note: 'Our official BlockNexa community channel is launching soon. Stay tuned!', ok: 'Got it', cancel: '', tone: 'info', icon: 'users' });
 
   async function buy(root) {
     const rt = await api().rates(), min = Math.ceil(rt.minBuyUsdt * rt.buy);
     if (rt.buySellEnabled === false) {
-      screen(root, 'Buy USDT', `<div class="card center"><p class="err" style="margin-top:0">Buy, Sell &amp; Withdrawal services are currently disabled. We'll notify you.</p><a class="btn ghost" href="#/deposit">Deposit USDT instead</a><a class="btn ghost" href="#/home">Back to home</a></div>`);
-      return buySellOffAlert();
+      screen(root, 'Buy USDT', `<div class="card center"><p class="err" style="margin-top:0">${esc(rt.buySellReason || "Buy, Sell & Withdrawal services are currently disabled. We'll notify you.")}</p><a class="btn ghost" href="#/deposit">Deposit USDT instead</a><a class="btn ghost" href="#/home">Back to home</a></div>`);
+      return buySellOffAlert(rt.buySellReason);
     }
     screen(root, 'Buy USDT', `<div class="card"><p class="mut">₹${+rt.buy} per USDT. Minimum ${rt.minBuyUsdt} USDT (₹${fmt(min, 0)}), maximum ₹${fmt(rt.maxBuyInr, 0)}.</p>
       <label class="field"><span class="pre">₹</span><input id="amt" type="number" inputmode="numeric" placeholder="0" aria-label="Amount in rupees"></label>
@@ -330,17 +336,34 @@
   }
   function pay(root, o) {
     const qr = `<img class="qr" src="/api/v2/buy/${esc(o.id)}/qr.svg" alt="UPI QR code">`;
+    const exp = o.expiresAt || (Date.now() + 300000);
     screen(root, 'Pay with UPI', `<div class="card center">${qr}<p class="mut" style="margin-top:10px">Scan with any UPI app and pay exactly <b style="color:var(--text)">₹${fmt(o.inr)}</b></p>
+      <div class="note" id="btimer" style="margin-top:10px;color:var(--text)">Time left: <b>05:00</b></div>
       <div class="copyrow"><span class="addr">${esc(o.upi)}</span><button class="btn ghost" style="margin:0;width:auto;padding:8px 14px" id="cp">Copy</button></div>
       <label class="field" style="margin-top:18px"><input id="utr" class="sm" inputmode="numeric" maxlength="12" placeholder="12-digit UTR after paying" aria-label="UTR"></label>
       <p class="err" id="err" role="alert"></p><button class="btn" id="paid">I have paid</button></div>`);
+    const tick = () => {
+      const box = $('#btimer', root); if (!box) return clearInterval(iv);
+      const left = Math.max(0, Math.ceil((exp - Date.now()) / 1000));
+      const m = String(Math.floor(left / 60)).padStart(2, '0'), s = String(left % 60).padStart(2, '0');
+      if (left <= 0) {
+        clearInterval(iv);
+        box.innerHTML = '<b style="color:var(--error)">Order expired (5 min limit)</b>';
+        const btn = $('#paid', root); if (btn) btn.disabled = true;
+        const err = $('#err', root); if (err) err.textContent = 'This order expired after 5 minutes. Please create a new order.';
+      } else {
+        box.innerHTML = `Time left to pay &amp; submit UTR: <b>${m}:${s}</b>`;
+      }
+    };
+    const iv = setInterval(tick, 1000); tick();
+    window.addEventListener('hashchange', () => clearInterval(iv), { once: true });
     $('#cp', root).onclick = e => copy(o.upi, e.target);
     $('#utr', root).oninput = e => e.target.value = e.target.value.replace(/\D/g, '');
     $('#paid', root).onclick = async e => {
       const u = $('#utr', root).value, err = $('#err', root);
       if (!/^\d{12}$/.test(u)) return err.textContent = 'Enter the 12-digit UTR from your payment app.';
       e.target.disabled = true;
-      try { await api().buyPaid(o.id, u); done(root, 'Payment submitted', 'We are checking your payment', [['Order', '#' + o.id], ['Amount', '₹' + fmt(o.inr)], ['You receive', fmt(o.usdt, 4) + ' USDT'], ['Status', 'Processing']], 'buy'); }
+      try { await api().buyPaid(o.id, u); clearInterval(iv); done(root, 'Payment submitted', 'We are checking your payment', [['Order', '#' + o.id], ['Amount', '₹' + fmt(o.inr)], ['You receive', fmt(o.usdt, 4) + ' USDT'], ['Status', 'Processing']], 'buy'); }
       catch (x) { err.textContent = msg(x); e.target.disabled = false; }
     };
   }
@@ -348,8 +371,8 @@
   async function sell(root) {
     const [rt, bal] = await Promise.all([api().rates(), api().balance()]);
     if (rt.buySellEnabled === false) {
-      screen(root, 'Sell USDT', `<div class="card center"><p class="err" style="margin-top:0">Buy, Sell &amp; Withdrawal services are currently disabled. We'll notify you.</p><a class="btn ghost" href="#/deposit">Deposit USDT instead</a><a class="btn ghost" href="#/home">Back to home</a></div>`);
-      return buySellOffAlert();
+      screen(root, 'Sell USDT', `<div class="card center"><p class="err" style="margin-top:0">${esc(rt.buySellReason || "Buy, Sell & Withdrawal services are currently disabled. We'll notify you.")}</p><a class="btn ghost" href="#/deposit">Deposit USDT instead</a><a class="btn ghost" href="#/home">Back to home</a></div>`);
+      return buySellOffAlert(rt.buySellReason);
     }
     screen(root, 'Sell USDT', `<div class="card"><p class="mut">Sell at <b style="color:var(--success)">₹${+rt.sell}</b> per USDT. Available: ${fmt(bal.usdt)} USDT. Minimum ${rt.minSellUsdt} USDT.</p>
       <label class="field"><input id="amt" type="number" inputmode="decimal" placeholder="Amount in USDT" aria-label="USDT amount"><button class="mini" id="max">Max</button></label>
@@ -382,8 +405,8 @@
   async function withdraw(root) {
     const [bal, rt] = await Promise.all([api().balance(), api().rates()]), low = bal.usdt < rt.minWithdraw;
     if (rt.buySellEnabled === false) {
-      screen(root, 'Withdraw USDT', `<div class="card center"><p class="err" style="margin-top:0">Buy, Sell &amp; Withdrawal services are currently disabled. We'll notify you.</p><a class="btn ghost" href="#/deposit">Deposit USDT instead</a><a class="btn ghost" href="#/home">Back to home</a></div>`);
-      return buySellOffAlert();
+      screen(root, 'Withdraw USDT', `<div class="card center"><p class="err" style="margin-top:0">${esc(rt.buySellReason || "Buy, Sell & Withdrawal services are currently disabled. We'll notify you.")}</p><a class="btn ghost" href="#/deposit">Deposit USDT instead</a><a class="btn ghost" href="#/home">Back to home</a></div>`);
+      return buySellOffAlert(rt.buySellReason);
     }
     screen(root, 'Withdraw USDT', `<div class="card"><p class="mut">Select your chain</p>
       <div class="row" style="border-color:var(--primary);cursor:default"><span class="rico l">${icon('wd')}</span><div class="rmid"><b>BSC</b><small>BNB Smart Chain (BEP20)</small></div><span class="badge ok">Selected</span></div>
@@ -416,15 +439,17 @@
     screen(root, 'Contact support', `<div class="card"><p class="mut">Tell us what happened and share your order or request ID (for example #A7K2M9) so we can find it quickly.</p>
       <a class="btn tg" href="${esc(tg(cfg.SUPPORT_TELEGRAM))}" target="_blank" rel="noopener">${icon('send')}Chat on Telegram</a>
       <a class="btn ghost" href="mailto:${esc(cfg.SUPPORT_EMAIL)}">${icon('mail')}${esc(cfg.SUPPORT_EMAIL)}</a>
-      <a class="btn ghost" href="${esc(tg(cfg.COMMUNITY_TELEGRAM))}" target="_blank" rel="noopener">${icon('users')}Join our community</a></div>`);
+      <button type="button" class="btn ghost" id="commBtn">${icon('users')}Join our community</button></div>`);
+    $('#commBtn', root).onclick = communitySoonAlert;
   }
   function account(root) {
     const u = BN.app.user();
     screen(root, 'Account', `<div class="card"><div class="kv" style="margin-top:0"><div><span>Account</span><b>${esc(u.email || u.phone || '')}</b></div><div><span>User ID</span><b>${esc(u.uid)}</b></div></div>
       <a class="btn ghost" href="#/password">${icon('lock')}${u.hasPassword ? 'Change password' : 'Set a password'}</a>
       <a class="btn ghost" href="#/support">${icon('help')}Contact support</a>
-      <a class="btn ghost" href="${esc(tg(cfg.COMMUNITY_TELEGRAM))}" target="_blank" rel="noopener">${icon('users')}Join our community</a>
+      <button type="button" class="btn ghost" id="commBtn">${icon('users')}Join our community</button>
       <button class="btn danger" id="out">${icon('logout')}Log out</button></div>`);
+    $('#commBtn', root).onclick = communitySoonAlert;
     $('#out', root).onclick = () => BN.app.logout();
   }
   function password(root, arg) {
