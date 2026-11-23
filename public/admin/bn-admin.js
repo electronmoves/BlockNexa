@@ -525,7 +525,121 @@
 
   $('#enter').onclick = enter; $('#key').onkeydown = e => { if (e.key === 'Enter') enter(); };
   $('#sf').onsubmit = e => { e.preventDefault(); find($('#q').value.trim()); };
+  // ---------- CashQR (ATM high-limit queue + photo-to-clean-QR converter) ----------
+  async function decodeQrFromFile(file) {
+    const url = URL.createObjectURL(file);
+    try {
+      const img = await new Promise((res, rej) => { const i = new Image(); i.onload = () => res(i); i.onerror = rej; i.src = url; });
+      if (window.BarcodeDetector) {
+        try {
+          const det = new BarcodeDetector({ formats: ['qr_code'] });
+          const res = await det.detect(img);
+          if (res && res[0] && res[0].rawValue) return res[0].rawValue;
+        } catch {}
+      }
+      if (typeof window.jsQR !== 'function') throw new Error('QR decoder not loaded.');
+      const canvas = document.createElement('canvas'), ctx = canvas.getContext('2d', { willReadFrequently: true });
+      for (const maxDim of [900, 1400, 520]) {
+        const sc = Math.min(1, maxDim / Math.max(img.width, img.height));
+        const w = Math.max(1, Math.round(img.width * sc)), h = Math.max(1, Math.round(img.height * sc));
+        canvas.width = w; canvas.height = h;
+        ctx.drawImage(img, 0, 0, w, h);
+        const raw = ctx.getImageData(0, 0, w, h);
+        let hit = window.jsQR(raw.data, w, h, { inversionAttempts: 'attemptBoth' });
+        if (hit && hit.data) return hit.data;
+        // High-contrast monochrome pass for washed-out / glare-heavy ATM screen photos
+        const d = raw.data;
+        let sum = 0;
+        for (let i = 0; i < d.length; i += 4) sum += 0.299 * d[i] + 0.587 * d[i + 1] + 0.114 * d[i + 2];
+        const avg = sum / (d.length / 4);
+        for (let i = 0; i < d.length; i += 4) {
+          const v = (0.299 * d[i] + 0.587 * d[i + 1] + 0.114 * d[i + 2]) > avg * 0.92 ? 255 : 0;
+          d[i] = d[i + 1] = d[i + 2] = v; d[i + 3] = 255;
+        }
+        hit = window.jsQR(d, w, h, { inversionAttempts: 'attemptBoth' });
+        if (hit && hit.data) return hit.data;
+      }
+      throw new Error('Could not detect a clear QR code in that photo. Try cropping closer to the ATM QR or paste the QR text.');
+    } finally { URL.revokeObjectURL(url); }
+  }
+  async function attachCleanQr(order, payload) {
+    try {
+      const p = await api('/cashqr/preview', { method: 'POST', body: { payload } });
+      const ok = await ask({
+        title: `Send clean QR to #${order.id}?`,
+        html: `<p>Amount: <b>₹${f2(order.inr)}</b> · User: <b>${esc(order.user.uid)}</b></p><div class="cqr-prev">${p.svg}</div><p class="mut">Once sent, this CashQR will stay active for <b>1 minute</b> on the user’s screen.</p>`,
+        ok: 'Send 1-min QR to user'
+      });
+      if (!ok) return;
+      await api(`/cashqr/${order.id}/qr`, { method: 'POST', body: { payload } });
+      toast(`Clean 1-min CashQR sent to #${order.id}`);
+      cashQrPanel();
+    } catch (e) { toast(e.message, true); }
+  }
+  async function cashQrPanel() {
+    try {
+      const d = await api('/cashqr');
+      const card = o => {
+        const badge = o.utr ? '<span class="badge success">UTR submitted</span>'
+          : o.hasQr ? `<span class="badge pending" data-cqr-t="${o.qrExpiresAt}">QR active · ${fmtRem(o.qrExpiresAt)}</span>`
+          : `<span class="badge pending" data-cqr-t="${o.expiresAt}">Waiting QR · ${fmtRem(o.expiresAt)}</span>`;
+        return `<div class="cqr-card">
+          <div class="cqr-top"><div><b>#${esc(o.id)} · ₹${f2(o.inr)}</b> <small>(${f2(o.usdt)} USDT)</small><br><small>${esc(o.user.uid)} · ${esc(o.user.email || o.user.phone || '')} · ${clock(o.at)}</small></div>${badge}</div>
+          ${o.utr ? `<small>UTR: <b style="font-family:ui-monospace,Consolas,monospace;color:var(--text)">${esc(o.utr)}</b></small>` : ''}
+          <div class="cqr-acts">
+            ${!o.utr ? `<button class="btn" data-cqr-scan="${esc(o.id)}">${o.hasQr ? 'Replace QR photo' : 'Scan / Upload ATM QR'}</button><button class="btn ghost" data-cqr-paste="${esc(o.id)}">Paste QR text</button>` : ''}
+            <button class="btn ghost" data-cqr-open="${esc(o.id)}">Open / Approve</button>
+          </div>
+        </div>`;
+      };
+      const hist = d.recent.map(o => `<button class="row" data-cqr-open="${esc(o.id)}"><span class="t buy">CashQR</span><span class="m"><b>#${esc(o.id)} · ₹${f2(o.inr)} · ${f2(o.usdt)} USDT</b><small>${esc(o.user.uid)} · ${day(o.at)} ${clock(o.at)}${o.reason ? ' · <span class="why">' + esc(o.reason) + '</span>' : ''}</small></span><span class="badge ${o.status}">${STAT[o.status]}</span></button>`).join('');
+      $('#main').innerHTML = `
+        <div class="card">
+          <div class="head">
+            <div><h2>CashQR · ATM High-Limit Queue</h2><small>First-come, first-served · Upload ATM screen photo to convert into a clean 1-minute SVG QR</small></div>
+            <div style="display:flex;gap:8px;flex-wrap:wrap">
+              <button class="btn ${d.enabled ? '' : 'danger'}" id="cqrToggle">CashQR: ${d.enabled ? 'ON' : 'OFF'}</button>
+              <button class="btn ghost" id="cqrRefresh">Refresh</button>
+            </div>
+          </div>
+          <input type="file" id="cqrFile" accept="image/*" capture="environment" hidden>
+          <div class="cqr-list">${d.pending.length ? d.pending.map(card).join('') : '<p class="empty">No pending CashQR requests right now.</p>'}</div>
+          ${hist ? `<h3 style="margin:20px 0 6px;font-size:15px">Recent CashQR orders</h3>${hist}` : ''}
+        </div>`;
+      window._cqrList = [...d.pending, ...d.recent];
+      const m = $('#main');
+      let targetOrder = null;
+      $('#cqrRefresh', m).onclick = cashQrPanel;
+      $('#cqrToggle', m).onclick = async () => {
+        try { const r = await api('/cashqr/toggle', { method: 'POST', body: { enabled: !d.enabled } }); toast(r.enabled ? 'CashQR turned ON' : 'CashQR turned OFF'); cashQrPanel(); }
+        catch (e) { toast(e.message, true); }
+      };
+      $('#cqrFile', m).onchange = async e => {
+        const f = e.target.files && e.target.files[0]; e.target.value = '';
+        if (!f || !targetOrder) return;
+        try { const payload = await decodeQrFromFile(f); await attachCleanQr(targetOrder, payload); }
+        catch (err) { toast(err.message, true); }
+      };
+      m.querySelectorAll('[data-cqr-scan]').forEach(b => b.onclick = () => {
+        targetOrder = window._cqrList.find(x => x.id === b.dataset.cqrScan);
+        $('#cqrFile', m).click();
+      });
+      m.querySelectorAll('[data-cqr-paste]').forEach(b => b.onclick = async () => {
+        const o = window._cqrList.find(x => x.id === b.dataset.cqrPaste);
+        const r = await ask({ title: `Paste QR text for #${o.id}`, text: { placeholder: 'Paste decoded ATM QR string (e.g. upi://pay?...)', required: true }, ok: 'Preview clean QR' });
+        if (r) await attachCleanQr(o, r.text);
+      });
+      m.querySelectorAll('[data-cqr-open]').forEach(b => b.onclick = () => showOrder(window._cqrList.find(x => x.id === b.dataset.cqrOpen)));
+    } catch (e) { toast(e.message, true); }
+  }
+  setInterval(() => {
+    document.querySelectorAll('[data-cqr-t]').forEach(el => {
+      const prefix = el.textContent.split('·')[0].trim();
+      el.textContent = `${prefix} · ${fmtRem(+el.dataset.cqrT)}`;
+    });
+  }, 1000);
+
   $('#nTrade').onclick = toggleTrade;
-  $('#nPending').onclick = pending; $('#nUsers').onclick = () => userbase(0); $('#nTxLog').onclick = txLog; $('#nNotifs').onclick = pushNotifs; $('#nAudit').onclick = auditLog; $('#nBackup').onclick = backup; $('#nLock').onclick = lock;
+  $('#nPending').onclick = pending; $('#nCashQr').onclick = cashQrPanel; $('#nUsers').onclick = () => userbase(0); $('#nTxLog').onclick = txLog; $('#nNotifs').onclick = pushNotifs; $('#nAudit').onclick = auditLog; $('#nBackup').onclick = backup; $('#nLock').onclick = lock;
   if (KEY) api('/ping').then(() => { $('#login').hidden = true; $('#panel').hidden = false; loadSettings(); }).catch(() => {});
 })();

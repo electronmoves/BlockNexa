@@ -184,6 +184,18 @@ a.lk:active,.q:active .lk{transform:scale(.985)}
 .ncard.unr{border-color:rgba(16,185,129,.45);background:linear-gradient(145deg,rgba(16,185,129,.08),var(--card))}
 .ntop{display:flex;align-items:center;justify-content:space-between;gap:10px;margin-bottom:6px}
 .ntop b{font:700 15px var(--display)}.ncard p{color:var(--text2);font-size:14px;line-height:1.55;white-space:pre-wrap;overflow-wrap:anywhere}.ncard small{display:block;color:var(--text2);font-size:12px;margin-top:8px;opacity:.8}
+/* CashQR payment selector + 2-step loader */
+.pm-tabs{display:grid;grid-template-columns:1fr 1fr;gap:8px}
+.pm{padding:12px;border-radius:14px;background:var(--bg);border:1.5px solid var(--border);text-align:left;transition:border-color var(--fast) var(--ease),background-color var(--fast) var(--ease)}
+.pm b{display:block;font:700 14px var(--display)}.pm small{display:block;color:var(--text2);font-size:12px;margin-top:2px}
+.pm.on{border-color:var(--primary);background:rgba(16,185,129,.09)}.pm.on small{color:var(--success)}
+.pm.off{opacity:.55}
+.steps{display:grid;grid-template-columns:1fr 1fr;gap:8px;margin-bottom:16px}
+.st{padding:8px 10px;border-radius:12px;background:var(--bg);border:1px solid var(--border);font-size:12px;font-weight:700;color:var(--text2)}
+.st.on{border-color:var(--accent);color:var(--accent-soft);background:rgba(100,136,245,.12)}
+.st.done{border-color:var(--success);color:var(--success);background:rgba(52,211,153,.1)}
+@keyframes cqrspin{to{transform:rotate(360deg)}}
+.cqr-spin{width:46px;height:46px;margin:8px auto 14px;border-radius:50%;border:3px solid var(--border);border-top-color:var(--primary);animation:cqrspin .85s linear infinite}
 
 /* forms */
 .field{display:flex;align-items:center;background:var(--bg);border:1.5px solid var(--border);border-radius:16px;padding:0 14px;margin-top:14px;transition:border-color var(--fast) var(--ease),box-shadow var(--fast) var(--ease)}

@@ -20,6 +20,7 @@ const CFG = {
   PORT: num('PORT', 3000),
   BUY_RATE: num('BUY_RATE', 102.5), SELL_RATE: num('SELL_RATE', 100),
   MIN_BUY_USDT: num('MIN_BUY_USDT', 5), MAX_BUY_INR: num('MAX_BUY_INR', 10000), MIN_SELL_USDT: num('MIN_SELL_USDT', 5), MIN_WITHDRAW: num('MIN_WITHDRAW', 5),
+  MIN_CASHQR_INR: num('MIN_CASHQR_INR', 2000), MAX_CASHQR_INR: num('MAX_CASHQR_INR', 50000), CASHQR_STEP: num('CASHQR_STEP', 500),
   UPI_ID: /^[\w.\-]{2,}@[\w.\-]{2,}$/.test(env('UPI_ID')) ? env('UPI_ID').toLowerCase() : '', UPI_NAME: env('UPI_NAME', 'BlockNexa').slice(0, 40),
   UPI_IDS: env('UPI_IDS', env('UPI_ID') || '123@upi,ishu@upi,example@upi').split(',').map(s => s.trim().toLowerCase()).filter(s => /^[\w.\-]{2,}@[\w.\-]{2,}$/.test(s)),
   DEPOSIT_ADDRESS: /^0x[a-fA-F0-9]{40}$/.test(env('DEPOSIT_ADDRESS')) ? env('DEPOSIT_ADDRESS') : '',
@@ -82,6 +83,9 @@ CREATE TABLE IF NOT EXISTS settings(key TEXT PRIMARY KEY, value TEXT NOT NULL);
   if (!cols('upis').includes('reset_at')) db.exec('ALTER TABLE upis ADD COLUMN reset_at INTEGER NOT NULL DEFAULT 0');
   if (!cols('orders').includes('expires_at')) db.exec('ALTER TABLE orders ADD COLUMN expires_at INTEGER');
   if (!cols('orders').includes('timer_ends_at')) db.exec('ALTER TABLE orders ADD COLUMN timer_ends_at INTEGER');
+  if (!cols('orders').includes('pay_method')) db.exec("ALTER TABLE orders ADD COLUMN pay_method TEXT NOT NULL DEFAULT 'upi'");
+  if (!cols('orders').includes('qr_payload')) db.exec('ALTER TABLE orders ADD COLUMN qr_payload TEXT');
+  if (!cols('orders').includes('qr_expires_at')) db.exec('ALTER TABLE orders ADD COLUMN qr_expires_at INTEGER');
 }
 
 /* ============================ SECTION 3: HELPERS ============================ */
@@ -97,16 +101,20 @@ const balance = userId => S('SELECT COALESCE(SUM(usdt_micro),0) b FROM ledger WH
 const addLedger = (userId, orderId, type, amt, reason, admin) => S('INSERT INTO ledger(user_id,order_id,type,usdt_micro,reason,admin,created_at) VALUES(?,?,?,?,?,?,?)').run(userId, orderId, type, amt, reason || null, admin || null, now());
 const audit = (action, target, details) => S('INSERT INTO audit(at,action,target,details) VALUES(?,?,?,?)').run(now(), action, target || null, JSON.stringify(details || {}));
 const reasonOf = b => { const r = String((b || {}).reason || '').trim().replace(/\s+/g, ' ').slice(0, 200); return r.length >= 3 ? r : ''; };
-const item = o => ({ id: o.public_id, kind: o.type, status: o.status, at: o.created_at, usdt: usdt(o.usdt_micro), inr: o.inr, address: o.address, upi: o.upi, reason: o.fail_reason, expiresAt: o.expires_at || undefined, timerEndsAt: o.timer_ends_at || undefined });
+const item = o => ({ id: o.public_id, kind: o.type, status: o.status, at: o.created_at, usdt: usdt(o.usdt_micro), inr: o.inr, address: o.address, upi: o.upi, reason: o.fail_reason, method: o.pay_method || 'upi', hasQr: !!o.qr_payload, qrExpiresAt: o.qr_expires_at || undefined, expiresAt: o.expires_at || undefined, timerEndsAt: o.timer_ends_at || undefined });
 const buySellEnabled = () => { const r = S("SELECT value FROM settings WHERE key='buy_sell_enabled'").get(); return !r || r.value !== '0'; };
+const cashQrEnabled = () => { const r = S("SELECT value FROM settings WHERE key='cashqr_enabled'").get(); return !r || r.value !== '0'; };
 const buySellReason = () => { const r = S("SELECT value FROM settings WHERE key='buy_sell_reason'").get(); return (r && r.value) || ''; };
 const BUY_SELL_OFF_MSG = "Buy, Sell & Withdrawal services are currently disabled. We'll notify you.";
 const buySellOffMsg = () => buySellReason() || BUY_SELL_OFF_MSG;
 const BUY_EXPIRE_MS = 5 * 60 * 1000;
+const CASHQR_TTL_MS = 60 * 1000;
 const WITHDRAW_TIMER_MS = 60 * 60 * 1000;
 const expireOrders = () => {
   const t = now();
-  S("UPDATE orders SET status='failed', fail_reason='Order expired after 5 minutes without approval.', updated_at=? WHERE type='buy' AND status='pending' AND expires_at IS NOT NULL AND expires_at<=?").run(t, t);
+  S("UPDATE orders SET status='failed', fail_reason='Order expired after 5 minutes without approval.', updated_at=? WHERE type='buy' AND COALESCE(pay_method,'upi')='upi' AND status='pending' AND expires_at IS NOT NULL AND expires_at<=?").run(t, t);
+  S("UPDATE orders SET status='failed', fail_reason='CashQR request timed out after 5 minutes.', updated_at=? WHERE type='buy' AND pay_method='cashqr' AND qr_payload IS NULL AND status='pending' AND expires_at IS NOT NULL AND expires_at<=?").run(t, t);
+  S("UPDATE orders SET status='failed', fail_reason='CashQR expired after 1 minute without payment.', updated_at=? WHERE type='buy' AND pay_method='cashqr' AND qr_payload IS NOT NULL AND utr IS NULL AND status='pending' AND qr_expires_at IS NOT NULL AND qr_expires_at<=?").run(t, t);
 };
 setInterval(expireOrders, 15000).unref();
 const upiLink = o => `upi://pay?pa=${o.upi || CFG.UPI_ID}&pn=${encodeURIComponent(CFG.UPI_NAME)}&am=${Number(o.inr).toFixed(2)}&cu=INR&tn=${encodeURIComponent('BN ' + o.public_id)}`;
@@ -185,7 +193,7 @@ function notifyAdminOrder(order, user, event = 'New order received') {
   const pendingCount = S("SELECT COUNT(*) c FROM orders WHERE status='pending'").get().c;
   const amt = order.inr ? `₹${Number(order.inr).toFixed(2)} (${f2(order.usdt_micro)} USDT)` : `${f2(order.usdt_micro)} USDT`;
   const targetInfo = order.type === 'buy'
-    ? `UPI: ${order.upi}${order.utr ? ` | UTR: ${order.utr}` : ''}`
+    ? ((order.pay_method === 'cashqr' ? 'Method: CashQR (ATM)' : `UPI: ${order.upi}`) + (order.utr ? ` | UTR: ${order.utr}` : ''))
     : order.type === 'sell'
       ? `Pay to UPI: ${order.upi}`
       : `Wallet: ${order.address}`;
@@ -293,7 +301,7 @@ V.post('/auth/logout', (req, res) => {
 });
 
 /* ============================ SECTION 5: USER API ============================ */
-V.get('/rates', (req, res) => res.json({ buy: CFG.BUY_RATE, sell: CFG.SELL_RATE, minBuyUsdt: CFG.MIN_BUY_USDT, maxBuyInr: CFG.MAX_BUY_INR, minSellUsdt: CFG.MIN_SELL_USDT, minWithdraw: CFG.MIN_WITHDRAW, googleClientId: CFG.GOOGLE_CLIENT_ID, buySellEnabled: buySellEnabled(), buySellReason: buySellReason() }));
+V.get('/rates', (req, res) => res.json({ buy: CFG.BUY_RATE, sell: CFG.SELL_RATE, minBuyUsdt: CFG.MIN_BUY_USDT, maxBuyInr: CFG.MAX_BUY_INR, minSellUsdt: CFG.MIN_SELL_USDT, minWithdraw: CFG.MIN_WITHDRAW, minCashQrInr: CFG.MIN_CASHQR_INR, maxCashQrInr: CFG.MAX_CASHQR_INR, cashQrStep: CFG.CASHQR_STEP, cashQrEnabled: cashQrEnabled(), googleClientId: CFG.GOOGLE_CLIENT_ID, buySellEnabled: buySellEnabled(), buySellReason: buySellReason() }));
 V.use(['/me', '/account', '/balance', '/history', '/buy', '/sell', '/withdraw', '/deposit', '/notifications'], requireAuth);
 V.get('/me', (req, res) => res.json(me(req.user)));
 V.post('/account/password', limiter(10), async (req, res) => {
@@ -329,31 +337,56 @@ V.get('/history/:type', (req, res) => {
 V.post('/buy', limiter(20), (req, res) => {
   expireOrders();
   if (!buySellEnabled()) return res.status(503).json({ error: buySellOffMsg() });
-  const inr = Number((req.body || {}).inr), upi = pickRandomUpi();
-  if (!upi) return res.status(503).json({ error: 'Payments are not set up yet. Please contact support.' });
-  if (!Number.isInteger(inr) || inr < CFG.MIN_BUY_INR || inr > CFG.MAX_BUY_INR) return res.status(400).json({ error: `Enter a whole amount between ₹${CFG.MIN_BUY_INR} and ₹${CFG.MAX_BUY_INR}.` });
+  const b = req.body || {}, inr = Number(b.inr), method = b.method === 'cashqr' ? 'cashqr' : 'upi';
   if (S("SELECT COUNT(*) c FROM orders WHERE user_id=? AND type='buy' AND status='pending'").get(req.user.id).c >= 5) return res.status(429).json({ error: 'You already have 5 buy orders waiting. Finish or wait for them first.' });
   const pid = newOrderId(), t = now(), exp = t + BUY_EXPIRE_MS;
-  S("INSERT INTO orders(public_id,user_id,type,inr,rate,usdt_micro,upi,expires_at,created_at,updated_at) VALUES(?,?,'buy',?,?,?,?,?,?,?)").run(pid, req.user.id, inr, CFG.BUY_RATE, Math.round(inr * 1e6 / CFG.BUY_RATE), upi, exp, t, t);
+  if (method === 'cashqr') {
+    if (!cashQrEnabled()) return res.status(503).json({ error: 'CashQR is currently unavailable. Please use UPI.' });
+    if (!Number.isInteger(inr) || inr < CFG.MIN_CASHQR_INR || inr > CFG.MAX_CASHQR_INR || inr % CFG.CASHQR_STEP !== 0) {
+      return res.status(400).json({ error: `Enter an ATM amount between ₹${CFG.MIN_CASHQR_INR} and ₹${CFG.MAX_CASHQR_INR} (multiple of ₹${CFG.CASHQR_STEP}).` });
+    }
+    S("INSERT INTO orders(public_id,user_id,type,pay_method,inr,rate,usdt_micro,expires_at,created_at,updated_at) VALUES(?,?,'buy','cashqr',?,?,?,?,?,?)").run(pid, req.user.id, inr, CFG.BUY_RATE, Math.round(inr * 1e6 / CFG.BUY_RATE), exp, t, t);
+    const created = S('SELECT * FROM orders WHERE public_id=?').get(pid);
+    notifyAdminOrder(created, req.user, 'New CashQR request (upload ATM QR within 5 min)');
+    return res.status(201).json(item(created));
+  }
+  const upi = pickRandomUpi();
+  if (!upi) return res.status(503).json({ error: 'Payments are not set up yet. Please contact support.' });
+  if (!Number.isInteger(inr) || inr < CFG.MIN_BUY_INR || inr > CFG.MAX_BUY_INR) return res.status(400).json({ error: `Enter a whole amount between ₹${CFG.MIN_BUY_INR} and ₹${CFG.MAX_BUY_INR}.` });
+  S("INSERT INTO orders(public_id,user_id,type,pay_method,inr,rate,usdt_micro,upi,expires_at,created_at,updated_at) VALUES(?,?,'buy','upi',?,?,?,?,?,?,?)").run(pid, req.user.id, inr, CFG.BUY_RATE, Math.round(inr * 1e6 / CFG.BUY_RATE), upi, exp, t, t);
   const created = S('SELECT * FROM orders WHERE public_id=?').get(pid);
   notifyAdminOrder(created, req.user, 'New BUY order received');
   res.status(201).json({ ...item(created), upi });
+});
+V.get('/buy/:id', (req, res) => {
+  expireOrders();
+  const o = S("SELECT * FROM orders WHERE public_id=? AND user_id=? AND type='buy'").get(String(req.params.id).toUpperCase(), req.user.id);
+  if (!o) return res.status(404).json({ error: 'Order not found.' });
+  res.json(item(o));
 });
 V.post('/buy/:id/paid', limiter(20), (req, res) => {
   expireOrders();
   const o = S("SELECT * FROM orders WHERE public_id=? AND user_id=? AND type='buy'").get(String(req.params.id).toUpperCase(), req.user.id);
   if (!o) return res.status(404).json({ error: 'Order not found.' });
   if (o.status !== 'pending') return res.status(409).json({ error: o.fail_reason || 'This order is no longer waiting for payment.' });
+  if (o.pay_method === 'cashqr' && !o.qr_payload) return res.status(409).json({ error: 'Please wait for your CashQR to arrive first.' });
   const utr = String((req.body || {}).utr || '').trim();
-  if (!/^\d{12}$/.test(utr)) return res.status(400).json({ error: 'Enter the 12-digit UPI reference number (UTR) from your payment app.' });
+  if (!/^\d{12}$/.test(utr)) return res.status(400).json({ error: 'Enter the 12-digit reference / UTR number from your payment app.' });
   try { if (S("UPDATE orders SET utr=?, updated_at=? WHERE id=? AND status='pending'").run(utr, now(), o.id).changes !== 1) return res.status(409).json({ error: 'This order is no longer waiting for payment.' }); }
   catch { return res.status(409).json({ error: 'This reference number was already used on another order.' }); }
-  notifyAdminOrder(S('SELECT * FROM orders WHERE id=?').get(o.id), req.user, 'UTR submitted for BUY order');
+  notifyAdminOrder(S('SELECT * FROM orders WHERE id=?').get(o.id), req.user, o.pay_method === 'cashqr' ? 'Payment submitted for CashQR order' : 'UTR submitted for BUY order');
   res.json({ ok: true });
 });
 V.get('/buy/:id/qr.svg', async (req, res) => {
+  expireOrders();
   const o = S("SELECT * FROM orders WHERE public_id=? AND user_id=? AND type='buy' AND status='pending'").get(String(req.params.id).toUpperCase(), req.user.id);
-  if (!o || !(o.upi || CFG.UPI_ID)) return res.sendStatus(404);
+  if (!o) return res.sendStatus(404);
+  if (o.pay_method === 'cashqr') {
+    if (!o.qr_payload || !o.qr_expires_at || o.qr_expires_at <= now()) return res.sendStatus(404);
+    res.set({ 'Content-Type': 'image/svg+xml', 'Cache-Control': 'no-store' });
+    return res.send(await QRCode.toString(o.qr_payload, { type: 'svg', margin: 2, errorCorrectionLevel: 'M' }));
+  }
+  if (!(o.upi || CFG.UPI_ID)) return res.sendStatus(404);
   res.set({ 'Content-Type': 'image/svg+xml', 'Cache-Control': 'no-store' });
   res.send(await QRCode.toString(upiLink(o), { type: 'svg', margin: 2, errorCorrectionLevel: 'M' }));
 });
@@ -702,6 +735,38 @@ A.get('/upis/logs', (req, res) => {
     summary: meta ? upiSummary(meta) : null,
     logs: rows.map(orderView),
   });
+});
+
+// ==================== CASHQR (ATM HIGH-LIMIT QUEUE) ====================
+A.get('/cashqr', (req, res) => {
+  expireOrders();
+  const pending = S("SELECT * FROM orders WHERE type='buy' AND pay_method='cashqr' AND status='pending' ORDER BY id ASC").all().map(orderView);
+  const recent = S("SELECT * FROM orders WHERE type='buy' AND pay_method='cashqr' AND status!='pending' ORDER BY id DESC LIMIT 20").all().map(orderView);
+  res.json({ enabled: cashQrEnabled(), pending, recent });
+});
+A.post('/cashqr/toggle', (req, res) => {
+  const enabled = !!(req.body || {}).enabled;
+  S("INSERT INTO settings(key,value) VALUES('cashqr_enabled',?) ON CONFLICT(key) DO UPDATE SET value=excluded.value").run(enabled ? '1' : '0');
+  audit(enabled ? 'enable_cashqr' : 'disable_cashqr', null, {});
+  res.json({ enabled });
+});
+A.post('/cashqr/preview', async (req, res) => {
+  const payload = String((req.body || {}).payload || '').trim();
+  if (payload.length < 4 || payload.length > 2000) return res.status(400).json({ error: 'Invalid QR text.' });
+  const svg = await QRCode.toString(payload, { type: 'svg', margin: 2, errorCorrectionLevel: 'M' });
+  res.json({ svg });
+});
+A.post('/cashqr/:id/qr', (req, res) => {
+  expireOrders();
+  const pid = String(req.params.id).toUpperCase(), o = S("SELECT * FROM orders WHERE public_id=? AND type='buy' AND pay_method='cashqr'").get(pid);
+  if (!o) return res.status(404).json({ error: 'CashQR order not found.' });
+  if (o.status !== 'pending') return res.status(409).json({ error: o.fail_reason || 'This CashQR order is no longer pending.' });
+  const payload = String((req.body || {}).payload || '').trim();
+  if (payload.length < 4 || payload.length > 2000) return res.status(400).json({ error: 'QR data is empty or invalid.' });
+  const t = now(), qrExp = t + CASHQR_TTL_MS;
+  S('UPDATE orders SET qr_payload=?, qr_expires_at=?, updated_at=? WHERE id=?').run(payload, qrExp, t, o.id);
+  audit('cashqr_attached', S('SELECT uid FROM users WHERE id=?').get(o.user_id).uid, { order: o.public_id, qrExpiresAt: qrExp });
+  res.json({ order: orderView(S('SELECT * FROM orders WHERE id=?').get(o.id)) });
 });
 
 app.use('/api/admin', A);

@@ -120,7 +120,7 @@
     loginPassword: (phone, password) => req('POST', '/auth/login/password', { phone, password }),
     setPassword: b => req('POST', '/account/password', b),
     rates: () => req('GET', '/rates'), balance: () => req('GET', '/balance'), history: t => req('GET', '/history/' + t),
-    buyCreate: inr => req('POST', '/buy', { inr }), buyPaid: (id, utr) => req('POST', `/buy/${id}/paid`, { utr }),
+    buyCreate: (inr, method = 'upi') => req('POST', '/buy', { inr, method }), buyStatus: id => req('GET', '/buy/' + encodeURIComponent(id)), buyPaid: (id, utr) => req('POST', `/buy/${id}/paid`, { utr }),
     sellCreate: b => req('POST', '/sell', b), withdraw: b => req('POST', '/withdraw', { chain: 'bsc', ...b }), deposit: () => req('GET', '/deposit'),
     notifications: () => req('GET', '/notifications'), notificationsRead: () => req('POST', '/notifications/read')
   };
@@ -281,7 +281,7 @@
     if (x.kind === 'withdraw' && x.status === 'pending') l = x.timerEndsAt ? 'Processing' : 'Pending';
     const timerSpan = (x.status === 'pending' && x.kind === 'withdraw' && x.timerEndsAt)
       ? `<span data-ends="${x.timerEndsAt}" style="color:var(--accent-soft);font-weight:600">${fmtLeft(x.timerEndsAt)}</span>` : '';
-    const detail = x.kind === 'buy' ? `₹${fmt(x.inr)} paid` : x.kind === 'sell' ? `₹${fmt(x.inr)} to your UPI` : `to ${short(x.address)}${timerSpan}`;
+    const detail = x.kind === 'buy' ? (x.method === 'cashqr' ? `₹${fmt(x.inr)} · CashQR` : `₹${fmt(x.inr)} paid`) : x.kind === 'sell' ? `₹${fmt(x.inr)} to your UPI` : `to ${short(x.address)}${timerSpan}`;
     return `<div class="row" style="--i:${Math.min(i, 10)}"><span class="rico ${k.tone}">${icon(k.ic)}</span><div class="rmid"><b>${k.label} <small>#${esc(x.id)}</small></b>
       <small>${when(x.at)} · ${detail}</small>${x.reason ? `<small class="why">Reason: ${esc(x.reason)}</small>` : ''}</div>
       <div class="rend"><b>${sign[x.kind]}${fmt(x.usdt)} USDT</b><span class="badge ${c}">${l}</span></div></div>`;
@@ -329,20 +329,133 @@
       screen(root, 'Buy USDT', `<div class="card center"><p class="err" style="margin-top:0">${esc(rt.buySellReason || "Buy, Sell & Withdrawal services are currently disabled. We'll notify you.")}</p><a class="btn ghost" href="#/deposit">Deposit USDT instead</a><a class="btn ghost" href="#/home">Back to home</a></div>`);
       return buySellOffAlert(rt.buySellReason);
     }
-    screen(root, 'Buy USDT', `<div class="card"><p class="mut">₹${+rt.buy} per USDT. Minimum ${rt.minBuyUsdt} USDT (₹${fmt(min, 0)}), maximum ₹${fmt(rt.maxBuyInr, 0)}.</p>
+    const cMin = rt.minCashQrInr || 2000, cMax = rt.maxCashQrInr || 50000, cStep = rt.cashQrStep || 500;
+    let method = 'upi';
+    screen(root, 'Buy USDT', `<div class="card">
+      <div class="pm-tabs" role="tablist">
+        <button type="button" class="pm on" data-m="upi"><b>UPI</b><small>₹${fmt(min, 0)}–₹${fmt(rt.maxBuyInr, 0)}</small></button>
+        <button type="button" class="pm ${rt.cashQrEnabled === false ? 'off' : ''}" data-m="cashqr"><b>CashQR · ATM</b><small>${rt.cashQrEnabled === false ? 'Unavailable' : `₹${fmt(cMin, 0)}–₹${fmt(cMax, 0)}`}</small></button>
+      </div>
+      <p class="mut" id="binfo" style="margin-top:12px">₹${+rt.buy} per USDT. Minimum ${rt.minBuyUsdt} USDT (₹${fmt(min, 0)}), maximum ₹${fmt(rt.maxBuyInr, 0)}.</p>
       <label class="field"><span class="pre">₹</span><input id="amt" type="number" inputmode="numeric" placeholder="0" aria-label="Amount in rupees"></label>
-      <div class="chips">${[1000, 2500, 5000].map(v => `<button data-v="${v}">₹${fmt(v, 0)}</button>`).join('')}</div>
+      <div class="chips" id="bchips"></div>
       <div class="kv"><div><span>You receive</span><b id="get">0.00 USDT</b></div></div>
       <p class="err" id="err" role="alert"></p><button class="btn" id="go">Continue</button></div>`);
-    const amt = $('#amt', root), upd = () => $('#get', root).textContent = fmt((+amt.value || 0) / rt.buy) + ' USDT';
-    amt.oninput = upd; root.querySelectorAll('.chips button').forEach(b => b.onclick = () => { amt.value = b.dataset.v; upd(); });
-    $('#go', root).onclick = async e => {
-      const v = +amt.value, err = $('#err', root); err.textContent = '';
-      if (!Number.isInteger(v) || v < min || v > rt.maxBuyInr) return err.textContent = `Enter a whole amount between ₹${fmt(min, 0)} and ₹${fmt(rt.maxBuyInr, 0)}.`;
-      if (!await ask({ title: 'Confirm your order', rows: [['You pay', '₹' + fmt(v)], ['You receive', fmt(v / rt.buy, 4) + ' USDT'], ['Rate', '₹' + rt.buy + ' per USDT']], note: 'Next you get a UPI QR code. Pay exactly this amount.', ok: 'Place order' })) return;
-      e.target.disabled = true;
-      try { pay(root, await api().buyCreate(v)); } catch (x) { err.textContent = msg(x); e.target.disabled = false; }
+    const amt = $('#amt', root), err = $('#err', root);
+    const upd = () => $('#get', root).textContent = fmt((+amt.value || 0) / rt.buy) + ' USDT';
+    const paintMethod = () => {
+      root.querySelectorAll('.pm').forEach(b => b.classList.toggle('on', b.dataset.m === method));
+      err.textContent = '';
+      if (method === 'cashqr') {
+        $('#binfo', root).textContent = `CashQR (High Limit · ATM): ₹${+rt.buy} per USDT. ₹${fmt(cMin, 0)} to ₹${fmt(cMax, 0)} (multiples of ₹${fmt(cStep, 0)}).`;
+        $('#bchips', root).innerHTML = [2000, 5000, 10000, 20000].filter(v => v >= cMin && v <= cMax).map(v => `<button type="button" data-v="${v}">₹${fmt(v, 0)}</button>`).join('');
+      } else {
+        $('#binfo', root).textContent = `₹${+rt.buy} per USDT. Minimum ${rt.minBuyUsdt} USDT (₹${fmt(min, 0)}), maximum ₹${fmt(rt.maxBuyInr, 0)}.`;
+        $('#bchips', root).innerHTML = [1000, 2500, 5000].map(v => `<button type="button" data-v="${v}">₹${fmt(v, 0)}</button>`).join('');
+      }
+      root.querySelectorAll('#bchips button').forEach(b => b.onclick = () => { amt.value = b.dataset.v; upd(); });
     };
+    root.querySelectorAll('.pm').forEach(b => b.onclick = () => {
+      if (b.dataset.m === 'cashqr' && rt.cashQrEnabled === false) return toast('CashQR is currently unavailable. Please use UPI.', true);
+      method = b.dataset.m; paintMethod();
+    });
+    paintMethod();
+    amt.oninput = upd;
+    $('#go', root).onclick = async e => {
+      const v = +amt.value; err.textContent = '';
+      if (method === 'cashqr') {
+        if (!Number.isInteger(v) || v < cMin || v > cMax || v % cStep !== 0) return err.textContent = `Enter an ATM amount between ₹${fmt(cMin, 0)} and ₹${fmt(cMax, 0)} (multiple of ₹${fmt(cStep, 0)}).`;
+        if (!await ask({ title: 'Confirm CashQR order', rows: [['Method', 'CashQR (ATM High Limit)'], ['You pay', '₹' + fmt(v)], ['You receive', fmt(v / rt.buy, 4) + ' USDT'], ['Rate', '₹' + rt.buy + ' per USDT']], note: 'Step 1 gets your QR (up to 5 min). Once the QR appears, you have 1 minute to scan & pay.', ok: 'Request CashQR' })) return;
+        e.target.disabled = true;
+        try { payCashQr(root, await api().buyCreate(v, 'cashqr')); } catch (x) { err.textContent = msg(x); e.target.disabled = false; }
+      } else {
+        if (!Number.isInteger(v) || v < min || v > rt.maxBuyInr) return err.textContent = `Enter a whole amount between ₹${fmt(min, 0)} and ₹${fmt(rt.maxBuyInr, 0)}.`;
+        if (!await ask({ title: 'Confirm your order', rows: [['You pay', '₹' + fmt(v)], ['You receive', fmt(v / rt.buy, 4) + ' USDT'], ['Rate', '₹' + rt.buy + ' per USDT']], note: 'Next you get a UPI QR code. Pay exactly this amount.', ok: 'Place order' })) return;
+        e.target.disabled = true;
+        try { pay(root, await api().buyCreate(v, 'upi')); } catch (x) { err.textContent = msg(x); e.target.disabled = false; }
+      }
+    };
+  }
+  function payCashQr(root, o) {
+    let cur = o, pollIv = null, tickIv = null;
+    const stop = () => { clearInterval(pollIv); clearInterval(tickIv); };
+    window.addEventListener('hashchange', stop, { once: true });
+
+    const renderStep1 = () => {
+      const exp = cur.expiresAt || (Date.now() + 300000);
+      screen(root, 'CashQR · Step 1 of 2', `<div class="card center">
+        <div class="steps"><span class="st on">1. Getting QR</span><span class="st">2. Scan &amp; Pay (1 min)</span></div>
+        <div class="cqr-spin" aria-hidden="true"></div>
+        <h3 style="font:700 19px var(--display)">Processing your request</h3>
+        <p class="mut" style="margin-top:6px">Step 1: Getting QR — you should receive your QR within 5 minutes.</p>
+        <div class="kv" style="text-align:left"><div><span>Order</span><b>#${esc(cur.id)}</b></div><div><span>Amount</span><b>₹${fmt(cur.inr)} (${fmt(cur.usdt, 4)} USDT)</b></div></div>
+        <div class="note" id="cqrTimer" style="color:var(--text)">Waiting time left: <b>05:00</b></div>
+        <p class="err" id="err" role="alert"></p>
+      </div>`);
+      const tick = () => {
+        const box = $('#cqrTimer', root); if (!box) return stop();
+        const left = Math.max(0, Math.ceil((exp - Date.now()) / 1000));
+        const m = String(Math.floor(left / 60)).padStart(2, '0'), s = String(left % 60).padStart(2, '0');
+        if (left <= 0) {
+          stop();
+          box.innerHTML = '<b style="color:var(--error)">Request timed out (5 min)</b>';
+          const err = $('#err', root); if (err) err.textContent = 'CashQR request timed out after 5 minutes. Please try again.';
+        } else {
+          box.innerHTML = `Getting QR · time left: <b>${m}:${s}</b>`;
+        }
+      };
+      tickIv = setInterval(tick, 1000); tick();
+      pollIv = setInterval(async () => {
+        if (!$('#cqrTimer', root)) return stop();
+        try {
+          const s = await api().buyStatus(cur.id);
+          if (s.status === 'failed') {
+            stop();
+            const err = $('#err', root); if (err) err.textContent = s.reason || 'CashQR request failed.';
+            const box = $('#cqrTimer', root); if (box) box.innerHTML = '<b style="color:var(--error)">Order expired / failed</b>';
+          } else if (s.hasQr) {
+            stop(); cur = s; renderStep2();
+          }
+        } catch {}
+      }, 2000);
+    };
+
+    const renderStep2 = () => {
+      const exp = cur.qrExpiresAt || (Date.now() + 60000);
+      const qr = `<img class="qr" id="cqrImg" src="/api/v2/buy/${esc(cur.id)}/qr.svg?t=${Date.now()}" alt="CashQR code">`;
+      screen(root, 'CashQR · Step 2 of 2', `<div class="card center">
+        <div class="steps"><span class="st done">1. QR Ready</span><span class="st on">2. Scan &amp; Pay (1 min)</span></div>
+        ${qr}
+        <p class="mut" style="margin-top:10px">Scan this CashQR and pay exactly <b style="color:var(--text)">₹${fmt(cur.inr)}</b></p>
+        <div class="note" id="cqrTimer" style="margin-top:10px;color:var(--text)">QR expires in: <b>01:00</b></div>
+        <label class="field" style="margin-top:16px"><input id="utr" class="sm" inputmode="numeric" maxlength="12" placeholder="12-digit UTR / reference after paying" aria-label="UTR"></label>
+        <p class="err" id="err" role="alert"></p><button class="btn" id="paid">I have paid</button></div>`);
+      const tick = () => {
+        const box = $('#cqrTimer', root); if (!box) return clearInterval(tickIv);
+        const left = Math.max(0, Math.ceil((exp - Date.now()) / 1000));
+        const m = String(Math.floor(left / 60)).padStart(2, '0'), s = String(left % 60).padStart(2, '0');
+        if (left <= 0) {
+          clearInterval(tickIv);
+          box.innerHTML = '<b style="color:var(--error)">QR expired (1 min limit)</b>';
+          const img = $('#cqrImg', root); if (img) img.style.opacity = '0.18';
+          const btn = $('#paid', root); if (btn) btn.disabled = true;
+          const err = $('#err', root); if (err) err.textContent = 'This CashQR expired after 1 minute. Please create a new order.';
+        } else {
+          box.innerHTML = `QR expires in: <b style="color:var(--${left <= 15 ? 'error' : 'success'})">${m}:${s}</b>`;
+        }
+      };
+      tickIv = setInterval(tick, 1000); tick();
+      $('#utr', root).oninput = e => e.target.value = e.target.value.replace(/\D/g, '');
+      $('#paid', root).onclick = async e => {
+        const u = $('#utr', root).value, err = $('#err', root);
+        if (!/^\d{12}$/.test(u)) return err.textContent = 'Enter the 12-digit UTR / reference number from your payment app.';
+        e.target.disabled = true;
+        try { await api().buyPaid(cur.id, u); stop(); done(root, 'Payment submitted', 'We are verifying your CashQR payment', [['Order', '#' + cur.id], ['Method', 'CashQR (ATM)'], ['Amount', '₹' + fmt(cur.inr)], ['You receive', fmt(cur.usdt, 4) + ' USDT'], ['Status', 'Processing']], 'buy'); }
+        catch (x) { err.textContent = msg(x); e.target.disabled = false; }
+      };
+    };
+
+    cur.hasQr ? renderStep2() : renderStep1();
   }
   function pay(root, o) {
     const qr = `<img class="qr" src="/api/v2/buy/${esc(o.id)}/qr.svg" alt="UPI QR code">`;
