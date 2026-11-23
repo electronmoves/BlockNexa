@@ -680,14 +680,14 @@ const hasGateCookie = req => {
   return Number.isFinite(exp) && exp > now() && /^[a-f0-9]{64}$/.test(sig) && same(sig, gateSig(expStr));
 };
 const adminGate = (req, res, next) => {
-  if (CFG.ADMIN_PATH && ADMIN_ROUTE !== '/admin' && !CFG.ADMIN_GATE_KEY) return next();
   if (hasGateCookie(req)) return next();
   const k = typeof req.query.key === 'string' ? req.query.key.trim() : '';
   if (k && (keyFails.get(req.ip) || 0) < 10) {
     const a = Buffer.from(k), b = Buffer.from(GATE_KEY);
     if (a.length === b.length && crypto.timingSafeEqual(a, b)) {
       const exp = String(now() + GATE_MS);
-      res.append('Set-Cookie', `bn_admin_gate=${exp}.${gateSig(exp)}; HttpOnly; SameSite=Lax; Path=/; Max-Age=${GATE_MS / 1000}${req.secure ? '; Secure' : ''}`);
+      const secureCookie = req.secure || env('NODE_ENV') === 'production' || !!env('RAILWAY_ENVIRONMENT');
+      res.append('Set-Cookie', `bn_admin_gate=${exp}.${gateSig(exp)}; HttpOnly; SameSite=Strict; Path=${ADMIN_ROUTE}; Max-Age=${GATE_MS / 1000}${secureCookie ? '; Secure' : ''}`);
       return res.redirect(ADMIN_ROUTE + '/bn-admin.html');
     }
     keyFails.set(req.ip, (keyFails.get(req.ip) || 0) + 1);
@@ -696,8 +696,10 @@ const adminGate = (req, res, next) => {
 };
 app.get([ADMIN_ROUTE, ADMIN_ROUTE + '/'], ipOk, adminGate, (req, res) => res.redirect(ADMIN_ROUTE + '/bn-admin.html'));
 app.use(ADMIN_ROUTE, ipOk, adminGate, express.static(ADMIN));
+// When a custom admin route is configured, block the conventional /admin path before public static serving.
+if (ADMIN_ROUTE !== '/admin') app.use('/admin', (req, res) => res.sendStatus(404));
 app.get('/', (req, res) => res.sendFile('blocknexa.html', { root: PUBLIC }));   // root: works even if the project folder path has a dot-folder in it
-app.use(express.static(PUBLIC, { index: false }));      // (/admin is handled above, behind the key gate & optional IP lock)
+app.use(express.static(PUBLIC, { index: false }));      // public assets only; /admin is gated or blocked above
 app.use((err, req, res, next) => res.status(400).json({ error: 'Bad request.' }));
 app.listen(CFG.PORT, err => {
   if (err) { console.error(err.code === 'EADDRINUSE' ? `PORT ${CFG.PORT} IS ALREADY IN USE. Close the other server and try again.` : err); process.exit(1); }
