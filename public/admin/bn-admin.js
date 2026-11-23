@@ -364,7 +364,8 @@
               <small>${activeCount} active UPI${activeCount === 1 ? '' : 's'} in random rotation · ₹${f2(d.totalCollected)} collected since last reset (${d.totalCount} payment${d.totalCount === 1 ? '' : 's'} · ${d.allTimeCount} all-time)</small>
             </div>
             <div style="display:flex;gap:8px;flex-wrap:wrap">
-              <button class="btn danger" id="resetTodayUpi">Reset collection</button>
+              <button class="btn ghost" id="resetTodayUpi">Reset collection</button>
+              <button class="btn danger" id="clearUpiLogs">Clear all logs</button>
               <button class="btn ghost" id="allUpiLogs">See all logs (${d.allTimeCount})</button>
             </div>
           </div>
@@ -401,7 +402,10 @@
                 ? `UPI name: ${esc(sum.upi)} · Total collected: ₹${f2(sum.totalCollected)} (${sum.count} payment${sum.count === 1 ? '' : 's'}) · Activation date: ${day(sum.createdAt)}`
                 : `${d.logs.length} successful payment${d.logs.length === 1 ? '' : 's'}`}</small>
             </div>
-            <button class="btn ghost" id="backTxLog">← Back to UPI control</button>
+            <div style="display:flex;gap:8px;flex-wrap:wrap">
+              ${d.logs.length ? '<button class="btn danger" id="clearInsideLogs">Clear all logs</button>' : ''}
+              <button class="btn ghost" id="backTxLog">← Back to UPI control</button>
+            </div>
           </div>
           <div class="ub-wrap">
             <table class="ub-table">
@@ -412,13 +416,27 @@
         </div>`;
       const m = $('#main');
       $('#backTxLog', m).onclick = txLog;
+      if ($('#clearInsideLogs', m)) $('#clearInsideLogs', m).onclick = () => clearAllUpiLogs(() => showUpiLogs(upi));
       m.querySelectorAll('[data-uid]').forEach(b => b.onclick = () => openUser(b.dataset.uid));
       m.querySelectorAll('[data-ul-oid]').forEach(b => b.onclick = () => showOrder(window._upiLogs.find(x => x.id === b.dataset.ulOid)));
     } catch (e) { toast(e.message, true); }
   }
+  async function clearAllUpiLogs(after) {
+    const r = await ask({
+      title: 'Clear all transaction logs?',
+      html: '<p>Clears all UPI payment logs and resets every UPI card’s <b>Total collected</b> counter back to <b>₹0.00</b>.</p><p class="mut">User account balances and ledger history remain untouched.</p>',
+      secret: { label: 'Enter admin key to confirm', placeholder: 'Admin key' },
+      ok: 'Clear all logs',
+      danger: true
+    });
+    if (!r) return;
+    try { await api('/upis/clear-logs', { method: 'POST', body: { adminKey: r.secret } }); toast('All transaction logs cleared'); after(); }
+    catch (err) { toast(err.message, true); }
+  }
   function bindTxLog() {
     const m = $('#main');
     if ($('#allUpiLogs', m)) $('#allUpiLogs', m).onclick = () => showUpiLogs('');
+    if ($('#clearUpiLogs', m)) $('#clearUpiLogs', m).onclick = () => clearAllUpiLogs(txLog);
     if ($('#resetTodayUpi', m)) $('#resetTodayUpi', m).onclick = async () => {
       const r = await ask({
         title: 'Reset today’s collection',

@@ -622,10 +622,11 @@ A.post('/settings/buy-sell', (req, res) => {
 });
 
 // ==================== UPI RANDOMNESS & TRANSACTION LOG ====================
+const upiLogsClearedAt = () => { const r = S("SELECT value FROM settings WHERE key='upi_logs_cleared_at'").get(); return Number(r && r.value) || 0; };
 const upiSummary = u => {
-  const since = u.reset_at || 0;
+  const clearedAt = upiLogsClearedAt(), since = Math.max(u.reset_at || 0, clearedAt);
   const s = S("SELECT COALESCE(SUM(inr),0) AS totalInr, COALESCE(SUM(usdt_micro),0) AS totalUsdtMicro, COUNT(*) AS count, MAX(updated_at) AS lastAt FROM orders WHERE type='buy' AND status='success' AND LOWER(upi)=LOWER(?) AND updated_at>=?").get(u.upi, since);
-  const all = S("SELECT COUNT(*) AS c FROM orders WHERE type='buy' AND status='success' AND LOWER(upi)=LOWER(?)").get(u.upi);
+  const all = S("SELECT COUNT(*) AS c FROM orders WHERE type='buy' AND status='success' AND LOWER(upi)=LOWER(?) AND updated_at>=?").get(u.upi, clearedAt);
   const p = S("SELECT COUNT(*) AS c FROM orders WHERE type='buy' AND status='pending' AND LOWER(upi)=LOWER(?)").get(u.upi);
   return { id: u.id, upi: u.upi, active: !!u.active, createdAt: u.created_at, resetAt: since, totalCollected: Math.round((s.totalInr || 0) * 100) / 100, totalUsdt: usdt(s.totalUsdtMicro || 0), count: s.count || 0, allTimeCount: all.c || 0, pendingCount: p.c || 0, lastAt: s.lastAt || null };
 };
@@ -645,6 +646,15 @@ A.post('/upis/reset', (req, res) => {
   S('UPDATE upis SET reset_at=?').run(t);
   audit('upi_reset_collection', 'ALL', { resetAt: t });
   res.json({ ok: true, resetAt: t });
+});
+A.post('/upis/clear-logs', (req, res) => {
+  const bad = checkAdminKey(req, (req.body || {}).adminKey);
+  if (bad) return res.status(bad.code).json({ error: bad.err });
+  const t = now();
+  S("INSERT INTO settings(key,value) VALUES('upi_logs_cleared_at',?) ON CONFLICT(key) DO UPDATE SET value=excluded.value").run(String(t));
+  S('UPDATE upis SET reset_at=?').run(t);
+  audit('upi_clear_logs', 'ALL', { clearedAt: t });
+  res.json({ ok: true, clearedAt: t });
 });
 A.post('/upis', (req, res) => {
   const upi = String((req.body || {}).upi || '').trim().toLowerCase();
@@ -682,10 +692,10 @@ A.post('/upis/delete', (req, res) => {
   res.json({ ok: true });
 });
 A.get('/upis/logs', (req, res) => {
-  const upi = String(req.query.upi || '').trim();
+  const upi = String(req.query.upi || '').trim(), clearedAt = upiLogsClearedAt();
   const rows = upi
-    ? S("SELECT * FROM orders WHERE type='buy' AND status='success' AND LOWER(upi)=LOWER(?) ORDER BY updated_at DESC, id DESC LIMIT 300").all(upi)
-    : S("SELECT * FROM orders WHERE type='buy' AND status='success' ORDER BY updated_at DESC, id DESC LIMIT 300").all();
+    ? S("SELECT * FROM orders WHERE type='buy' AND status='success' AND LOWER(upi)=LOWER(?) AND updated_at>=? ORDER BY updated_at DESC, id DESC LIMIT 300").all(upi, clearedAt)
+    : S("SELECT * FROM orders WHERE type='buy' AND status='success' AND updated_at>=? ORDER BY updated_at DESC, id DESC LIMIT 300").all(clearedAt);
   const meta = upi ? S('SELECT * FROM upis WHERE LOWER(upi)=LOWER(?)').get(upi) : null;
   res.json({
     upi: upi || null,
