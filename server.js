@@ -467,9 +467,12 @@ A.post('/orders/:id/timer', (req, res) => {
   const pid = String(req.params.id).toUpperCase(), o = S('SELECT * FROM orders WHERE public_id=?').get(pid);
   if (!o) return res.status(404).json({ error: 'Order not found.' });
   if (o.type !== 'withdraw' || o.status !== 'pending') return res.status(409).json({ error: 'Timer can only be set on pending withdrawals.' });
-  const t = now(), endsAt = t + WITHDRAW_TIMER_MS;
+  const raw = (req.body || {}).minutes;
+  const mins = raw === undefined ? 60 : Number(raw);
+  if (!Number.isFinite(mins) || mins < 1 || mins > 1440) return res.status(400).json({ error: 'Enter a timer between 1 and 1440 minutes.' });
+  const t = now(), endsAt = t + Math.round(mins * 60 * 1000);
   S('UPDATE orders SET timer_ends_at=?, updated_at=? WHERE id=?').run(endsAt, t, o.id);
-  audit('withdraw_timer_set', S('SELECT uid FROM users WHERE id=?').get(o.user_id).uid, { order: o.public_id, endsAt });
+  audit('withdraw_timer_set', S('SELECT uid FROM users WHERE id=?').get(o.user_id).uid, { order: o.public_id, minutes: Math.round(mins * 100) / 100, endsAt });
   res.json({ order: orderView(S('SELECT * FROM orders WHERE id=?').get(o.id)) });
 });
 

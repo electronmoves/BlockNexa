@@ -262,6 +262,16 @@
   const msg = e => e.message || 'Something went wrong. Please try again.';
   const sign = { buy: '+', sell: '−', withdraw: '−' };
 
+  const fmtLeft = endsAt => {
+    const left = Math.max(0, Math.ceil((endsAt - Date.now()) / 1000));
+    if (left <= 0) return ' · finishing…';
+    const m = String(Math.floor(left / 60)).padStart(2, '0'), s = String(left % 60).padStart(2, '0');
+    return ` · ${m}:${s} left`;
+  };
+  setInterval(() => {
+    document.querySelectorAll('[data-ends]').forEach(el => { el.textContent = fmtLeft(+el.dataset.ends); });
+  }, 1000);
+
   function screen(root, title, body, back = '#/home') {
     root.innerHTML = `<div class="wrap"><div class="narrow"><div class="top"><a class="iconbtn" href="${back}" aria-label="Back">${icon('back')}</a><h2 class="ttl">${title}</h2><span style="width:42px"></span></div>${body}</div></div>`;
   }
@@ -269,9 +279,9 @@
     const k = KIND[x.kind];
     let [c, l] = ST[x.status];
     if (x.kind === 'withdraw' && x.status === 'pending') l = x.timerEndsAt ? 'Processing' : 'Pending';
-    const rem = (x.status === 'pending' && x.kind === 'withdraw' && x.timerEndsAt)
-      ? Math.max(0, Math.ceil((x.timerEndsAt - Date.now()) / 60000)) : 0;
-    const detail = x.kind === 'buy' ? `₹${fmt(x.inr)} paid` : x.kind === 'sell' ? `₹${fmt(x.inr)} to your UPI` : `to ${short(x.address)}${rem ? ` · ~${rem}m left` : ''}`;
+    const timerSpan = (x.status === 'pending' && x.kind === 'withdraw' && x.timerEndsAt)
+      ? `<span data-ends="${x.timerEndsAt}" style="color:var(--accent-soft);font-weight:600">${fmtLeft(x.timerEndsAt)}</span>` : '';
+    const detail = x.kind === 'buy' ? `₹${fmt(x.inr)} paid` : x.kind === 'sell' ? `₹${fmt(x.inr)} to your UPI` : `to ${short(x.address)}${timerSpan}`;
     return `<div class="row" style="--i:${Math.min(i, 10)}"><span class="rico ${k.tone}">${icon(k.ic)}</span><div class="rmid"><b>${k.label} <small>#${esc(x.id)}</small></b>
       <small>${when(x.at)} · ${detail}</small>${x.reason ? `<small class="why">Reason: ${esc(x.reason)}</small>` : ''}</div>
       <div class="rend"><b>${sign[x.kind]}${fmt(x.usdt)} USDT</b><span class="badge ${c}">${l}</span></div></div>`;

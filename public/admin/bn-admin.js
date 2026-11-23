@@ -32,7 +32,10 @@
       m.hidden = false;
       const done = v => { m.hidden = true; document.removeEventListener('keydown', key); resolve(v); };
       const key = e => { if (e.key === 'Escape') done(null); }; document.addEventListener('keydown', key);
-      c.querySelectorAll('.chip').forEach(b => b.onclick = () => { $('#mf').value = b.textContent; $('#mf').focus(); });
+      c.querySelectorAll('.chip').forEach(b => b.onclick = () => {
+        if (o.num && !o.text) { $('#mn').value = parseInt(b.textContent, 10); $('#mn').dispatchEvent(new Event('input')); $('#mn').focus(); }
+        else { $('#mf').value = b.textContent; $('#mf').focus(); }
+      });
       if (o.num) { const upd = () => { $('#prev').innerHTML = o.num.preview ? o.num.preview(+$('#mn').value) : ''; }; $('#mn').oninput = upd; upd(); }
       if (o.secret) $('#ms').onkeydown = e => { if (e.key === 'Enter') $('#myes').click(); };
       $('#mno').onclick = () => done(null);
@@ -118,13 +121,17 @@
   const rowHtml = o => `<button class="row" data-oid="${esc(o.id)}"><span class="t ${o.kind}">${TYPE[o.kind]}</span><span class="m"><b>#${esc(o.id)} · ${f2(o.usdt)} USDT${o.inr ? ' · ₹' + f2(o.inr) : ''}</b><small>${day(o.at)} ${clock(o.at)}${o.reason ? ' · <span class="why">' + esc(o.reason) + '</span>' : ''}</small></span><span class="badge ${o.status}">${STAT[o.status]}</span></button>`;
 
   // ---------- order view ----------
+  const fmtRem = ends => {
+    const left = Math.max(0, Math.ceil((ends - Date.now()) / 1000));
+    if (left <= 0) return '00:00';
+    return `${String(Math.floor(left / 60)).padStart(2, '0')}:${String(left % 60).padStart(2, '0')}`;
+  };
   function showOrder(o) {
     const can = s => o.kind === 'buy' ? o.status !== s : o.status === 'pending';
     const kv = (k, v) => v === undefined || v === null || v === '' ? '' : `<div><span>${k}</span><b>${v}</b></div>`;
     const wdLabel = o.kind === 'withdraw' && o.status === 'pending' ? (o.timerEndsAt ? 'Processing' : 'Pending') : STAT[o.status];
-    const wdMins = o.timerEndsAt ? Math.max(0, Math.ceil((o.timerEndsAt - Date.now()) / 60000)) : 0;
     const wdTimerText = o.kind === 'withdraw' && o.status === 'pending'
-      ? (o.timerEndsAt ? (wdMins > 0 ? `${wdMins} min remaining (Processing)` : 'Timer finished (Processing)') : 'Not set (shows Pending to user)') : '';
+      ? (o.timerEndsAt ? `${fmtRem(o.timerEndsAt)} remaining (Processing)` : 'Not set (shows Pending to user)') : '';
     $('#main').innerHTML = `<div style="max-width:620px;margin:0 auto"><div class="card"><div class="head"><h2>Order #${esc(o.id)}</h2><span class="badge ${o.status}">${wdLabel}</span></div>
       <div class="kv">
         ${kv('Type', TYPE[o.kind])}${kv('Amount', (o.inr ? '₹' + f2(o.inr) + ' → ' : '') + f2(o.usdt) + ' USDT')}${kv('Rate', o.rate ? '₹' + o.rate + ' per USDT' : '')}
@@ -133,7 +140,7 @@
         ${kv('User ID', `<button class="link" data-uid="${esc(o.user.uid)}">${esc(o.user.uid)}</button>`)}${kv('User email', esc(o.user.email))}${kv('User phone', esc(o.user.phone))}
         ${kv('Date', day(o.at))}${kv('Time', clock(o.at))}${kv('Last update', day(o.updatedAt) + ' ' + clock(o.updatedAt))}${o.reason ? `<div><span>Failure reason</span><b class="why">${esc(o.reason)}</b></div>` : ''}
       </div>
-      <div style="display:flex;gap:10px;margin-top:16px;flex-wrap:wrap">${o.kind === 'withdraw' && o.status === 'pending' && !o.timerEndsAt ? '<button class="btn ghost" id="setTimer">Set 60 min timer</button>' : ''}${can('success') ? '<button class="btn" id="ok">Mark success</button>' : ''}${can('failed') ? '<button class="btn danger" id="bad">Mark failed</button>' : ''}</div>
+      <div style="display:flex;gap:10px;margin-top:16px;flex-wrap:wrap">${o.kind === 'withdraw' && o.status === 'pending' ? `<button class="btn ghost" id="setTimer">${o.timerEndsAt ? 'Edit timer' : 'Set timer'}</button>` : ''}${can('success') ? '<button class="btn" id="ok">Mark success</button>' : ''}${can('failed') ? '<button class="btn danger" id="bad">Mark failed</button>' : ''}</div>
       ${o.kind !== 'buy' && o.status !== 'pending' ? '<p class="mut" style="margin-top:12px">Finished sells and withdrawals are locked. Use Edit balance on the user to correct anything.</p>' : ''}</div></div>`;
     bind(o);
   }
@@ -212,7 +219,18 @@
     if ($('#eb', m)) $('#eb', m).onclick = editBalance; if ($('#susp', m)) $('#susp', m).onclick = suspend; if ($('#unsusp', m)) $('#unsusp', m).onclick = unsuspend; if ($('#setPw', m)) $('#setPw', m).onclick = resetPassword;
     if (order) {
       if ($('#setTimer', m)) $('#setTimer', m).onclick = async () => {
-        try { const d = await api(`/orders/${order.id}/timer`, { method: 'POST' }); toast('60 min timer set — status is now Processing'); showOrder(d.order); }
+        const curMins = order.timerEndsAt ? Math.max(1, Math.ceil((order.timerEndsAt - Date.now()) / 60000)) : 60;
+        const r = await ask({
+          title: order.timerEndsAt ? 'Edit withdraw timer' : 'Set withdraw timer',
+          html: '<p>Sets the withdrawal status to <b>Processing</b> with a live countdown shown to the user.</p>',
+          num: { label: 'Duration (minutes)', value: curMins, preview: v => v >= 1 && v <= 1440 ? `Countdown: <b>${Math.round(v)}:00</b>` : '<span class="why">Enter 1 to 1440 minutes</span>' },
+          chips: ['15 min', '30 min', '45 min', '60 min'],
+          ok: 'Save timer'
+        });
+        if (!r) return;
+        const mins = +r.num;
+        if (!(mins >= 1 && mins <= 1440)) return toast('Enter a timer between 1 and 1440 minutes.', true);
+        try { const d = await api(`/orders/${order.id}/timer`, { method: 'POST', body: { minutes: mins } }); toast(`${mins} min timer set — status is now Processing`); showOrder(d.order); }
         catch (e) { toast(e.message, true); }
       };
       if ($('#ok', m)) $('#ok', m).onclick = () => changeStatus(order, 'success');
