@@ -349,7 +349,7 @@
     screen(root, 'Buy USDT', `<div class="card">
       <div class="pm-tabs" role="tablist">
         <button type="button" class="pm on" data-m="upi"><b>UPI</b><small>₹${fmt(min, 0)}–₹${fmt(rt.maxBuyInr, 0)}</small></button>
-        <button type="button" class="pm ${rt.cashQrEnabled === false ? 'off' : ''}" data-m="cashqr"><b>CashQR · ATM</b><small>${rt.cashQrEnabled === false ? 'Unavailable' : `₹${fmt(cMin, 0)}–₹${fmt(cMax, 0)}`}</small></button>
+        <button type="button" class="pm ${rt.cashQrEnabled === false ? 'off' : ''}" data-m="cashqr"><b>CashQR</b><small>${rt.cashQrEnabled === false ? 'Unavailable' : `₹${fmt(cMin, 0)}–₹${fmt(cMax, 0)}`}</small></button>
       </div>
       <p class="mut" id="binfo" style="margin-top:12px">₹${+rt.buy} per USDT. Minimum ${rt.minBuyUsdt} USDT (₹${fmt(min, 0)}), maximum ₹${fmt(rt.maxBuyInr, 0)}.</p>
       <label class="field"><span class="pre">₹</span><input id="amt" type="number" inputmode="numeric" placeholder="0" aria-label="Amount in rupees"></label>
@@ -362,7 +362,7 @@
       root.querySelectorAll('.pm').forEach(b => b.classList.toggle('on', b.dataset.m === method));
       err.textContent = '';
       if (method === 'cashqr') {
-        $('#binfo', root).textContent = `CashQR (High Limit · ATM): ₹${+rt.buy} per USDT. ₹${fmt(cMin, 0)} to ₹${fmt(cMax, 0)} (multiples of ₹${fmt(cStep, 0)}).`;
+        $('#binfo', root).textContent = `CashQR: ₹${+rt.buy} per USDT. ₹${fmt(cMin, 0)} to ₹${fmt(cMax, 0)} (multiples of ₹${fmt(cStep, 0)}).`;
         $('#bchips', root).innerHTML = [2000, 4000, 6000, 10000].filter(v => v >= cMin && v <= cMax).map(v => `<button type="button" data-v="${v}">₹${fmt(v, 0)}</button>`).join('');
       } else {
         $('#binfo', root).textContent = `₹${+rt.buy} per USDT. Minimum ${rt.minBuyUsdt} USDT (₹${fmt(min, 0)}), maximum ₹${fmt(rt.maxBuyInr, 0)}.`;
@@ -379,8 +379,8 @@
     $('#go', root).onclick = async e => {
       const v = +amt.value; err.textContent = '';
       if (method === 'cashqr') {
-        if (!Number.isInteger(v) || v < cMin || v > cMax || v % cStep !== 0) return err.textContent = `Enter an ATM amount between ₹${fmt(cMin, 0)} and ₹${fmt(cMax, 0)} (multiple of ₹${fmt(cStep, 0)}).`;
-        if (!await ask({ title: 'Confirm CashQR order', rows: [['Method', 'CashQR (ATM High Limit)'], ['You pay', '₹' + fmt(v)], ['You receive', fmt(v / rt.buy, 4) + ' USDT'], ['Rate', '₹' + rt.buy + ' per USDT']], note: 'Step 1 gets your QR (up to 5 min). Once the QR appears, you have 1 minute to scan & pay.', ok: 'Request CashQR' })) return;
+        if (!Number.isInteger(v) || v < cMin || v > cMax || v % cStep !== 0) return err.textContent = `Enter an amount between ₹${fmt(cMin, 0)} and ₹${fmt(cMax, 0)} (multiple of ₹${fmt(cStep, 0)}).`;
+        if (!await ask({ title: 'Confirm CashQR order', rows: [['Method', 'CashQR'], ['You pay', '₹' + fmt(v)], ['You receive', fmt(v / rt.buy, 4) + ' USDT'], ['Rate', '₹' + rt.buy + ' per USDT']], note: 'Step 1 gets your QR (up to 5 min). Once the QR appears, you have 1 minute to scan & pay.', ok: 'Request CashQR' })) return;
         e.target.disabled = true;
         try { payCashQr(root, await api().buyCreate(v, 'cashqr')); } catch (x) { err.textContent = msg(x); e.target.disabled = false; }
       } else {
@@ -465,7 +465,7 @@
         const u = $('#utr', root).value, err = $('#err', root);
         if (!/^\d{12}$/.test(u)) return err.textContent = 'Enter the 12-digit UTR / reference number from your payment app.';
         e.target.disabled = true;
-        try { await api().buyPaid(cur.id, u); stop(); done(root, 'Payment submitted', 'We are verifying your CashQR payment', [['Order', '#' + cur.id], ['Method', 'CashQR (ATM)'], ['Amount', '₹' + fmt(cur.inr)], ['You receive', fmt(cur.usdt, 4) + ' USDT'], ['Status', 'Processing']], 'buy'); }
+        try { await api().buyPaid(cur.id, u); stop(); done(root, 'Payment submitted', 'We are verifying your CashQR payment', [['Order', '#' + cur.id], ['Method', 'CashQR'], ['Amount', '₹' + fmt(cur.inr)], ['You receive', fmt(cur.usdt, 4) + ' USDT'], ['Status', 'Processing']], 'buy'); }
         catch (x) { err.textContent = msg(x); e.target.disabled = false; }
       };
     };
