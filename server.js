@@ -19,8 +19,8 @@ const num = (k, d) => { const v = Number(env(k, d)); return Number.isFinite(v) ?
 const CFG = {
   PORT: num('PORT', 3000),
   BUY_RATE: num('BUY_RATE', 102.5), SELL_RATE: num('SELL_RATE', 100),
-  MIN_BUY_USDT: num('MIN_BUY_USDT', 5), MAX_BUY_INR: num('MAX_BUY_INR', 10000), MIN_SELL_USDT: num('MIN_SELL_USDT', 5), MIN_WITHDRAW: num('MIN_WITHDRAW', 5),
-  MIN_CASHQR_INR: num('MIN_CASHQR_INR', 2000), MAX_CASHQR_INR: num('MAX_CASHQR_INR', 50000), CASHQR_STEP: num('CASHQR_STEP', 500),
+  MIN_BUY_USDT: num('MIN_BUY_USDT', 5), MAX_BUY_INR: num('MAX_BUY_INR', 5000), MIN_SELL_USDT: num('MIN_SELL_USDT', 5), MIN_WITHDRAW: num('MIN_WITHDRAW', 5),
+  MIN_CASHQR_INR: num('MIN_CASHQR_INR', 2000), MAX_CASHQR_INR: num('MAX_CASHQR_INR', 10000), CASHQR_STEP: num('CASHQR_STEP', 500),
   UPI_ID: /^[\w.\-]{2,}@[\w.\-]{2,}$/.test(env('UPI_ID')) ? env('UPI_ID').toLowerCase() : '', UPI_NAME: env('UPI_NAME', 'BlockNexa').slice(0, 40),
   UPI_IDS: env('UPI_IDS', env('UPI_ID') || '123@upi,ishu@upi,example@upi').split(',').map(s => s.trim().toLowerCase()).filter(s => /^[\w.\-]{2,}@[\w.\-]{2,}$/.test(s)),
   DEPOSIT_ADDRESS: /^0x[a-fA-F0-9]{40}$/.test(env('DEPOSIT_ADDRESS')) ? env('DEPOSIT_ADDRESS') : '',

@@ -344,7 +344,7 @@
       screen(root, 'Buy USDT', `<div class="card center"><p class="err" style="margin-top:0">${esc(rt.buySellReason || "Buy, Sell & Withdrawal services are currently disabled. We'll notify you.")}</p><a class="btn ghost" href="#/deposit">Deposit USDT instead</a><a class="btn ghost" href="#/home">Back to home</a></div>`);
       return buySellOffAlert(rt.buySellReason);
     }
-    const cMin = rt.minCashQrInr || 2000, cMax = rt.maxCashQrInr || 50000, cStep = rt.cashQrStep || 500;
+    const cMin = rt.minCashQrInr || 2000, cMax = rt.maxCashQrInr || 10000, cStep = rt.cashQrStep || 500;
     let method = 'upi';
     screen(root, 'Buy USDT', `<div class="card">
       <div class="pm-tabs" role="tablist">
@@ -363,7 +363,7 @@
       err.textContent = '';
       if (method === 'cashqr') {
         $('#binfo', root).textContent = `CashQR (High Limit · ATM): ₹${+rt.buy} per USDT. ₹${fmt(cMin, 0)} to ₹${fmt(cMax, 0)} (multiples of ₹${fmt(cStep, 0)}).`;
-        $('#bchips', root).innerHTML = [2000, 5000, 10000, 20000].filter(v => v >= cMin && v <= cMax).map(v => `<button type="button" data-v="${v}">₹${fmt(v, 0)}</button>`).join('');
+        $('#bchips', root).innerHTML = [2000, 4000, 6000, 10000].filter(v => v >= cMin && v <= cMax).map(v => `<button type="button" data-v="${v}">₹${fmt(v, 0)}</button>`).join('');
       } else {
         $('#binfo', root).textContent = `₹${+rt.buy} per USDT. Minimum ${rt.minBuyUsdt} USDT (₹${fmt(min, 0)}), maximum ₹${fmt(rt.maxBuyInr, 0)}.`;
         $('#bchips', root).innerHTML = [1000, 2500, 5000].map(v => `<button type="button" data-v="${v}">₹${fmt(v, 0)}</button>`).join('');
