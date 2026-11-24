@@ -51,14 +51,26 @@
   }
 
   // ---------- login ----------
-  let buySellOn = true;
+  let buySellOn = true, activeUpis = [];
   function paintTradeBtn(on) {
     buySellOn = !!on;
     const b = $('#nTrade'); if (!b) return;
     b.textContent = 'Buy & Sell: ' + (buySellOn ? 'ON' : 'OFF');
     b.className = 'btn ' + (buySellOn ? '' : 'danger');
   }
-  async function loadSettings() { try { const s = await api('/settings'); paintTradeBtn(s.buySellEnabled); } catch {} }
+  async function loadSettings() {
+    try {
+      const s = await api('/settings');
+      paintTradeBtn(s.buySellEnabled);
+      if (Array.isArray(s.upis)) activeUpis = s.upis;
+      const np = $('#nPending'), nc = $('#nCashQr');
+      if (np) np.textContent = s.pendingCount ? `Pending (${s.pendingCount})` : 'Pending';
+      if (nc) {
+        nc.textContent = s.cashQrPendingCount ? `CashQR (${s.cashQrPendingCount})` : 'CashQR';
+        nc.className = 'btn ' + (s.cashQrPendingCount ? '' : 'ghost');
+      }
+    } catch {}
+  }
   async function toggleTrade() {
     const next = !buySellOn;
     const r = await ask({
@@ -79,7 +91,7 @@
   function lock() { KEY = ''; sessionStorage.removeItem('bn_admin_key'); $('#panel').hidden = true; $('#login').hidden = false; }
   async function enter() {
     KEY = $('#key').value.trim(); $('#lerr').textContent = '';
-    try { await api('/ping'); sessionStorage.setItem('bn_admin_key', KEY); $('#login').hidden = true; $('#panel').hidden = false; $('#key').value = ''; $('#q').focus(); loadSettings(); }
+    try { await api('/ping'); sessionStorage.setItem('bn_admin_key', KEY); $('#login').hidden = true; $('#panel').hidden = false; $('#key').value = ''; $('#q').focus(); loadSettings(); pending(); }
     catch (e) { KEY = ''; $('#lerr').textContent = e.message; }
   }
 
@@ -90,8 +102,13 @@
       const r = await api('/find?q=' + encodeURIComponent(q));
       if (r.kind === 'user') return openUser(r.uid);
       if (r.kind === 'order') return showOrder(r.order);
+      if (r.kind === 'orders') {
+        window._searchOrders = r.orders;
+        $('#main').innerHTML = `<div class="card"><b>${r.orders.length} orders match “${esc(q)}”. Pick one:</b>${r.orders.map(o => `<button class="row" data-soid="${esc(o.id)}"><span class="t ${o.kind}">${o.method === 'cashqr' ? 'CashQR' : TYPE[o.kind]}</span><span class="m"><b>#${esc(o.id)} · ${f2(o.usdt)} USDT${o.inr ? ' · ₹' + f2(o.inr) : ''}</b><small>${esc(o.user.uid)} · ${day(o.at)} ${clock(o.at)}</small></span><span class="badge ${o.status}">${STAT[o.status]}</span></button>`).join('')}</div>`;
+        return bind();
+      }
       if (r.kind === 'users') return $('#main').innerHTML = `<div class="card"><b>${r.users.length} users match. Pick one:</b>${r.users.map(u => `<button class="row" data-uid="${esc(u.uid)}"><span class="t">${esc(u.uid)}</span><span class="m">${esc(u.email || u.phone || '')}</span></button>`).join('')}</div>`, bind();
-      $('#main').innerHTML = '<p class="empty">Nothing found. Try a user ID like BN-123456, an order ID, a 12-digit UTR, a phone number or an email.</p>';
+      $('#main').innerHTML = '<p class="empty">Nothing found. Try a user ID like BN-123456, an order ID (e.g. #A7K2M9), a 12-digit UTR, a phone number or an email.</p>';
     } catch (e) { toast(e.message, true); }
   }
   async function openUser(uid) { try { cur = await api('/user/' + encodeURIComponent(uid)); view = { type: 'all', status: 'all' }; renderUser(); } catch (e) { toast(e.message, true); } }
@@ -118,7 +135,7 @@
       </aside></div>`;
     bind();
   }
-  const rowHtml = o => `<button class="row" data-oid="${esc(o.id)}"><span class="t ${o.kind}">${TYPE[o.kind]}</span><span class="m"><b>#${esc(o.id)} · ${f2(o.usdt)} USDT${o.inr ? ' · ₹' + f2(o.inr) : ''}</b><small>${day(o.at)} ${clock(o.at)}${o.reason ? ' · <span class="why">' + esc(o.reason) + '</span>' : ''}</small></span><span class="badge ${o.status}">${STAT[o.status]}</span></button>`;
+  const rowHtml = o => `<button class="row" data-oid="${esc(o.id)}"><span class="t ${o.kind}">${o.method === 'cashqr' ? 'CashQR' : TYPE[o.kind]}</span><span class="m"><b>#${esc(o.id)} · ${f2(o.usdt)} USDT${o.inr ? ' · ₹' + f2(o.inr) : ''}</b><small>${day(o.at)} ${clock(o.at)}${o.method === 'cashqr' ? ' · CashQR (ATM)' : ''}${o.reason ? ' · <span class="why">' + esc(o.reason) + '</span>' : ''}</small></span><span class="badge ${o.status}">${STAT[o.status]}</span></button>`;
 
   // ---------- order view ----------
   const fmtRem = ends => {
@@ -127,19 +144,40 @@
     return `${String(Math.floor(left / 60)).padStart(2, '0')}:${String(left % 60).padStart(2, '0')}`;
   };
   function showOrder(o) {
+    loadSettings();
     const can = s => o.kind === 'buy' ? o.status !== s : o.status === 'pending';
     const kv = (k, v) => v === undefined || v === null || v === '' ? '' : `<div><span>${k}</span><b>${v}</b></div>`;
+    const isCqr = o.kind === 'buy' && o.method === 'cashqr';
     const wdLabel = o.kind === 'withdraw' && o.status === 'pending' ? (o.timerEndsAt ? 'Processing' : 'Pending') : STAT[o.status];
     const wdTimerText = o.kind === 'withdraw' && o.status === 'pending'
       ? (o.timerEndsAt ? `${fmtRem(o.timerEndsAt)} remaining (Processing)` : 'Not set (shows Pending to user)') : '';
+    const cqrStatusHtml = !isCqr ? '' : o.utr ? `<span style="color:var(--success)">UTR submitted (${esc(o.utr)})</span>`
+      : (o.hasQr && o.qrExpiresAt > Date.now()) ? `<span style="color:var(--success)" data-cqr-t="${o.qrExpiresAt}">QR active · ${fmtRem(o.qrExpiresAt)}</span>`
+      : o.hasQr ? '<span class="why">QR expired (1 min elapsed) — assign a fresh QR</span>'
+      : (o.status === 'pending' && o.expiresAt) ? `<span data-cqr-t="${o.expiresAt}">Waiting for QR · ${fmtRem(o.expiresAt)}</span>`
+      : 'Waiting for QR';
+    const showQrAssign = o.kind === 'buy' && (o.status === 'pending' || (isCqr && o.status !== 'success'));
     $('#main').innerHTML = `<div style="max-width:620px;margin:0 auto"><div class="card"><div class="head"><h2>Order #${esc(o.id)}</h2><span class="badge ${o.status}">${wdLabel}</span></div>
       <div class="kv">
-        ${kv('Type', TYPE[o.kind])}${kv('Amount', (o.inr ? '₹' + f2(o.inr) + ' → ' : '') + f2(o.usdt) + ' USDT')}${kv('Rate', o.rate ? '₹' + o.rate + ' per USDT' : '')}
+        ${kv('Type', isCqr ? 'Buy · CashQR (ATM)' : TYPE[o.kind])}${kv('Payment method', o.kind === 'buy' ? (isCqr ? 'CashQR (ATM High Limit)' : 'UPI') : '')}${kv('Amount', (o.inr ? '₹' + f2(o.inr) + ' → ' : '') + f2(o.usdt) + ' USDT')}${kv('Rate', o.rate ? '₹' + o.rate + ' per USDT' : '')}
+        ${kv('CashQR status', cqrStatusHtml)}
         ${kv('UTR', o.utr ? esc(o.utr) : o.kind === 'buy' ? 'Not submitted yet' : '')}${kv('Paid to UPI', esc(o.upi))}${kv('Wallet', esc(o.address))}${kv('Chain', esc(o.chain && o.chain.toUpperCase()))}${kv('Transaction hash', esc(o.txid))}
         ${kv('Withdraw timer', wdTimerText)}
         ${kv('User ID', `<button class="link" data-uid="${esc(o.user.uid)}">${esc(o.user.uid)}</button>`)}${kv('User email', esc(o.user.email))}${kv('User phone', esc(o.user.phone))}
         ${kv('Date', day(o.at))}${kv('Time', clock(o.at))}${kv('Last update', day(o.updatedAt) + ' ' + clock(o.updatedAt))}${o.reason ? `<div><span>Failure reason</span><b class="why">${esc(o.reason)}</b></div>` : ''}
       </div>
+      ${showQrAssign ? `<div class="cqr-box">
+        <div>
+          <b>${o.hasQr && o.qrExpiresAt > Date.now() ? 'CashQR Active on User Screen' : 'Assign CashQR to User'} · ₹${f2(o.inr)}</b>
+          <small style="display:block;margin-top:3px">${o.hasQr && o.qrExpiresAt > Date.now() ? 'User can currently see the 1-minute QR. You can replace or resend a new QR below.' : 'Upload/scan the ATM QR photo, pick a UPI ID, or paste QR text to send a clean 1-minute QR to this order.'}</small>
+        </div>
+        <input type="file" id="ordQrFile" accept="image/*" capture="environment" hidden>
+        <div class="cqr-acts">
+          <button class="btn" id="ordAssignQr">${o.hasQr ? 'Replace / Resend QR' : 'Assign QR to Order'}</button>
+          <button class="btn ghost" id="ordScanQr">Scan / Upload ATM QR Photo</button>
+          <button class="btn ghost" id="ordPasteQr">Paste QR Text</button>
+        </div>
+      </div>` : ''}
       <div style="display:flex;gap:10px;margin-top:16px;flex-wrap:wrap">${o.kind === 'withdraw' && o.status === 'pending' ? `<button class="btn ghost" id="setTimer">${o.timerEndsAt ? 'Edit timer' : 'Set timer'}</button>` : ''}${can('success') ? '<button class="btn" id="ok">Mark success</button>' : ''}${can('failed') ? '<button class="btn danger" id="bad">Mark failed</button>' : ''}</div>
       ${o.kind !== 'buy' && o.status !== 'pending' ? '<p class="mut" style="margin-top:12px">Finished sells and withdrawals are locked. Use Edit balance on the user to correct anything.</p>' : ''}</div></div>`;
     bind(o);
@@ -192,9 +230,29 @@
   // ---------- pending + log + backup ----------
   async function pending() {
     try {
+      loadSettings();
       const list = await api('/pending');
-      const lbl = o => o.kind === 'withdraw' ? (o.timerEndsAt ? `Processing (${Math.max(1, Math.ceil((o.timerEndsAt - Date.now()) / 60000))}m)` : 'Pending') : 'Pending';
-      $('#main').innerHTML = `<h3 style="margin-bottom:6px">Pending (${list.length})</h3><small>Buys with a UTR are first. Click one to review it.</small>` + (list.length ? list.map(o => `<button class="row" data-pid="${esc(o.id)}"><span class="t ${o.kind}">${TYPE[o.kind]}</span><span class="m"><b>#${esc(o.id)} · ${f2(o.usdt)} USDT${o.inr ? ' · ₹' + f2(o.inr) : ''}</b><small>${esc(o.user.uid)} · ${day(o.at)} ${clock(o.at)}${o.upi ? ' · UPI: <b>' + esc(o.upi) + '</b>' : ''}${o.kind === 'buy' ? (o.utr ? ' · UTR submitted' : ' · no UTR yet') : ''}</small></span><span class="badge pending">${lbl(o)}</span></button>`).join('') : '<p class="empty">Nothing is waiting.</p>');
+      const lbl = o => {
+        if (o.kind === 'withdraw') return o.timerEndsAt ? `Processing (${Math.max(1, Math.ceil((o.timerEndsAt - Date.now()) / 60000))}m)` : 'Pending';
+        if (o.kind === 'buy' && o.method === 'cashqr') {
+          if (o.utr) return 'UTR submitted';
+          if (o.hasQr && o.qrExpiresAt > Date.now()) return `QR active · ${fmtRem(o.qrExpiresAt)}`;
+          if (o.expiresAt) return `Waiting QR · ${fmtRem(o.expiresAt)}`;
+          return 'Waiting QR';
+        }
+        return 'Pending';
+      };
+      const rowP = o => {
+        const isCqr = o.kind === 'buy' && o.method === 'cashqr';
+        const timerAttr = isCqr && !o.utr ? (o.hasQr && o.qrExpiresAt > Date.now() ? ` data-cqr-t="${o.qrExpiresAt}"` : o.expiresAt ? ` data-cqr-t="${o.expiresAt}"` : '') : '';
+        return `<div class="row" data-pid="${esc(o.id)}" style="cursor:pointer">
+          <span class="t ${o.kind}">${isCqr ? 'CashQR' : TYPE[o.kind]}</span>
+          <span class="m"><b>#${esc(o.id)} · ${f2(o.usdt)} USDT${o.inr ? ' · ₹' + f2(o.inr) : ''}</b><small>${esc(o.user.uid)} · ${day(o.at)} ${clock(o.at)}${isCqr ? ' · <b>CashQR (ATM)</b>' : o.upi ? ' · UPI: <b>' + esc(o.upi) + '</b>' : ''}${o.kind === 'buy' ? (o.utr ? ' · UTR: <b>' + esc(o.utr) + '</b>' : isCqr ? (o.hasQr ? ' · QR sent to user' : ' · Waiting for you to assign QR') : ' · no UTR yet') : ''}</small></span>
+          ${isCqr && !o.utr ? `<button type="button" class="btn ub-act" data-assign-pid="${esc(o.id)}">${o.hasQr ? 'Replace QR' : 'Assign QR'}</button>` : ''}
+          <span class="badge ${o.utr ? 'success' : 'pending'}"${timerAttr}>${lbl(o)}</span>
+        </div>`;
+      };
+      $('#main').innerHTML = `<div class="head" style="margin-bottom:6px"><div><h3>Pending (${list.length})</h3><small>Buys with a UTR are first. Click an order to review it, or click <b>Assign QR</b> on CashQR requests.</small></div></div>` + (list.length ? list.map(rowP).join('') : '<p class="empty">Nothing is waiting.</p>');
       window._pending = list; bind();
     } catch (e) { toast(e.message, true); }
   }
@@ -214,10 +272,27 @@
     const m = $('#main');
     m.querySelectorAll('[data-uid]').forEach(b => b.onclick = () => openUser(b.dataset.uid));
     m.querySelectorAll('[data-oid]').forEach(b => b.onclick = () => showOrder(cur.history.find(x => x.id === b.dataset.oid)));
+    m.querySelectorAll('[data-soid]').forEach(b => b.onclick = () => showOrder((window._searchOrders || []).find(x => x.id === b.dataset.soid)));
     m.querySelectorAll('[data-pid]').forEach(b => b.onclick = () => showOrder(window._pending.find(x => x.id === b.dataset.pid)));
+    m.querySelectorAll('[data-assign-pid]').forEach(b => b.onclick = e => {
+      e.stopPropagation();
+      const o = (window._pending || []).find(x => x.id === b.dataset.assignPid);
+      if (o) openAssignQrModal(o, () => pending());
+    });
     m.querySelectorAll('[data-f]').forEach(b => b.onclick = () => { const [g, v] = b.dataset.f.split(':'); view[g] = v; renderUser(); });
     if ($('#eb', m)) $('#eb', m).onclick = editBalance; if ($('#susp', m)) $('#susp', m).onclick = suspend; if ($('#unsusp', m)) $('#unsusp', m).onclick = unsuspend; if ($('#setPw', m)) $('#setPw', m).onclick = resetPassword;
     if (order) {
+      if ($('#ordAssignQr', m)) $('#ordAssignQr', m).onclick = () => openAssignQrModal(order, upd => showOrder(upd));
+      if ($('#ordScanQr', m) && $('#ordQrFile', m)) {
+        $('#ordScanQr', m).onclick = () => $('#ordQrFile', m).click();
+        $('#ordQrFile', m).onchange = async e => {
+          const f = e.target.files && e.target.files[0]; e.target.value = '';
+          if (!f) return;
+          try { const payload = await decodeQrFromFile(f); await attachCleanQr(order, payload, upd => showOrder(upd)); }
+          catch (err) { toast(err.message, true); openAssignQrModal(order, upd => showOrder(upd)); }
+        };
+      }
+      if ($('#ordPasteQr', m)) $('#ordPasteQr', m).onclick = () => openAssignQrModal(order, upd => showOrder(upd));
       if ($('#setTimer', m)) $('#setTimer', m).onclick = async () => {
         const curMins = order.timerEndsAt ? Math.max(1, Math.ceil((order.timerEndsAt - Date.now()) / 60000)) : 60;
         const r = await ask({
@@ -247,7 +322,7 @@
         <div class="head"><div><h2>Userbase</h2><small id="ubCount">Loading…</small></div></div>
         <label class="ub-search">
           <svg viewBox="0 0 24 24" aria-hidden="true"><path d="M11 18a7 7 0 100-14 7 7 0 000 14zM20 20l-4-4"/></svg>
-          <input id="ubQ" type="search" placeholder="Search by user ID, phone or email" autocomplete="off" spellcheck="false" aria-label="Search users">
+          <input id="ubQ" type="search" placeholder="Search by user ID, order ID (#A7K2M9), phone or email" autocomplete="off" spellcheck="false" aria-label="Search users or orders">
           <kbd id="ubClear" hidden>Esc</kbd>
         </label>
         <div class="ub-wrap"><table class="ub-table">
@@ -273,6 +348,26 @@
     try {
       const d = await api('/users?page=' + page + '&q=' + encodeURIComponent(q));
       if (seq !== ubSeq || !$('#ubBody')) return;                     // an older, slower answer: ignore it
+      if (d.total === 0 && q) {
+        const f = await api('/find?q=' + encodeURIComponent(q)).catch(() => ({ kind: 'none' }));
+        if (seq !== ubSeq || !$('#ubBody')) return;
+        const foundOrders = f.kind === 'order' ? [f.order] : f.kind === 'orders' ? f.orders : [];
+        if (foundOrders.length) {
+          window._ubOrders = foundOrders;
+          body.innerHTML = foundOrders.map(o => `
+            <tr>
+              <td><button class="uid-link" data-ub-oid="${esc(o.id)}">Order #${esc(o.id)}</button></td>
+              <td>${o.method === 'cashqr' ? 'Buy · CashQR' : TYPE[o.kind]} · ${f2(o.usdt)} USDT${o.inr ? ' (₹' + f2(o.inr) + ')' : ''}</td>
+              <td>${day(o.at)} ${clock(o.at)}</td>
+              <td><span class="badge ${o.status}">${STAT[o.status]}</span></td>
+              <td><button class="btn ub-act" data-ub-oid="${esc(o.id)}">Open Order</button></td>
+            </tr>`).join('');
+          $('#ubCount').textContent = `${foundOrders.length} order match${foundOrders.length === 1 ? '' : 'es'} for “${q}”`;
+          $('#ubPages').innerHTML = '';
+          $('#main').querySelectorAll('[data-ub-oid]').forEach(b => b.onclick = () => showOrder((window._ubOrders || []).find(x => x.id === b.dataset.ubOid)));
+          return;
+        }
+      }
       const totalPages = Math.max(1, Math.ceil(d.total / 50));
       body.innerHTML = d.users.map((u, i) => `
         <tr style="--i:${Math.min(i, 12)}">
@@ -539,30 +634,39 @@
       }
       if (typeof window.jsQR !== 'function') throw new Error('QR decoder not loaded.');
       const canvas = document.createElement('canvas'), ctx = canvas.getContext('2d', { willReadFrequently: true });
-      for (const maxDim of [900, 1400, 520]) {
-        const sc = Math.min(1, maxDim / Math.max(img.width, img.height));
-        const w = Math.max(1, Math.round(img.width * sc)), h = Math.max(1, Math.round(img.height * sc));
-        canvas.width = w; canvas.height = h;
-        ctx.drawImage(img, 0, 0, w, h);
-        const raw = ctx.getImageData(0, 0, w, h);
-        let hit = window.jsQR(raw.data, w, h, { inversionAttempts: 'attemptBoth' });
-        if (hit && hit.data) return hit.data;
-        // High-contrast monochrome pass for washed-out / glare-heavy ATM screen photos
-        const d = raw.data;
-        let sum = 0;
-        for (let i = 0; i < d.length; i += 4) sum += 0.299 * d[i] + 0.587 * d[i + 1] + 0.114 * d[i + 2];
-        const avg = sum / (d.length / 4);
-        for (let i = 0; i < d.length; i += 4) {
-          const v = (0.299 * d[i] + 0.587 * d[i + 1] + 0.114 * d[i + 2]) > avg * 0.92 ? 255 : 0;
-          d[i] = d[i + 1] = d[i + 2] = v; d[i + 3] = 255;
+      const crops = [
+        [0, 0, img.width, img.height],
+        [Math.round(img.width * 0.15), Math.round(img.height * 0.15), Math.round(img.width * 0.7), Math.round(img.height * 0.7)]
+      ];
+      for (const [sx, sy, sw, sh] of crops) {
+        if (sw < 40 || sh < 40) continue;
+        for (const maxDim of [900, 1400, 560]) {
+          const sc = Math.min(1, maxDim / Math.max(sw, sh));
+          const w = Math.max(1, Math.round(sw * sc)), h = Math.max(1, Math.round(sh * sc));
+          canvas.width = w; canvas.height = h;
+          ctx.drawImage(img, sx, sy, sw, sh, 0, 0, w, h);
+          const base = ctx.getImageData(0, 0, w, h);
+          let hit = window.jsQR(base.data, w, h, { inversionAttempts: 'attemptBoth' });
+          if (hit && hit.data) return hit.data;
+          let sum = 0;
+          const bd = base.data;
+          for (let i = 0; i < bd.length; i += 4) sum += 0.299 * bd[i] + 0.587 * bd[i + 1] + 0.114 * bd[i + 2];
+          const avg = sum / (bd.length / 4);
+          for (const mult of [0.92, 1.05, 0.8]) {
+            const copy = new Uint8ClampedArray(bd);
+            for (let i = 0; i < copy.length; i += 4) {
+              const v = (0.299 * copy[i] + 0.587 * copy[i + 1] + 0.114 * copy[i + 2]) > avg * mult ? 255 : 0;
+              copy[i] = copy[i + 1] = copy[i + 2] = v; copy[i + 3] = 255;
+            }
+            hit = window.jsQR(copy, w, h, { inversionAttempts: 'attemptBoth' });
+            if (hit && hit.data) return hit.data;
+          }
         }
-        hit = window.jsQR(d, w, h, { inversionAttempts: 'attemptBoth' });
-        if (hit && hit.data) return hit.data;
       }
-      throw new Error('Could not detect a clear QR code in that photo. Try cropping closer to the ATM QR or paste the QR text.');
+      throw new Error('Could not detect a clear QR code in that photo. Crop closer to the ATM QR or paste/generate the QR below.');
     } finally { URL.revokeObjectURL(url); }
   }
-  async function attachCleanQr(order, payload) {
+  async function attachCleanQr(order, payload, afterFn) {
     try {
       const p = await api('/cashqr/preview', { method: 'POST', body: { payload } });
       const ok = await ask({
@@ -571,23 +675,102 @@
         ok: 'Send 1-min QR to user'
       });
       if (!ok) return;
-      await api(`/cashqr/${order.id}/qr`, { method: 'POST', body: { payload } });
+      const res = await api(`/cashqr/${order.id}/qr`, { method: 'POST', body: { payload } });
       toast(`Clean 1-min CashQR sent to #${order.id}`);
-      cashQrPanel();
+      loadSettings();
+      if (typeof afterFn === 'function') afterFn(res.order);
+      else cashQrPanel();
     } catch (e) { toast(e.message, true); }
+  }
+  function openAssignQrModal(order, afterFn) {
+    const m = $('#mdl'), c = $('#mcard');
+    const upiChips = activeUpis.length
+      ? `<div style="margin-top:8px"><small class="mut">Or 1-click generate ₹${f2(order.inr)} QR from active UPI:</small><div class="chips">${activeUpis.map(u => `<button type="button" class="chip" data-gen-upi="${esc(u)}">${esc(u)}</button>`).join('')}</div></div>`
+      : '';
+    c.innerHTML = `<h3>Assign CashQR to #${esc(order.id)}</h3>
+      <p>Amount: <b>₹${f2(order.inr)}</b> (${f2(order.usdt)} USDT) · User: <b>${esc(order.user.uid)}</b></p>
+      <input type="file" id="mQrFile" accept="image/*" capture="environment" hidden>
+      <button type="button" class="btn ghost block" id="mPickQrImg" style="margin:10px 0">📷 Upload / Scan ATM QR Photo (auto-converts to clean QR)</button>
+      ${upiChips}
+      <label class="mut" for="mQrText" style="display:block;margin-top:8px">QR payload / UPI link (auto-filled from photo or paste below):</label>
+      <textarea id="mQrText" rows="2" maxlength="2000" placeholder="upi://pay?pa=... or decoded ATM QR string" style="margin-top:6px"></textarea>
+      <div id="mQrPrevWrap" hidden style="text-align:center;margin-top:8px">
+        <div class="cqr-prev" id="mQrPrev"></div>
+        <small class="mut">Clean 1-minute vector QR preview</small>
+      </div>
+      <p class="merr" id="merr"></p>
+      <div class="mbtns"><button class="btn ghost" id="mno">Cancel</button><button class="btn" id="myes">Send 1-min QR to user</button></div>`;
+    m.hidden = false;
+    const close = () => { m.hidden = true; document.removeEventListener('keydown', onKey); };
+    const onKey = e => { if (e.key === 'Escape') close(); };
+    document.addEventListener('keydown', onKey);
+    $('#mno', c).onclick = close;
+    let prevTimer = null;
+    const updatePreview = async val => {
+      const txt = (val ?? $('#mQrText', c).value).trim();
+      $('#merr', c).textContent = '';
+      if (txt.length < 4) { $('#mQrPrevWrap', c).hidden = true; return; }
+      try {
+        const p = await api('/cashqr/preview', { method: 'POST', body: { payload: txt } });
+        if (!$('#mQrPrev', c)) return;
+        $('#mQrPrev', c).innerHTML = p.svg;
+        $('#mQrPrevWrap', c).hidden = false;
+      } catch (e) { $('#merr', c).textContent = e.message; }
+    };
+    $('#mQrText', c).oninput = () => { clearTimeout(prevTimer); prevTimer = setTimeout(() => updatePreview(), 220); };
+    c.querySelectorAll('[data-gen-upi]').forEach(b => b.onclick = () => {
+      const upi = b.dataset.genUpi;
+      const link = `upi://pay?pa=${upi}&pn=BlockNexa&am=${Number(order.inr).toFixed(2)}&cu=INR&tn=${encodeURIComponent('BN ' + order.id)}`;
+      $('#mQrText', c).value = link;
+      updatePreview(link);
+    });
+    $('#mPickQrImg', c).onclick = () => $('#mQrFile', c).click();
+    $('#mQrFile', c).onchange = async e => {
+      const f = e.target.files && e.target.files[0]; e.target.value = '';
+      if (!f) return;
+      $('#merr', c).textContent = '';
+      $('#mPickQrImg', c).textContent = 'Decoding ATM QR photo…';
+      try {
+        const decoded = await decodeQrFromFile(f);
+        $('#mQrText', c).value = decoded;
+        $('#mPickQrImg', c).textContent = '✓ ATM QR decoded — change photo';
+        await updatePreview(decoded);
+      } catch (err) {
+        $('#mPickQrImg', c).textContent = '📷 Upload / Scan ATM QR Photo';
+        $('#merr', c).textContent = err.message;
+      }
+    };
+    $('#myes', c).onclick = async () => {
+      const payload = $('#mQrText', c).value.trim();
+      if (payload.length < 4) { $('#merr', c).textContent = 'Upload an ATM QR photo, pick a UPI chip, or paste QR text first.'; return; }
+      $('#myes', c).disabled = true;
+      try {
+        const res = await api(`/cashqr/${order.id}/qr`, { method: 'POST', body: { payload } });
+        close();
+        toast(`Clean 1-min CashQR sent to #${order.id}`);
+        loadSettings();
+        if (typeof afterFn === 'function') afterFn(res.order);
+        else cashQrPanel();
+      } catch (err) {
+        $('#myes', c).disabled = false;
+        $('#merr', c).textContent = err.message;
+      }
+    };
+    $('#mQrText', c).focus();
   }
   async function cashQrPanel() {
     try {
+      loadSettings();
       const d = await api('/cashqr');
       const card = o => {
         const badge = o.utr ? '<span class="badge success">UTR submitted</span>'
-          : o.hasQr ? `<span class="badge pending" data-cqr-t="${o.qrExpiresAt}">QR active · ${fmtRem(o.qrExpiresAt)}</span>`
+          : (o.hasQr && o.qrExpiresAt > Date.now()) ? `<span class="badge pending" data-cqr-t="${o.qrExpiresAt}">QR active · ${fmtRem(o.qrExpiresAt)}</span>`
           : `<span class="badge pending" data-cqr-t="${o.expiresAt}">Waiting QR · ${fmtRem(o.expiresAt)}</span>`;
         return `<div class="cqr-card">
           <div class="cqr-top"><div><b>#${esc(o.id)} · ₹${f2(o.inr)}</b> <small>(${f2(o.usdt)} USDT)</small><br><small>${esc(o.user.uid)} · ${esc(o.user.email || o.user.phone || '')} · ${clock(o.at)}</small></div>${badge}</div>
           ${o.utr ? `<small>UTR: <b style="font-family:ui-monospace,Consolas,monospace;color:var(--text)">${esc(o.utr)}</b></small>` : ''}
           <div class="cqr-acts">
-            ${!o.utr ? `<button class="btn" data-cqr-scan="${esc(o.id)}">${o.hasQr ? 'Replace QR photo' : 'Scan / Upload ATM QR'}</button><button class="btn ghost" data-cqr-paste="${esc(o.id)}">Paste QR text</button>` : ''}
+            ${!o.utr ? `<button class="btn" data-cqr-assign="${esc(o.id)}">${o.hasQr ? 'Replace / Assign QR' : 'Assign QR'}</button><button class="btn ghost" data-cqr-scan="${esc(o.id)}">${o.hasQr ? 'Replace QR photo' : 'Scan / Upload ATM QR'}</button><button class="btn ghost" data-cqr-paste="${esc(o.id)}">Paste QR text</button>` : ''}
             <button class="btn ghost" data-cqr-open="${esc(o.id)}">Open / Approve</button>
           </div>
         </div>`;
@@ -596,7 +779,7 @@
       $('#main').innerHTML = `
         <div class="card">
           <div class="head">
-            <div><h2>CashQR · ATM High-Limit Queue</h2><small>First-come, first-served · Upload ATM screen photo to convert into a clean 1-minute SVG QR</small></div>
+            <div><h2>CashQR · ATM High-Limit Queue</h2><small>First-come, first-served · Upload ATM screen photo or assign a clean 1-minute SVG QR</small></div>
             <div style="display:flex;gap:8px;flex-wrap:wrap">
               <button class="btn ${d.enabled ? '' : 'danger'}" id="cqrToggle">CashQR: ${d.enabled ? 'ON' : 'OFF'}</button>
               <button class="btn ghost" id="cqrRefresh">Refresh</button>
@@ -617,9 +800,13 @@
       $('#cqrFile', m).onchange = async e => {
         const f = e.target.files && e.target.files[0]; e.target.value = '';
         if (!f || !targetOrder) return;
-        try { const payload = await decodeQrFromFile(f); await attachCleanQr(targetOrder, payload); }
-        catch (err) { toast(err.message, true); }
+        try { const payload = await decodeQrFromFile(f); await attachCleanQr(targetOrder, payload, () => cashQrPanel()); }
+        catch (err) { toast(err.message, true); openAssignQrModal(targetOrder, () => cashQrPanel()); }
       };
+      m.querySelectorAll('[data-cqr-assign]').forEach(b => b.onclick = () => {
+        const o = window._cqrList.find(x => x.id === b.dataset.cqrAssign);
+        if (o) openAssignQrModal(o, () => cashQrPanel());
+      });
       m.querySelectorAll('[data-cqr-scan]').forEach(b => b.onclick = () => {
         targetOrder = window._cqrList.find(x => x.id === b.dataset.cqrScan);
         $('#cqrFile', m).click();
@@ -627,7 +814,7 @@
       m.querySelectorAll('[data-cqr-paste]').forEach(b => b.onclick = async () => {
         const o = window._cqrList.find(x => x.id === b.dataset.cqrPaste);
         const r = await ask({ title: `Paste QR text for #${o.id}`, text: { placeholder: 'Paste decoded ATM QR string (e.g. upi://pay?...)', required: true }, ok: 'Preview clean QR' });
-        if (r) await attachCleanQr(o, r.text);
+        if (r) await attachCleanQr(o, r.text, () => cashQrPanel());
       });
       m.querySelectorAll('[data-cqr-open]').forEach(b => b.onclick = () => showOrder(window._cqrList.find(x => x.id === b.dataset.cqrOpen)));
     } catch (e) { toast(e.message, true); }
@@ -641,5 +828,5 @@
 
   $('#nTrade').onclick = toggleTrade;
   $('#nPending').onclick = pending; $('#nCashQr').onclick = cashQrPanel; $('#nUsers').onclick = () => userbase(0); $('#nTxLog').onclick = txLog; $('#nNotifs').onclick = pushNotifs; $('#nAudit').onclick = auditLog; $('#nBackup').onclick = backup; $('#nLock').onclick = lock;
-  if (KEY) api('/ping').then(() => { $('#login').hidden = true; $('#panel').hidden = false; loadSettings(); }).catch(() => {});
+  if (KEY) api('/ping').then(() => { $('#login').hidden = true; $('#panel').hidden = false; loadSettings(); pending(); }).catch(() => {});
 })();

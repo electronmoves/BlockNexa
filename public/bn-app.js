@@ -279,12 +279,26 @@
     const k = KIND[x.kind];
     let [c, l] = ST[x.status];
     if (x.kind === 'withdraw' && x.status === 'pending') l = x.timerEndsAt ? 'Processing' : 'Pending';
+    if (x.kind === 'buy' && x.status === 'pending' && x.method === 'cashqr') l = x.hasQr ? 'QR Ready · Tap' : 'Getting QR · Tap';
     const timerSpan = (x.status === 'pending' && x.kind === 'withdraw' && x.timerEndsAt)
       ? `<span data-ends="${x.timerEndsAt}" style="color:var(--accent-soft);font-weight:600">${fmtLeft(x.timerEndsAt)}</span>` : '';
     const detail = x.kind === 'buy' ? (x.method === 'cashqr' ? `₹${fmt(x.inr)} · CashQR` : `₹${fmt(x.inr)} paid`) : x.kind === 'sell' ? `₹${fmt(x.inr)} to your UPI` : `to ${short(x.address)}${timerSpan}`;
-    return `<div class="row" style="--i:${Math.min(i, 10)}"><span class="rico ${k.tone}">${icon(k.ic)}</span><div class="rmid"><b>${k.label} <small>#${esc(x.id)}</small></b>
+    const openAttr = x.kind === 'buy' && x.status === 'pending' ? ` data-open-buy="${esc(x.id)}" style="--i:${Math.min(i, 10)};cursor:pointer"` : ` style="--i:${Math.min(i, 10)}"`;
+    return `<div class="row"${openAttr}><span class="rico ${k.tone}">${icon(k.ic)}</span><div class="rmid"><b>${k.label} <small>#${esc(x.id)}</small></b>
       <small>${when(x.at)} · ${detail}</small>${x.reason ? `<small class="why">Reason: ${esc(x.reason)}</small>` : ''}</div>
       <div class="rend"><b>${sign[x.kind]}${fmt(x.usdt)} USDT</b><span class="badge ${c}">${l}</span></div></div>`;
+  }
+  function wireOpenBuy(root, list) {
+    root.querySelectorAll('[data-open-buy]').forEach(el => el.onclick = async () => {
+      try {
+        const fresh = await api().buyStatus(el.dataset.openBuy);
+        if (fresh.status !== 'pending') return toast(fresh.reason || `Order #${fresh.id} is ${fresh.status}`, fresh.status === 'failed');
+        fresh.method === 'cashqr' ? payCashQr(root, fresh) : pay(root, fresh);
+      } catch (e) {
+        const o = (list || []).find(x => x.id === el.dataset.openBuy);
+        if (o) o.method === 'cashqr' ? payCashQr(root, o) : pay(root, o);
+      }
+    });
   }
   function done(root, title, text, rows, hist) {
     screen(root, title, `<div class="card center"><div class="okmark">${icon('check')}${'<i class="pt"></i>'.repeat(8)}</div><h3 style="font:700 20px var(--display)">${esc(text)}</h3>
@@ -316,6 +330,7 @@
         <a class="row lk tn-t" href="#/support" style="margin-top:0"><span class="rico t">${icon('help')}</span><div class="rmid"><b>Need help?</b><small>Contact support</small></div></a>
       </section></div></div>`;
     $('#commBtn', root).onclick = communitySoonAlert;
+    wireOpenBuy(root, rec);
     if (rt.buySellEnabled === false) {
       root.querySelectorAll('a[href="#/buy"], a[href="#/sell"], a[href="#/withdraw"]').forEach(a => a.onclick = e => { e.preventDefault(); buySellOffAlert(rt.buySellReason); });
     }
@@ -556,7 +571,24 @@
     const t = KIND[type] ? type : 'buy', names = { buy: 'Buy history', sell: 'Sell history', withdraw: 'Withdrawals' };
     screen(root, names[t], '<p class="empty">Loading…</p>');
     const list = await api().history(t);
-    screen(root, names[t], list.length ? list.map(row).join('') : '<p class="empty">Nothing here yet.</p>');
+    if (!list.length) return screen(root, names[t], '<p class="empty">Nothing here yet.</p>');
+    screen(root, names[t], `<label class="field" style="margin-top:0;margin-bottom:12px"><input id="hq" class="sm" type="search" placeholder="Search by Order ID (e.g. #${esc(list[0].id)}), amount or status" autocomplete="off" spellcheck="false" aria-label="Search orders"></label><div id="hlist">${list.map(row).join('')}</div>`);
+    const hq = $('#hq', root), hlist = $('#hlist', root);
+    const filter = () => {
+      const q = hq.value.trim().toUpperCase().replace(/^(ORDER|REQUEST|ID)?[\s#:-]+/, '');
+      const hit = !q ? list : list.filter(x =>
+        String(x.id || '').toUpperCase().includes(q) ||
+        String(x.inr || '').includes(q) ||
+        String(x.usdt || '').includes(q) ||
+        String(x.upi || '').toUpperCase().includes(q) ||
+        String(x.address || '').toUpperCase().includes(q) ||
+        String(x.status || '').toUpperCase().includes(q)
+      );
+      hlist.innerHTML = hit.length ? hit.map(row).join('') : `<p class="empty">No orders match “${esc(hq.value.trim())}”.</p>`;
+      wireOpenBuy(root, hit);
+    };
+    hq.oninput = filter;
+    wireOpenBuy(root, list);
   }
   function support(root) {
     screen(root, 'Contact support', `<div class="card"><p class="mut">Tell us what happened and share your order or request ID (for example #A7K2M9) so we can find it quickly.</p>

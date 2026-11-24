@@ -443,16 +443,30 @@ const orderView = o => { const u = S('SELECT * FROM users WHERE id=?').get(o.use
 
 A.get('/ping', (req, res) => res.json({ ok: true }));
 A.get('/find', (req, res) => {
+  expireOrders();
   const raw = String(req.query.q || '').trim().slice(0, 80); if (!raw) return res.json({ kind: 'none' });
   const up = raw.toUpperCase(), digits = raw.replace(/\D/g, '');
+  const token = up.replace(/^(ORDER|REQUEST|ID)?[\s#:*-]+/, '').trim();
+  const hashMatch = up.match(/#([A-Z0-9]{6})\b/);
+  const ordCode = hashMatch ? hashMatch[1] : (/^[A-Z0-9]{6}$/.test(token) ? token : '');
   let u, o;
-  if (/^BN-?\d{6}$/.test(up)) u = S('SELECT * FROM users WHERE uid=?').get('BN-' + up.replace(/\D/g, ''));
-  else if (/^\d{12}$/.test(raw)) o = S('SELECT * FROM orders WHERE utr=?').get(raw);
-  else if (/^[A-Z0-9]{6}$/.test(up)) { o = S('SELECT * FROM orders WHERE public_id=?').get(up); if (!o && /^\d{6}$/.test(up)) u = S('SELECT * FROM users WHERE uid=?').get('BN-' + up); }
+  if (/^BN-?\d{6}$/.test(token)) u = S('SELECT * FROM users WHERE uid=?').get('BN-' + token.replace(/\D/g, ''));
+  else if (/^\d{12}$/.test(digits)) o = S('SELECT * FROM orders WHERE utr=?').get(digits);
+  else if (ordCode) {
+    o = S('SELECT * FROM orders WHERE UPPER(public_id)=?').get(ordCode);
+    if (!o && /^\d{6}$/.test(ordCode)) u = S('SELECT * FROM users WHERE uid=?').get('BN-' + ordCode);
+  } else if (/^0X[A-F0-9]{64}$/.test(token)) {
+    o = S('SELECT * FROM orders WHERE LOWER(txid)=LOWER(?)').get(token);
+  }
   if (o) return res.json({ kind: 'order', order: orderView(o) });
   if (u) return res.json({ kind: 'user', uid: u.uid });
+  const cleanTok = token.replace(/[%_\\]/g, '');
+  const ordLike = cleanTok.length >= 2 ? '%' + cleanTok + '%' : 'no-order-match';
+  const orders = S("SELECT * FROM orders WHERE UPPER(public_id) LIKE ? OR COALESCE(utr,'') LIKE ? OR UPPER(COALESCE(txid,'')) LIKE ? OR UPPER(COALESCE(address,'')) LIKE ? ORDER BY id DESC LIMIT 20").all(ordLike, ordLike, ordLike, ordLike);
+  if (orders.length === 1) return res.json({ kind: 'order', order: orderView(orders[0]) });
+  if (orders.length > 1) return res.json({ kind: 'orders', orders: orders.map(orderView) });
   const like = '%' + raw.toLowerCase().replace(/[%_]/g, '') + '%', ph = digits.length >= 6 ? '%' + digits + '%' : 'no-phone-match';
-  const list = S('SELECT * FROM users WHERE LOWER(COALESCE(email,\'\')) LIKE ? OR phone LIKE ? ORDER BY id DESC LIMIT 20').all(like, ph);
+  const list = S('SELECT * FROM users WHERE LOWER(COALESCE(email,\'\')) LIKE ? OR phone LIKE ? OR UPPER(uid) LIKE ? ORDER BY id DESC LIMIT 20').all(like, ph, ordLike);
   if (list.length === 1) return res.json({ kind: 'user', uid: list[0].uid });
   res.json(list.length ? { kind: 'users', users: list.map(x => ({ uid: x.uid, email: x.email, phone: x.phone })) } : { kind: 'none' });
 });
@@ -642,7 +656,13 @@ const checkAdminKey = (req, k) => {
   }
   return null;
 };
-A.get('/settings', (req, res) => res.json({ buySellEnabled: buySellEnabled(), buySellReason: buySellReason() }));
+A.get('/settings', (req, res) => {
+  expireOrders();
+  const pendingCount = S("SELECT COUNT(*) c FROM orders WHERE status='pending'").get().c;
+  const cashQrPendingCount = S("SELECT COUNT(*) c FROM orders WHERE type='buy' AND pay_method='cashqr' AND status='pending'").get().c;
+  const upis = S('SELECT upi FROM upis WHERE active=1 ORDER BY id ASC').all().map(r => r.upi);
+  res.json({ buySellEnabled: buySellEnabled(), buySellReason: buySellReason(), cashQrEnabled: cashQrEnabled(), pendingCount, cashQrPendingCount, upis });
+});
 A.post('/settings/buy-sell', (req, res) => {
   const b = req.body || {}, bad = checkAdminKey(req, b.adminKey);
   if (bad) return res.status(bad.code).json({ error: bad.err });
@@ -758,13 +778,14 @@ A.post('/cashqr/preview', async (req, res) => {
 });
 A.post('/cashqr/:id/qr', (req, res) => {
   expireOrders();
-  const pid = String(req.params.id).toUpperCase(), o = S("SELECT * FROM orders WHERE public_id=? AND type='buy' AND pay_method='cashqr'").get(pid);
-  if (!o) return res.status(404).json({ error: 'CashQR order not found.' });
-  if (o.status !== 'pending') return res.status(409).json({ error: o.fail_reason || 'This CashQR order is no longer pending.' });
+  const pid = String(req.params.id).toUpperCase(), o = S("SELECT * FROM orders WHERE public_id=? AND type='buy'").get(pid);
+  if (!o) return res.status(404).json({ error: 'Buy order not found.' });
+  if (o.status === 'success') return res.status(409).json({ error: 'This order is already marked as success.' });
+  if (o.status !== 'pending' && o.pay_method !== 'cashqr') return res.status(409).json({ error: o.fail_reason || 'This order is no longer pending.' });
   const payload = String((req.body || {}).payload || '').trim();
   if (payload.length < 4 || payload.length > 2000) return res.status(400).json({ error: 'QR data is empty or invalid.' });
-  const t = now(), qrExp = t + CASHQR_TTL_MS;
-  S('UPDATE orders SET qr_payload=?, qr_expires_at=?, updated_at=? WHERE id=?').run(payload, qrExp, t, o.id);
+  const t = now(), qrExp = t + CASHQR_TTL_MS, ordExp = Math.max(o.expires_at || 0, qrExp + 60000);
+  S("UPDATE orders SET pay_method='cashqr', status='pending', fail_reason=NULL, qr_payload=?, qr_expires_at=?, expires_at=?, updated_at=? WHERE id=?").run(payload, qrExp, ordExp, t, o.id);
   audit('cashqr_attached', S('SELECT uid FROM users WHERE id=?').get(o.user_id).uid, { order: o.public_id, qrExpiresAt: qrExp });
   res.json({ order: orderView(S('SELECT * FROM orders WHERE id=?').get(o.id)) });
 });
@@ -773,6 +794,7 @@ app.use('/api/admin', A);
 
 /* ================================= SECTION 7: START ================================= */
 const PUBLIC = path.join(__dirname, 'public'), ADMIN = path.join(PUBLIC, 'admin');   // the site is public/, the admin panel is public/admin/
+const NO_CACHE_STATIC = { index: false, etag: true, maxAge: 0, setHeaders: res => res.set('Cache-Control', 'no-cache') };
 const ADMIN_ROUTE = /^[a-zA-Z0-9_-]{8,64}$/.test(CFG.ADMIN_PATH) && CFG.ADMIN_PATH.toLowerCase() !== 'admin' ? '/' + CFG.ADMIN_PATH : '/tsjsigjijgdigj77sf7sf4';
 const GATE_KEY = CFG.ADMIN_GATE_KEY || CFG.ADMIN_KEY;
 const GATE_MS = 12 * 3600 * 1000;
@@ -801,9 +823,9 @@ const adminGate = (req, res, next) => {
 };
 app.use('/admin', (req, res) => res.sendStatus(404));                                   // /admin and /admin/* are ALWAYS 404 (never exposed via public/)
 app.get([ADMIN_ROUTE, ADMIN_ROUTE + '/'], ipOk, adminGate, (req, res) => res.redirect(ADMIN_ROUTE + '/bn-admin.html'));
-app.use(ADMIN_ROUTE, ipOk, adminGate, express.static(ADMIN));
-app.get('/', (req, res) => res.sendFile('blocknexa.html', { root: PUBLIC }));   // root: works even if the project folder path has a dot-folder in it
-app.use(express.static(PUBLIC, { index: false }));      // (/admin is blocked above; admin static is only served on ADMIN_ROUTE)
+app.use(ADMIN_ROUTE, ipOk, adminGate, express.static(ADMIN, NO_CACHE_STATIC));
+app.get('/', (req, res) => { res.set('Cache-Control', 'no-cache'); res.sendFile('blocknexa.html', { root: PUBLIC }); });   // root: works even if the project folder path has a dot-folder in it
+app.use(express.static(PUBLIC, NO_CACHE_STATIC));      // (/admin is blocked above; admin static is only served on ADMIN_ROUTE)
 app.use((err, req, res, next) => res.status(400).json({ error: 'Bad request.' }));
 app.listen(CFG.PORT, err => {
   if (err) { console.error(err.code === 'EADDRINUSE' ? `PORT ${CFG.PORT} IS ALREADY IN USE. Close the other server and try again.` : err); process.exit(1); }
