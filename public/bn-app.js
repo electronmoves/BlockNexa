@@ -104,11 +104,15 @@
 // Errors: HTTP 4xx with { error: "message the user can read" }
 (function () {
   const BN = window.BN, B = '/api/v2';
+  BN.state = { rates: null, balance: null, recent: null, notifications: null };
   async function req(method, path, body) {
-    const r = await fetch(B + path, { method, headers: body ? { 'Content-Type': 'application/json' } : {}, body: body ? JSON.stringify(body) : undefined, credentials: 'same-origin' });
+    const r = await fetch(B + path, { method, cache: 'no-store', headers: body ? { 'Content-Type': 'application/json' } : {}, body: body ? JSON.stringify(body) : undefined, credentials: 'same-origin' });
     const d = await r.json().catch(() => ({}));
-    if (r.status === 401 && path !== '/me' && !path.startsWith('/auth') && BN.app && BN.app.expired) BN.app.expired();
+    if (r.status === 401 && path !== '/me' && !path.startsWith('/auth') && BN.app && BN.app.expired) BN.app.expired(d.error);
     if (!r.ok) { const e = new Error(d.error || 'Something went wrong. Please try again.'); e.status = r.status; throw e; }
+    if (path === '/rates') BN.state.rates = d;
+    else if (path === '/balance') BN.state.balance = d;
+    else if (path === '/home') { BN.state.balance = d.balance; BN.state.rates = d.rates; BN.state.recent = d.recent; BN.state.notifications = d.notifications; }
     return d;
   }
   const live = {
@@ -119,6 +123,7 @@
     otpVerify: (phone, code, mode, password) => req('POST', '/auth/otp/verify', { phone, code, mode, password }),
     loginPassword: (phone, password) => req('POST', '/auth/login/password', { phone, password }),
     setPassword: b => req('POST', '/account/password', b),
+    home: () => req('GET', '/home'),
     rates: () => req('GET', '/rates'), balance: () => req('GET', '/balance'), history: t => req('GET', '/history/' + t),
     buyCreate: (inr, method = 'upi') => req('POST', '/buy', { inr, method }), buyStatus: id => req('GET', '/buy/' + encodeURIComponent(id)), buyPaid: (id, utr) => req('POST', `/buy/${id}/paid`, { utr }),
     sellCreate: b => req('POST', '/sell', b), withdraw: b => req('POST', '/withdraw', { chain: 'bsc', ...b }), deposit: () => req('GET', '/deposit'),
@@ -306,8 +311,10 @@
       <a class="btn" href="#/history/${hist}">View history</a><a class="btn ghost" href="#/home">Back to home</a></div>`);
   }
 
-  async function home(root) {
-    const [bal, rt, rec, notifs] = await Promise.all([api().balance(), api().rates(), api().history('all'), api().notifications().catch(() => ({ unread: 0, list: [] }))]);
+  let activeOrderHook = null, activeTradeSync = null;
+
+  function paintHome(root, d) {
+    const { balance: bal, rates: rt, recent: rec, notifications: notifs } = d;
     const q = (h, c, i, t) => `<a href="${h}" class="q ${c}"><span class="lk">${icon(i)}</span>${t}</a>`;
     const tile = (t, i, tone, n, s) => `<a class="tile lk tn-${tone}" href="#/history/${t}"><span class="rico ${tone}">${icon(i)}</span><b>${n}</b><small>${s}</small></a>`;
     const [whole, dec] = fmt(bal.usdt).split('.');
@@ -335,66 +342,130 @@
       root.querySelectorAll('a[href="#/buy"], a[href="#/sell"], a[href="#/withdraw"]').forEach(a => a.onclick = e => { e.preventDefault(); buySellOffAlert(rt.buySellReason); });
     }
   }
+
+  async function home(root) {
+    activeOrderHook = null; activeTradeSync = null;
+    const st = BN.state;
+    if (st.balance && st.rates && st.recent && st.notifications) {
+      paintHome(root, st);
+      api().home().then(d => { if ((location.hash || '#/home').split('/')[1] === 'home') paintHome(root, d); }).catch(() => {});
+      return;
+    }
+    paintHome(root, await api().home());
+  }
   const buySellOffAlert = r => ask({ title: 'Service Unavailable', note: r || "Buy, Sell & Withdrawal services are currently disabled. We'll notify you.", ok: 'OK', cancel: '', tone: 'danger', icon: 'warn' });
   const communitySoonAlert = () => ask({ title: 'Community Arriving Soon', note: 'Our official BlockNexa community channel is launching soon. Stay tuned!', ok: 'Got it', cancel: '', tone: 'info', icon: 'users' });
+  const cancelOpenModal = () => { const mno = $('#mno'); if (mno) mno.click(); };
+
+  function renderDisabledScreen(root, title, reason) {
+    screen(root, title, `<div class="card center"><p class="err" style="margin-top:0">${esc(reason || "Buy, Sell & Withdrawal services are currently disabled. We'll notify you.")}</p><a class="btn ghost" href="#/deposit">Deposit USDT instead</a><a class="btn ghost" href="#/home">Back to home</a></div>`);
+  }
 
   async function buy(root) {
-    const rt = await api().rates(), min = Math.ceil(rt.minBuyUsdt * rt.buy);
-    if (rt.buySellEnabled === false) {
-      screen(root, 'Buy USDT', `<div class="card center"><p class="err" style="margin-top:0">${esc(rt.buySellReason || "Buy, Sell & Withdrawal services are currently disabled. We'll notify you.")}</p><a class="btn ghost" href="#/deposit">Deposit USDT instead</a><a class="btn ghost" href="#/home">Back to home</a></div>`);
-      return buySellOffAlert(rt.buySellReason);
-    }
-    const cMin = rt.minCashQrInr || 2000, cMax = rt.maxCashQrInr || 10000, cStep = rt.cashQrStep || 500;
-    let method = 'upi';
-    screen(root, 'Buy USDT', `<div class="card">
-      <div class="pm-tabs" role="tablist">
-        <button type="button" class="pm on" data-m="upi"><b>UPI</b><small>₹${fmt(min, 0)}–₹${fmt(rt.maxBuyInr, 0)}</small></button>
-        <button type="button" class="pm ${rt.cashQrEnabled === false ? 'off' : ''}" data-m="cashqr"><b>CashQR</b><small>${rt.cashQrEnabled === false ? 'Unavailable' : `₹${fmt(cMin, 0)}–₹${fmt(cMax, 0)}`}</small></button>
-      </div>
-      <p class="mut" id="binfo" style="margin-top:12px">₹${+rt.buy} per USDT. Minimum ${rt.minBuyUsdt} USDT (₹${fmt(min, 0)}), maximum ₹${fmt(rt.maxBuyInr, 0)}.</p>
-      <label class="field"><span class="pre">₹</span><input id="amt" type="number" inputmode="numeric" placeholder="0" aria-label="Amount in rupees"></label>
-      <div class="chips" id="bchips"></div>
-      <div class="kv"><div><span>You receive</span><b id="get">0.00 USDT</b></div></div>
-      <p class="err" id="err" role="alert"></p><button class="btn" id="go">Continue</button></div>`);
-    const amt = $('#amt', root), err = $('#err', root);
-    const upd = () => $('#get', root).textContent = fmt((+amt.value || 0) / rt.buy) + ' USDT';
-    const paintMethod = () => {
-      root.querySelectorAll('.pm').forEach(b => b.classList.toggle('on', b.dataset.m === method));
-      err.textContent = '';
-      if (method === 'cashqr') {
-        $('#binfo', root).textContent = `CashQR: ₹${+rt.buy} per USDT. ₹${fmt(cMin, 0)} to ₹${fmt(cMax, 0)} (multiples of ₹${fmt(cStep, 0)}).`;
-        $('#bchips', root).innerHTML = [2000, 4000, 6000, 10000].filter(v => v >= cMin && v <= cMax).map(v => `<button type="button" data-v="${v}">₹${fmt(v, 0)}</button>`).join('');
-      } else {
-        $('#binfo', root).textContent = `₹${+rt.buy} per USDT. Minimum ${rt.minBuyUsdt} USDT (₹${fmt(min, 0)}), maximum ₹${fmt(rt.maxBuyInr, 0)}.`;
-        $('#bchips', root).innerHTML = [1000, 2500, 5000].map(v => `<button type="button" data-v="${v}">₹${fmt(v, 0)}</button>`).join('');
+    activeOrderHook = null;
+    let rt = BN.state.rates || await api().rates();
+    if (BN.state.rates) api().rates().then(fresh => { if (activeTradeSync) activeTradeSync(fresh, false); }).catch(() => {});
+    const renderBuyForm = (showOffPopup) => {
+      const min = Math.ceil(rt.minBuyUsdt * rt.buy);
+      if (rt.buySellEnabled === false) {
+        renderDisabledScreen(root, 'Buy USDT', rt.buySellReason);
+        if (showOffPopup) setTimeout(() => buySellOffAlert(rt.buySellReason), 190);
+        return;
       }
-      root.querySelectorAll('#bchips button').forEach(b => b.onclick = () => { amt.value = b.dataset.v; upd(); });
+      const cMin = rt.minCashQrInr || 2000, cMax = rt.maxCashQrInr || 10000, cStep = rt.cashQrStep || 500;
+      let method = 'upi';
+      screen(root, 'Buy USDT', `<div class="card">
+        <div class="pm-tabs" role="tablist">
+          <button type="button" class="pm on" data-m="upi"><b>UPI</b><small>₹${fmt(min, 0)}–₹${fmt(rt.maxBuyInr, 0)}</small></button>
+          <button type="button" class="pm ${rt.cashQrEnabled === false ? 'off' : ''}" data-m="cashqr" id="pmCashQr"><b>CashQR</b><small id="pmCashQrSub">${rt.cashQrEnabled === false ? 'Unavailable' : `₹${fmt(cMin, 0)}–₹${fmt(cMax, 0)}`}</small></button>
+        </div>
+        <p class="mut" id="binfo" style="margin-top:12px">₹${+rt.buy} per USDT. Minimum ${rt.minBuyUsdt} USDT (₹${fmt(min, 0)}), maximum ₹${fmt(rt.maxBuyInr, 0)}.</p>
+        <label class="field"><span class="pre">₹</span><input id="amt" type="number" inputmode="numeric" placeholder="0" aria-label="Amount in rupees"></label>
+        <div class="chips" id="bchips"></div>
+        <div class="kv"><div><span>You receive</span><b id="get">0.00 USDT</b></div></div>
+        <p class="err" id="err" role="alert"></p><button class="btn" id="go">Continue</button></div>`);
+      const amt = $('#amt', root), err = $('#err', root);
+      const upd = () => $('#get', root).textContent = fmt((+amt.value || 0) / rt.buy) + ' USDT';
+      const paintMethod = () => {
+        root.querySelectorAll('.pm').forEach(b => b.classList.toggle('on', b.dataset.m === method));
+        err.textContent = '';
+        if (method === 'cashqr') {
+          $('#binfo', root).textContent = `CashQR: ₹${+rt.buy} per USDT. ₹${fmt(cMin, 0)} to ₹${fmt(cMax, 0)} (multiples of ₹${fmt(cStep, 0)}).`;
+          $('#bchips', root).innerHTML = [2000, 4000, 6000, 10000].filter(v => v >= cMin && v <= cMax).map(v => `<button type="button" data-v="${v}">₹${fmt(v, 0)}</button>`).join('');
+        } else {
+          $('#binfo', root).textContent = `₹${+rt.buy} per USDT. Minimum ${rt.minBuyUsdt} USDT (₹${fmt(min, 0)}), maximum ₹${fmt(rt.maxBuyInr, 0)}.`;
+          $('#bchips', root).innerHTML = [1000, 2500, 5000].map(v => `<button type="button" data-v="${v}">₹${fmt(v, 0)}</button>`).join('');
+        }
+        root.querySelectorAll('#bchips button').forEach(b => b.onclick = () => { amt.value = b.dataset.v; upd(); });
+      };
+      root.querySelectorAll('.pm').forEach(b => b.onclick = () => {
+        if (b.dataset.m === 'cashqr' && rt.cashQrEnabled === false) return toast('CashQR is currently unavailable. Please use UPI.', true);
+        method = b.dataset.m; paintMethod();
+      });
+      paintMethod();
+      amt.oninput = upd;
+      buy._syncCashQr = () => {
+        const btn = $('#pmCashQr', root), sub = $('#pmCashQrSub', root);
+        if (!btn || !sub) return;
+        btn.classList.toggle('off', rt.cashQrEnabled === false);
+        sub.textContent = rt.cashQrEnabled === false ? 'Unavailable' : `₹${fmt(cMin, 0)}–₹${fmt(cMax, 0)}`;
+        if (rt.cashQrEnabled === false && method === 'cashqr') {
+          cancelOpenModal();
+          method = 'upi'; paintMethod();
+          toast('CashQR was just turned off — switched to UPI.', true);
+        }
+      };
+      $('#go', root).onclick = async e => {
+        if (rt.buySellEnabled === false) { renderBuyForm(true); return; }
+        const v = +amt.value; err.textContent = '';
+        if (method === 'cashqr') {
+          if (rt.cashQrEnabled === false) { buy._syncCashQr(); return; }
+          if (!Number.isInteger(v) || v < cMin || v > cMax || v % cStep !== 0) return err.textContent = `Enter an amount between ₹${fmt(cMin, 0)} and ₹${fmt(cMax, 0)} (multiple of ₹${fmt(cStep, 0)}).`;
+          if (!await ask({ title: 'Confirm CashQR order', rows: [['Method', 'CashQR'], ['You pay', '₹' + fmt(v)], ['You receive', fmt(v / rt.buy, 4) + ' USDT'], ['Rate', '₹' + rt.buy + ' per USDT']], note: 'Step 1 gets your QR (up to 5 min). Once the QR appears, you have 1 minute to scan & pay.', ok: 'Request CashQR' })) return;
+          if (rt.buySellEnabled === false) { renderBuyForm(true); return; }
+          e.target.disabled = true;
+          try { activeTradeSync = null; payCashQr(root, await api().buyCreate(v, 'cashqr')); } catch (x) { err.textContent = msg(x); e.target.disabled = false; }
+        } else {
+          if (!Number.isInteger(v) || v < min || v > rt.maxBuyInr) return err.textContent = `Enter a whole amount between ₹${fmt(min, 0)} and ₹${fmt(rt.maxBuyInr, 0)}.`;
+          if (!await ask({ title: 'Confirm your order', rows: [['You pay', '₹' + fmt(v)], ['You receive', fmt(v / rt.buy, 4) + ' USDT'], ['Rate', '₹' + rt.buy + ' per USDT']], note: 'Next you get a UPI QR code. Pay exactly this amount.', ok: 'Place order' })) return;
+          if (rt.buySellEnabled === false) { renderBuyForm(true); return; }
+          e.target.disabled = true;
+          try { activeTradeSync = null; pay(root, await api().buyCreate(v, 'upi')); } catch (x) { err.textContent = msg(x); e.target.disabled = false; }
+        }
+      };
     };
-    root.querySelectorAll('.pm').forEach(b => b.onclick = () => {
-      if (b.dataset.m === 'cashqr' && rt.cashQrEnabled === false) return toast('CashQR is currently unavailable. Please use UPI.', true);
-      method = b.dataset.m; paintMethod();
-    });
-    paintMethod();
-    amt.oninput = upd;
-    $('#go', root).onclick = async e => {
-      const v = +amt.value; err.textContent = '';
-      if (method === 'cashqr') {
-        if (!Number.isInteger(v) || v < cMin || v > cMax || v % cStep !== 0) return err.textContent = `Enter an amount between ₹${fmt(cMin, 0)} and ₹${fmt(cMax, 0)} (multiple of ₹${fmt(cStep, 0)}).`;
-        if (!await ask({ title: 'Confirm CashQR order', rows: [['Method', 'CashQR'], ['You pay', '₹' + fmt(v)], ['You receive', fmt(v / rt.buy, 4) + ' USDT'], ['Rate', '₹' + rt.buy + ' per USDT']], note: 'Step 1 gets your QR (up to 5 min). Once the QR appears, you have 1 minute to scan & pay.', ok: 'Request CashQR' })) return;
-        e.target.disabled = true;
-        try { payCashQr(root, await api().buyCreate(v, 'cashqr')); } catch (x) { err.textContent = msg(x); e.target.disabled = false; }
-      } else {
-        if (!Number.isInteger(v) || v < min || v > rt.maxBuyInr) return err.textContent = `Enter a whole amount between ₹${fmt(min, 0)} and ₹${fmt(rt.maxBuyInr, 0)}.`;
-        if (!await ask({ title: 'Confirm your order', rows: [['You pay', '₹' + fmt(v)], ['You receive', fmt(v / rt.buy, 4) + ' USDT'], ['Rate', '₹' + rt.buy + ' per USDT']], note: 'Next you get a UPI QR code. Pay exactly this amount.', ok: 'Place order' })) return;
-        e.target.disabled = true;
-        try { pay(root, await api().buyCreate(v, 'upi')); } catch (x) { err.textContent = msg(x); e.target.disabled = false; }
+    activeTradeSync = (newRt, notify = true) => {
+      const wasEnabled = rt.buySellEnabled !== false, wasCqr = rt.cashQrEnabled !== false;
+      rt = newRt;
+      if (rt.buySellEnabled === false && (wasEnabled || $('#go', root))) {
+        cancelOpenModal();
+        renderBuyForm(notify);
+      } else if (rt.buySellEnabled !== false && !wasEnabled && !$('#go', root)) {
+        const okBtn = $('#myes'); if (okBtn && !$('#mno')) okBtn.click();
+        renderBuyForm(false);
+        if (notify) toast('Buy, Sell & Withdrawals are now enabled!');
+      } else if ((rt.cashQrEnabled !== false) !== wasCqr && buy._syncCashQr) {
+        buy._syncCashQr();
       }
     };
+    renderBuyForm(rt.buySellEnabled === false);
   }
   function payCashQr(root, o) {
     let cur = o, pollIv = null, tickIv = null;
-    const stop = () => { clearInterval(pollIv); clearInterval(tickIv); };
+    const stop = () => { clearInterval(pollIv); clearInterval(tickIv); activeOrderHook = null; };
     window.addEventListener('hashchange', stop, { once: true });
+    activeOrderHook = ord => {
+      if (!ord || ord.id !== cur.id) return;
+      if (ord.status === 'failed') {
+        stop();
+        const err = $('#err', root); if (err) err.textContent = ord.reason || 'CashQR request failed.';
+        const box = $('#cqrTimer', root); if (box) box.innerHTML = '<b style="color:var(--error)">Order expired / failed</b>';
+        const btn = $('#paid', root); if (btn) btn.disabled = true;
+      } else if (ord.hasQr && (!cur.hasQr || ord.qrExpiresAt !== cur.qrExpiresAt)) {
+        clearInterval(pollIv); clearInterval(tickIv);
+        cur = ord; renderStep2();
+      }
+    };
 
     const renderStep1 = () => {
       const exp = cur.expiresAt || (Date.now() + 300000);
@@ -507,31 +578,46 @@
   }
 
   async function sell(root) {
-    const [rt, bal] = await Promise.all([api().rates(), api().balance()]);
-    if (rt.buySellEnabled === false) {
-      screen(root, 'Sell USDT', `<div class="card center"><p class="err" style="margin-top:0">${esc(rt.buySellReason || "Buy, Sell & Withdrawal services are currently disabled. We'll notify you.")}</p><a class="btn ghost" href="#/deposit">Deposit USDT instead</a><a class="btn ghost" href="#/home">Back to home</a></div>`);
-      return buySellOffAlert(rt.buySellReason);
-    }
-    screen(root, 'Sell USDT', `<div class="card"><p class="mut">Sell at <b style="color:var(--success)">₹${+rt.sell}</b> per USDT. Available: ${fmt(bal.usdt)} USDT. Minimum ${rt.minSellUsdt} USDT.</p>
-      <label class="field"><input id="amt" type="number" inputmode="decimal" placeholder="Amount in USDT" aria-label="USDT amount"><button class="mini" id="max">Max</button></label>
-      <label class="field"><input id="upi" class="sm" placeholder="Your UPI ID (to receive INR)" autocomplete="off" spellcheck="false" aria-label="Your UPI ID"></label>
-      <div class="kv"><div><span>You get</span><b id="get">₹0.00</b></div></div>
-      <p class="err" id="err" role="alert"></p><button class="btn blue" id="go" style="background:var(--accent);color:#fff">Sell USDT</button></div>`);
-    const amt = $('#amt', root), upd = () => $('#get', root).textContent = '₹' + fmt((+amt.value || 0) * rt.sell);
-    amt.oninput = upd; $('#max', root).onclick = () => { amt.value = Math.floor(bal.usdt * 1e6) / 1e6; upd(); };
-    $('#go', root).onclick = async e => {
-      const v = +amt.value, upi = $('#upi', root).value.trim(), err = $('#err', root); err.textContent = '';
-      if (!(v >= rt.minSellUsdt)) return err.textContent = `Minimum sale is ${rt.minSellUsdt} USDT.`;
-      if (v > bal.usdt) return err.textContent = `Insufficient balance. You have ${fmt(bal.usdt)} USDT.`;
-      if (!UPI.test(upi)) return err.textContent = 'Enter a valid UPI ID, like name@bank.';
-      if (!await ask({ title: 'Confirm sale', rows: [['You sell', fmt(v) + ' USDT'], ['Rate', '₹' + rt.sell + ' per USDT'], ['You get', '₹' + fmt(v * rt.sell)], ['Paid to', upi]], note: 'The USDT is set aside for this order. If the payout fails, it returns to your balance.', ok: 'Sell now' })) return;
-      e.target.disabled = true;
-      try { const o = await api().sellCreate({ usdt: v, upi }); done(root, 'Sale requested', 'We will pay your UPI soon', [['Order', '#' + o.id], ['You sold', fmt(o.usdt) + ' USDT'], ['You get', '₹' + fmt(o.inr)], ['Paid to', o.upi], ['Status', 'Processing']], 'sell'); }
-      catch (x) { err.textContent = msg(x); e.target.disabled = false; }
+    activeOrderHook = null;
+    let [rt, bal] = (BN.state.rates && BN.state.balance) ? [BN.state.rates, BN.state.balance] : await Promise.all([api().rates(), api().balance()]);
+    if (BN.state.rates && BN.state.balance) Promise.all([api().rates(), api().balance()]).then(([r2, b2]) => { bal = b2; if ($('#sellAvail', root)) $('#sellAvail', root).textContent = fmt(bal.usdt); if (activeTradeSync) activeTradeSync(r2, false); }).catch(() => {});
+    const renderSellForm = (showOffPopup) => {
+      if (rt.buySellEnabled === false) {
+        renderDisabledScreen(root, 'Sell USDT', rt.buySellReason);
+        if (showOffPopup) setTimeout(() => buySellOffAlert(rt.buySellReason), 190);
+        return;
+      }
+      screen(root, 'Sell USDT', `<div class="card"><p class="mut">Sell at <b style="color:var(--success)">₹${+rt.sell}</b> per USDT. Available: <span id="sellAvail">${fmt(bal.usdt)}</span> USDT. Minimum ${rt.minSellUsdt} USDT.</p>
+        <label class="field"><input id="amt" type="number" inputmode="decimal" placeholder="Amount in USDT" aria-label="USDT amount"><button class="mini" id="max">Max</button></label>
+        <label class="field"><input id="upi" class="sm" placeholder="Your UPI ID (to receive INR)" autocomplete="off" spellcheck="false" aria-label="Your UPI ID"></label>
+        <div class="kv"><div><span>You get</span><b id="get">₹0.00</b></div></div>
+        <p class="err" id="err" role="alert"></p><button class="btn blue" id="go" style="background:var(--accent);color:#fff">Sell USDT</button></div>`);
+      const amt = $('#amt', root), upd = () => $('#get', root).textContent = '₹' + fmt((+amt.value || 0) * rt.sell);
+      amt.oninput = upd; $('#max', root).onclick = () => { amt.value = Math.floor(bal.usdt * 1e6) / 1e6; upd(); };
+      $('#go', root).onclick = async e => {
+        if (rt.buySellEnabled === false) { renderSellForm(true); return; }
+        const v = +amt.value, upi = $('#upi', root).value.trim(), err = $('#err', root); err.textContent = '';
+        if (!(v >= rt.minSellUsdt)) return err.textContent = `Minimum sale is ${rt.minSellUsdt} USDT.`;
+        if (v > bal.usdt) return err.textContent = `Insufficient balance. You have ${fmt(bal.usdt)} USDT.`;
+        if (!UPI.test(upi)) return err.textContent = 'Enter a valid UPI ID, like name@bank.';
+        if (!await ask({ title: 'Confirm sale', rows: [['You sell', fmt(v) + ' USDT'], ['Rate', '₹' + rt.sell + ' per USDT'], ['You get', '₹' + fmt(v * rt.sell)], ['Paid to', upi]], note: 'The USDT is set aside for this order. If the payout fails, it returns to your balance.', ok: 'Sell now' })) return;
+        if (rt.buySellEnabled === false) { renderSellForm(true); return; }
+        e.target.disabled = true;
+        try { activeTradeSync = null; const o = await api().sellCreate({ usdt: v, upi }); done(root, 'Sale requested', 'We will pay your UPI soon', [['Order', '#' + o.id], ['You sold', fmt(o.usdt) + ' USDT'], ['You get', '₹' + fmt(o.inr)], ['Paid to', o.upi], ['Status', 'Processing']], 'sell'); }
+        catch (x) { err.textContent = msg(x); e.target.disabled = false; }
+      };
     };
+    activeTradeSync = (newRt, notify = true) => {
+      const wasEnabled = rt.buySellEnabled !== false;
+      rt = newRt;
+      if (rt.buySellEnabled === false && (wasEnabled || $('#go', root))) { cancelOpenModal(); renderSellForm(notify); }
+      else if (rt.buySellEnabled !== false && !wasEnabled && !$('#go', root)) { const okBtn = $('#myes'); if (okBtn && !$('#mno')) okBtn.click(); renderSellForm(false); if (notify) toast('Buy, Sell & Withdrawals are now enabled!'); }
+    };
+    renderSellForm(rt.buySellEnabled === false);
   }
 
   async function deposit(root) {
+    activeOrderHook = null; activeTradeSync = null;
     const ch = (await api().deposit())[0];
     screen(root, 'Deposit USDT', `<div class="card"><p class="mut">Currently available chain</p>
       <div class="row" style="border-color:var(--primary);cursor:default"><span class="rico g">${icon('dep')}</span><div class="rmid"><b>${esc(ch.short)}</b><small>${esc(ch.name)}</small></div><span class="badge ok">Selected</span></div>
@@ -541,30 +627,45 @@
   }
 
   async function withdraw(root) {
-    const [bal, rt] = await Promise.all([api().balance(), api().rates()]), low = bal.usdt < rt.minWithdraw;
-    if (rt.buySellEnabled === false) {
-      screen(root, 'Withdraw USDT', `<div class="card center"><p class="err" style="margin-top:0">${esc(rt.buySellReason || "Buy, Sell & Withdrawal services are currently disabled. We'll notify you.")}</p><a class="btn ghost" href="#/deposit">Deposit USDT instead</a><a class="btn ghost" href="#/home">Back to home</a></div>`);
-      return buySellOffAlert(rt.buySellReason);
-    }
-    screen(root, 'Withdraw USDT', `<div class="card"><p class="mut">Select your chain</p>
-      <div class="row" style="border-color:var(--primary);cursor:default"><span class="rico l">${icon('wd')}</span><div class="rmid"><b>BSC</b><small>BNB Smart Chain (BEP20)</small></div><span class="badge ok">Selected</span></div>
-      <div class="kv"><div><span>Available</span><b>${fmt(bal.usdt)} USDT</b></div></div>
-      <label class="field"><input id="amt" type="number" inputmode="decimal" placeholder="Amount in USDT" aria-label="Amount"><button class="mini" id="max">Max</button></label>
-      <label class="field"><input id="addr" class="sm" placeholder="Paste your BSC (BEP20) wallet address" autocomplete="off" spellcheck="false" aria-label="Wallet address"></label>
-      <p class="err" id="err" role="alert">${low ? `You need at least ${rt.minWithdraw} USDT to withdraw.` : ''}</p>
-      <button class="btn" id="go">Confirm withdrawal</button></div>`);
-    $('#max', root).onclick = () => $('#amt', root).value = Math.floor(bal.usdt * 1e6) / 1e6;
-    $('#go', root).onclick = async e => {
-      const v = +$('#amt', root).value, a = $('#addr', root).value.trim(), err = $('#err', root); err.textContent = '';
-      if (!(v > 0)) return err.textContent = 'Enter the amount you want to withdraw.';
-      if (v < rt.minWithdraw) return err.textContent = `Minimum withdrawal is ${rt.minWithdraw} USDT.`;
-      if (v > bal.usdt) return err.textContent = `Insufficient balance. You have ${fmt(bal.usdt)} USDT.`;
-      if (!ADDR.test(a)) return err.textContent = 'Enter a valid BSC (BEP20) address. It starts with 0x and has 42 characters.';
-      if (!await ask({ title: 'Confirm withdrawal', rows: [['Amount', v + ' USDT'], ['Network', 'BSC (BEP20)'], ['To address', a]], note: 'Check the address carefully. Crypto sent to a wrong address cannot be recovered.', ok: 'Withdraw' })) return;
-      e.target.disabled = true;
-      try { const o = await api().withdraw({ amount: v, address: a }); done(root, 'Withdrawal requested', 'We will send it shortly', [['Request', '#' + o.id], ['Amount', fmt(o.usdt) + ' USDT'], ['To', short(o.address)], ['Status', 'Processing']], 'withdraw'); }
-      catch (x) { err.textContent = msg(x); e.target.disabled = false; }
+    activeOrderHook = null;
+    let [bal, rt] = (BN.state.balance && BN.state.rates) ? [BN.state.balance, BN.state.rates] : await Promise.all([api().balance(), api().rates()]);
+    if (BN.state.balance && BN.state.rates) Promise.all([api().balance(), api().rates()]).then(([b2, r2]) => { bal = b2; if ($('#wdAvail', root)) $('#wdAvail', root).textContent = fmt(bal.usdt) + ' USDT'; if (activeTradeSync) activeTradeSync(r2, false); }).catch(() => {});
+    const renderWdForm = (showOffPopup) => {
+      const low = bal.usdt < rt.minWithdraw;
+      if (rt.buySellEnabled === false) {
+        renderDisabledScreen(root, 'Withdraw USDT', rt.buySellReason);
+        if (showOffPopup) setTimeout(() => buySellOffAlert(rt.buySellReason), 190);
+        return;
+      }
+      screen(root, 'Withdraw USDT', `<div class="card"><p class="mut">Select your chain</p>
+        <div class="row" style="border-color:var(--primary);cursor:default"><span class="rico l">${icon('wd')}</span><div class="rmid"><b>BSC</b><small>BNB Smart Chain (BEP20)</small></div><span class="badge ok">Selected</span></div>
+        <div class="kv"><div><span>Available</span><b id="wdAvail">${fmt(bal.usdt)} USDT</b></div></div>
+        <label class="field"><input id="amt" type="number" inputmode="decimal" placeholder="Amount in USDT" aria-label="Amount"><button class="mini" id="max">Max</button></label>
+        <label class="field"><input id="addr" class="sm" placeholder="Paste your BSC (BEP20) wallet address" autocomplete="off" spellcheck="false" aria-label="Wallet address"></label>
+        <p class="err" id="err" role="alert">${low ? `You need at least ${rt.minWithdraw} USDT to withdraw.` : ''}</p>
+        <button class="btn" id="go">Confirm withdrawal</button></div>`);
+      $('#max', root).onclick = () => $('#amt', root).value = Math.floor(bal.usdt * 1e6) / 1e6;
+      $('#go', root).onclick = async e => {
+        if (rt.buySellEnabled === false) { renderWdForm(true); return; }
+        const v = +$('#amt', root).value, a = $('#addr', root).value.trim(), err = $('#err', root); err.textContent = '';
+        if (!(v > 0)) return err.textContent = 'Enter the amount you want to withdraw.';
+        if (v < rt.minWithdraw) return err.textContent = `Minimum withdrawal is ${rt.minWithdraw} USDT.`;
+        if (v > bal.usdt) return err.textContent = `Insufficient balance. You have ${fmt(bal.usdt)} USDT.`;
+        if (!ADDR.test(a)) return err.textContent = 'Enter a valid BSC (BEP20) address. It starts with 0x and has 42 characters.';
+        if (!await ask({ title: 'Confirm withdrawal', rows: [['Amount', v + ' USDT'], ['Network', 'BSC (BEP20)'], ['To address', a]], note: 'Check the address carefully. Crypto sent to a wrong address cannot be recovered.', ok: 'Withdraw' })) return;
+        if (rt.buySellEnabled === false) { renderWdForm(true); return; }
+        e.target.disabled = true;
+        try { activeTradeSync = null; const o = await api().withdraw({ amount: v, address: a }); done(root, 'Withdrawal requested', 'We will send it shortly', [['Request', '#' + o.id], ['Amount', fmt(o.usdt) + ' USDT'], ['To', short(o.address)], ['Status', 'Processing']], 'withdraw'); }
+        catch (x) { err.textContent = msg(x); e.target.disabled = false; }
+      };
     };
+    activeTradeSync = (newRt, notify = true) => {
+      const wasEnabled = rt.buySellEnabled !== false;
+      rt = newRt;
+      if (rt.buySellEnabled === false && (wasEnabled || $('#go', root))) { cancelOpenModal(); renderWdForm(notify); }
+      else if (rt.buySellEnabled !== false && !wasEnabled && !$('#go', root)) { const okBtn = $('#myes'); if (okBtn && !$('#mno')) okBtn.click(); renderWdForm(false); if (notify) toast('Buy, Sell & Withdrawals are now enabled!'); }
+    };
+    renderWdForm(rt.buySellEnabled === false);
   }
 
   async function history(root, type) {
@@ -635,7 +736,37 @@
       </div>`).join('') : '<div class="card"><p class="empty">No notifications yet.</p></div>';
     screen(root, 'Notifications', body);
   }
-  BN.screens = { home, buy, sell, deposit, withdraw, history, support, account, password, notifications };
+    BN.screens = {
+      home, buy, sell, deposit, withdraw, history, support, account, password, notifications,
+      onLive(ev, root) {
+        const [, name, arg] = (location.hash || '#/home').split('/');
+        if (ev.type === 'settings' && ev.rates) {
+          BN.state.rates = ev.rates;
+          if (typeof ev.usdt === 'number') BN.state.balance = { usdt: ev.usdt };
+          if (activeTradeSync) activeTradeSync(ev.rates, true);
+          else if (!name || name === 'home') {
+            if (BN.state.balance && BN.state.recent && BN.state.notifications) paintHome(root, BN.state);
+            else api().home().then(d => { if (((location.hash || '#/home').split('/')[1] || 'home') === 'home') paintHome(root, d); }).catch(() => {});
+          }
+          return;
+        }
+        if (ev.type === 'order' && ev.order) {
+          if (activeOrderHook) activeOrderHook(ev.order);
+        }
+        if (ev.type === 'order' || ev.type === 'sync') {
+          api().home().then(d => {
+            const [, curName, curArg] = (location.hash || '#/home').split('/');
+            if (!curName || curName === 'home') paintHome(root, d);
+            else if (curName === 'history') {
+              const qEl = $('#hq', root), savedQ = qEl ? qEl.value : '';
+              history(root, curArg).then(() => { const nq = $('#hq', root); if (nq && savedQ) { nq.value = savedQ; nq.dispatchEvent(new Event('input')); } }).catch(() => {});
+            } else if (curName === 'notifications') notifications(root).catch(() => {});
+            else if (curName === 'sell' && $('#sellAvail', root)) $('#sellAvail', root).textContent = fmt(d.balance.usdt);
+            else if (curName === 'withdraw' && $('#wdAvail', root)) $('#wdAvail', root).textContent = fmt(d.balance.usdt) + ' USDT';
+          }).catch(() => {});
+        }
+      }
+    };
 })();
 
 /* ============================================================
@@ -647,7 +778,43 @@
   const BN = window.BN, { $, toast } = BN.ui;
   document.title = BN.cfg.NAME;
   const app = $('#app'), auth = $('#auth');
-  let user = null;
+  let user = null, es = null, watchIv = null;
+
+  function stopLive() {
+    if (es) { try { es.close(); } catch {} es = null; }
+    clearInterval(watchIv); watchIv = null;
+  }
+  function startLive() {
+    stopLive();
+    if (!user || typeof EventSource === 'undefined') return;
+    const connect = () => {
+      if (!user) return;
+      try {
+        es = new EventSource('/api/v2/events');
+        es.onmessage = e => {
+          try {
+            const ev = JSON.parse(e.data);
+            if (ev.type === 'deactivated') { showAuth(ev.error); return; }
+            if (BN.screens.onLive) BN.screens.onLive(ev, app);
+          } catch {}
+        };
+      } catch {}
+    };
+    connect();
+    // Lightweight fallback sync when tab becomes visible or if a mobile proxy buffers SSE
+    watchIv = setInterval(async () => {
+      if (!user || document.hidden) return;
+      try {
+        const prev = BN.state.rates ? JSON.stringify([BN.state.rates.buySellEnabled, BN.state.rates.buySellReason, BN.state.rates.cashQrEnabled]) : '';
+        const rt = await BN.api.rates();
+        const next = JSON.stringify([rt.buySellEnabled, rt.buySellReason, rt.cashQrEnabled]);
+        if (prev && prev !== next && BN.screens.onLive) BN.screens.onLive({ type: 'settings', rates: rt }, app);
+      } catch {}
+    }, 6000);
+  }
+  document.addEventListener('visibilitychange', () => {
+    if (!document.hidden && user && BN.screens.onLive) BN.screens.onLive({ type: 'sync' }, app);
+  });
 
   function route() {
     if (!user) return;
@@ -656,9 +823,12 @@
     Promise.resolve(fn(app, arg)).catch(e => toast(e.message || 'Something went wrong', true));
     window.scrollTo(0, 0);
   }
-  function showAuth() {
-    user = null; app.hidden = true; auth.hidden = false;
-    BN.auth.render(auth, (u, opts) => { user = u; auth.hidden = true; app.hidden = false; location.hash = opts && opts.setPassword ? '#/password/forgot' : '#/home'; route(); });
+  function showAuth(errMsg) {
+    user = null; stopLive();
+    BN.state = { rates: null, balance: null, recent: null, notifications: null };
+    app.hidden = true; auth.hidden = false;
+    BN.auth.render(auth, (u, opts) => { user = u; auth.hidden = true; app.hidden = false; startLive(); location.hash = opts && opts.setPassword ? '#/password/forgot' : '#/home'; route(); });
+    if (errMsg) toast(errMsg, true);
   }
   async function logout() { await BN.api.logout().catch(() => {}); showAuth(); }
   BN.app = { user: () => user, logout, expired: showAuth };
@@ -666,7 +836,7 @@
   (async function boot() {
     let down = false;
     try { user = await BN.api.session(); } catch (e) { user = null; down = true; }
-    if (user) { app.hidden = false; route(); } else {
+    if (user) { app.hidden = false; startLive(); route(); } else {
       showAuth();
       if (down) $('.acard', auth).insertAdjacentHTML('afterbegin', '<p class="err">Cannot reach the BlockNexa server. Start it with <b>npm start</b> and open the address it prints (like http://localhost:3000). Do not open this file directly.</p>');
     }

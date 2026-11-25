@@ -7,10 +7,11 @@
   const clock = t => new Date(t).toLocaleTimeString('en-IN', { hour: 'numeric', minute: '2-digit', second: '2-digit' });
   const TYPE = { buy: 'Buy', sell: 'Sell', withdraw: 'Withdraw' }, STAT = { success: 'Success', failed: 'Failed', pending: 'Pending' };
   let KEY = sessionStorage.getItem('bn_admin_key') || '', cur = null, view = { type: 'all', status: 'all' };
+  let panelMode = '', openOrderId = '', adminEs = null;
 
   const toast = (m, bad) => { const t = document.createElement('div'); t.className = 'toast' + (bad ? ' bad' : ''); t.textContent = m; document.body.appendChild(t); setTimeout(() => t.remove(), 2800); };
   async function api(path, o = {}) {
-    const r = await fetch('/api/admin' + path, { method: o.method || 'GET', headers: { 'x-admin-key': KEY, ...(o.body ? { 'Content-Type': 'application/json' } : {}) }, body: o.body ? JSON.stringify(o.body) : undefined });
+    const r = await fetch('/api/admin' + path, { method: o.method || 'GET', cache: 'no-store', headers: { 'x-admin-key': KEY, ...(o.body ? { 'Content-Type': 'application/json' } : {}) }, body: o.body ? JSON.stringify(o.body) : undefined });
     if (o.raw && r.ok) return r;
     const d = await r.json().catch(() => ({}));
     if (r.status === 401) lock();
@@ -88,10 +89,31 @@
     try { const s = await api('/settings/buy-sell', { method: 'POST', body: { enabled: next, reason: r.text, adminKey: r.secret } }); paintTradeBtn(s.buySellEnabled); toast(s.buySellEnabled ? 'Buy, Sell & Withdrawals turned ON' : 'Buy, Sell & Withdrawals turned OFF (deposits still work)'); }
     catch (e) { toast(e.message, true); }
   }
-  function lock() { KEY = ''; sessionStorage.removeItem('bn_admin_key'); $('#panel').hidden = true; $('#login').hidden = false; }
+  function stopAdminStream() { if (adminEs) { try { adminEs.close(); } catch {} adminEs = null; } }
+  function startAdminStream() {
+    stopAdminStream();
+    if (!KEY || typeof EventSource === 'undefined') return;
+    try {
+      adminEs = new EventSource('/api/admin/events?key=' + encodeURIComponent(KEY));
+      adminEs.onmessage = e => {
+        try {
+          const ev = JSON.parse(e.data);
+          if (ev.type !== 'admin_sync') return;
+          loadSettings();
+          if (!$('#mdl').hidden) return;
+          if (panelMode === 'pending') pending();
+          else if (panelMode === 'cashqr') cashQrPanel();
+          else if (panelMode === 'order' && openOrderId && (!ev.orderId || ev.orderId === openOrderId)) {
+            api('/find?q=' + encodeURIComponent(openOrderId)).then(r => { if (r.kind === 'order' && panelMode === 'order' && openOrderId === r.order.id && $('#mdl').hidden) showOrder(r.order); }).catch(() => {});
+          }
+        } catch {}
+      };
+    } catch {}
+  }
+  function lock() { stopAdminStream(); KEY = ''; sessionStorage.removeItem('bn_admin_key'); $('#panel').hidden = true; $('#login').hidden = false; }
   async function enter() {
     KEY = $('#key').value.trim(); $('#lerr').textContent = '';
-    try { await api('/ping'); sessionStorage.setItem('bn_admin_key', KEY); $('#login').hidden = true; $('#panel').hidden = false; $('#key').value = ''; $('#q').focus(); loadSettings(); pending(); }
+    try { await api('/ping'); sessionStorage.setItem('bn_admin_key', KEY); $('#login').hidden = true; $('#panel').hidden = false; $('#key').value = ''; $('#q').focus(); startAdminStream(); loadSettings(); pending(); }
     catch (e) { KEY = ''; $('#lerr').textContent = e.message; }
   }
 
@@ -111,7 +133,7 @@
       $('#main').innerHTML = '<p class="empty">Nothing found. Try a user ID like BN-123456, an order ID (e.g. #A7K2M9), a 12-digit UTR, a phone number or an email.</p>';
     } catch (e) { toast(e.message, true); }
   }
-  async function openUser(uid) { try { cur = await api('/user/' + encodeURIComponent(uid)); view = { type: 'all', status: 'all' }; renderUser(); } catch (e) { toast(e.message, true); } }
+  async function openUser(uid) { panelMode = 'user'; openOrderId = ''; try { cur = await api('/user/' + encodeURIComponent(uid)); view = { type: 'all', status: 'all' }; renderUser(); } catch (e) { toast(e.message, true); } }
 
   // ---------- user view ----------
   function renderUser() {
@@ -144,6 +166,7 @@
     return `${String(Math.floor(left / 60)).padStart(2, '0')}:${String(left % 60).padStart(2, '0')}`;
   };
   function showOrder(o) {
+    panelMode = 'order'; openOrderId = o.id;
     loadSettings();
     const can = s => o.kind === 'buy' ? o.status !== s : o.status === 'pending';
     const kv = (k, v) => v === undefined || v === null || v === '' ? '' : `<div><span>${k}</span><b>${v}</b></div>`;
@@ -229,6 +252,7 @@
 
   // ---------- pending + log + backup ----------
   async function pending() {
+    panelMode = 'pending'; openOrderId = '';
     try {
       loadSettings();
       const list = await api('/pending');
@@ -759,6 +783,7 @@
     $('#mQrText', c).focus();
   }
   async function cashQrPanel() {
+    panelMode = 'cashqr'; openOrderId = '';
     try {
       loadSettings();
       const d = await api('/cashqr');
@@ -827,6 +852,6 @@
   }, 1000);
 
   $('#nTrade').onclick = toggleTrade;
-  $('#nPending').onclick = pending; $('#nCashQr').onclick = cashQrPanel; $('#nUsers').onclick = () => userbase(0); $('#nTxLog').onclick = txLog; $('#nNotifs').onclick = pushNotifs; $('#nAudit').onclick = auditLog; $('#nBackup').onclick = backup; $('#nLock').onclick = lock;
-  if (KEY) api('/ping').then(() => { $('#login').hidden = true; $('#panel').hidden = false; loadSettings(); pending(); }).catch(() => {});
+  $('#nPending').onclick = pending; $('#nCashQr').onclick = cashQrPanel; $('#nUsers').onclick = () => { panelMode = 'users'; userbase(0); }; $('#nTxLog').onclick = () => { panelMode = 'txlog'; txLog(); }; $('#nNotifs').onclick = () => { panelMode = 'notifs'; pushNotifs(); }; $('#nAudit').onclick = () => { panelMode = 'audit'; auditLog(); }; $('#nBackup').onclick = backup; $('#nLock').onclick = lock;
+  if (KEY) api('/ping').then(() => { $('#login').hidden = true; $('#panel').hidden = false; startAdminStream(); loadSettings(); pending(); }).catch(() => {});
 })();

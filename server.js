@@ -110,13 +110,28 @@ const buySellOffMsg = () => buySellReason() || BUY_SELL_OFF_MSG;
 const BUY_EXPIRE_MS = 5 * 60 * 1000;
 const CASHQR_TTL_MS = 60 * 1000;
 const WITHDRAW_TIMER_MS = 60 * 60 * 1000;
+const ratesPayload = () => ({ buy: CFG.BUY_RATE, sell: CFG.SELL_RATE, minBuyUsdt: CFG.MIN_BUY_USDT, maxBuyInr: CFG.MAX_BUY_INR, minSellUsdt: CFG.MIN_SELL_USDT, minWithdraw: CFG.MIN_WITHDRAW, minCashQrInr: CFG.MIN_CASHQR_INR, maxCashQrInr: CFG.MAX_CASHQR_INR, cashQrStep: CFG.CASHQR_STEP, cashQrEnabled: cashQrEnabled(), googleClientId: CFG.GOOGLE_CLIENT_ID, buySellEnabled: buySellEnabled(), buySellReason: buySellReason() });
+
+// Real-time Server-Sent Events (SSE) hub so open User & Admin screens update immediately without refresh
+const userStreams = new Map(), adminStreams = new Set();
+const sseWrite = (res, payload) => { try { res.write('data: ' + JSON.stringify(payload) + '\n\n'); } catch {} };
+const sseHeaders = res => { res.set({ 'Content-Type': 'text/event-stream', 'Cache-Control': 'no-cache, no-transform', Connection: 'keep-alive', 'X-Accel-Buffering': 'no' }); if (res.flushHeaders) res.flushHeaders(); };
+const pushUser = (userId, payload) => { const set = userStreams.get(userId); if (set) for (const r of set) sseWrite(r, payload); };
+const pushAllUsers = payload => { for (const set of userStreams.values()) for (const r of set) sseWrite(r, payload); };
+const pushAdmins = payload => { for (const r of adminStreams) sseWrite(r, payload); };
+setInterval(() => {
+  for (const set of userStreams.values()) for (const r of set) { try { r.write(':ping\n\n'); } catch {} }
+  for (const r of adminStreams) { try { r.write(':ping\n\n'); } catch {} }
+}, 20000).unref();
+
 const expireOrders = () => {
   const t = now();
-  S("UPDATE orders SET status='failed', fail_reason='Order expired after 5 minutes without approval.', updated_at=? WHERE type='buy' AND COALESCE(pay_method,'upi')='upi' AND status='pending' AND expires_at IS NOT NULL AND expires_at<=?").run(t, t);
-  S("UPDATE orders SET status='failed', fail_reason='CashQR request timed out after 5 minutes.', updated_at=? WHERE type='buy' AND pay_method='cashqr' AND qr_payload IS NULL AND status='pending' AND expires_at IS NOT NULL AND expires_at<=?").run(t, t);
-  S("UPDATE orders SET status='failed', fail_reason='CashQR expired after 1 minute without payment.', updated_at=? WHERE type='buy' AND pay_method='cashqr' AND qr_payload IS NOT NULL AND utr IS NULL AND status='pending' AND qr_expires_at IS NOT NULL AND qr_expires_at<=?").run(t, t);
+  const c1 = S("UPDATE orders SET status='failed', fail_reason='Order expired after 5 minutes without approval.', updated_at=? WHERE type='buy' AND COALESCE(pay_method,'upi')='upi' AND status='pending' AND expires_at IS NOT NULL AND expires_at<=?").run(t, t).changes;
+  const c2 = S("UPDATE orders SET status='failed', fail_reason='CashQR request timed out after 5 minutes.', updated_at=? WHERE type='buy' AND pay_method='cashqr' AND qr_payload IS NULL AND status='pending' AND expires_at IS NOT NULL AND expires_at<=?").run(t, t).changes;
+  const c3 = S("UPDATE orders SET status='failed', fail_reason='CashQR expired after 1 minute without payment.', updated_at=? WHERE type='buy' AND pay_method='cashqr' AND qr_payload IS NOT NULL AND utr IS NULL AND status='pending' AND qr_expires_at IS NOT NULL AND qr_expires_at<=?").run(t, t).changes;
+  if (c1 + c2 + c3 > 0) { pushAllUsers({ type: 'sync' }); pushAdmins({ type: 'admin_sync' }); }
 };
-setInterval(expireOrders, 15000).unref();
+setInterval(expireOrders, 10000).unref();
 const upiLink = o => `upi://pay?pa=${o.upi || CFG.UPI_ID}&pn=${encodeURIComponent(CFG.UPI_NAME)}&am=${Number(o.inr).toFixed(2)}&cu=INR&tn=${encodeURIComponent('BN ' + o.public_id)}`;
 { // seed initial UPI pool (only when upis table is empty) and migrate any legacy buy orders onto upis
   const t = now();
@@ -301,9 +316,33 @@ V.post('/auth/logout', (req, res) => {
 });
 
 /* ============================ SECTION 5: USER API ============================ */
-V.get('/rates', (req, res) => res.json({ buy: CFG.BUY_RATE, sell: CFG.SELL_RATE, minBuyUsdt: CFG.MIN_BUY_USDT, maxBuyInr: CFG.MAX_BUY_INR, minSellUsdt: CFG.MIN_SELL_USDT, minWithdraw: CFG.MIN_WITHDRAW, minCashQrInr: CFG.MIN_CASHQR_INR, maxCashQrInr: CFG.MAX_CASHQR_INR, cashQrStep: CFG.CASHQR_STEP, cashQrEnabled: cashQrEnabled(), googleClientId: CFG.GOOGLE_CLIENT_ID, buySellEnabled: buySellEnabled(), buySellReason: buySellReason() }));
-V.use(['/me', '/account', '/balance', '/history', '/buy', '/sell', '/withdraw', '/deposit', '/notifications'], requireAuth);
+V.use((req, res, next) => { res.set('Cache-Control', 'no-store'); next(); });
+V.get('/rates', (req, res) => res.json(ratesPayload()));
+V.use(['/me', '/home', '/events', '/account', '/balance', '/history', '/buy', '/sell', '/withdraw', '/deposit', '/notifications'], requireAuth);
 V.get('/me', (req, res) => res.json(me(req.user)));
+V.get('/home', (req, res) => {
+  expireOrders();
+  const uid = req.user.id;
+  const rd = S('SELECT last_read_at FROM notification_reads WHERE user_id=?').get(uid);
+  const lastRead = rd ? rd.last_read_at : 0;
+  const nRows = S('SELECT id, user_id, title, message, created_at FROM notifications WHERE user_id IS NULL OR user_id=? ORDER BY id DESC LIMIT 50').all(uid);
+  const nList = nRows.map(n => ({ id: n.id, title: n.title, message: n.message, at: n.created_at, personal: n.user_id !== null, unread: n.created_at > lastRead }));
+  res.json({
+    balance: { usdt: usdt(balance(uid)) },
+    rates: ratesPayload(),
+    recent: S('SELECT * FROM orders WHERE user_id=? ORDER BY id DESC LIMIT 6').all(uid).map(item),
+    notifications: { unread: nList.filter(n => n.unread).length, list: nList }
+  });
+});
+V.get('/events', (req, res) => {
+  sseHeaders(res);
+  const uid = req.user.id;
+  let set = userStreams.get(uid);
+  if (!set) { set = new Set(); userStreams.set(uid, set); }
+  set.add(res);
+  sseWrite(res, { type: 'settings', rates: ratesPayload(), usdt: usdt(balance(uid)) });
+  req.on('close', () => { set.delete(res); if (!set.size) userStreams.delete(uid); });
+});
 V.post('/account/password', limiter(10), async (req, res) => {
   const b = req.body || {}, u = req.user, t = now(), cur = String(b.current || '').slice(0, 200);
   if (!pwOk(b.next)) return res.status(400).json({ error: 'The new password must have 8 to 128 characters.' });
@@ -348,6 +387,7 @@ V.post('/buy', limiter(20), (req, res) => {
     S("INSERT INTO orders(public_id,user_id,type,pay_method,inr,rate,usdt_micro,expires_at,created_at,updated_at) VALUES(?,?,'buy','cashqr',?,?,?,?,?,?)").run(pid, req.user.id, inr, CFG.BUY_RATE, Math.round(inr * 1e6 / CFG.BUY_RATE), exp, t, t);
     const created = S('SELECT * FROM orders WHERE public_id=?').get(pid);
     notifyAdminOrder(created, req.user, 'New CashQR request (upload ATM QR within 5 min)');
+    pushUser(req.user.id, { type: 'sync' }); pushAdmins({ type: 'admin_sync', orderId: created.public_id });
     return res.status(201).json(item(created));
   }
   const upi = pickRandomUpi();
@@ -356,6 +396,7 @@ V.post('/buy', limiter(20), (req, res) => {
   S("INSERT INTO orders(public_id,user_id,type,pay_method,inr,rate,usdt_micro,upi,expires_at,created_at,updated_at) VALUES(?,?,'buy','upi',?,?,?,?,?,?,?)").run(pid, req.user.id, inr, CFG.BUY_RATE, Math.round(inr * 1e6 / CFG.BUY_RATE), upi, exp, t, t);
   const created = S('SELECT * FROM orders WHERE public_id=?').get(pid);
   notifyAdminOrder(created, req.user, 'New BUY order received');
+  pushUser(req.user.id, { type: 'sync' }); pushAdmins({ type: 'admin_sync', orderId: created.public_id });
   res.status(201).json({ ...item(created), upi });
 });
 V.get('/buy/:id', (req, res) => {
@@ -375,6 +416,7 @@ V.post('/buy/:id/paid', limiter(20), (req, res) => {
   try { if (S("UPDATE orders SET utr=?, updated_at=? WHERE id=? AND status='pending'").run(utr, now(), o.id).changes !== 1) return res.status(409).json({ error: 'This order is no longer waiting for payment.' }); }
   catch { return res.status(409).json({ error: 'This reference number was already used on another order.' }); }
   notifyAdminOrder(S('SELECT * FROM orders WHERE id=?').get(o.id), req.user, o.pay_method === 'cashqr' ? 'Payment submitted for CashQR order' : 'UTR submitted for BUY order');
+  pushUser(req.user.id, { type: 'sync' }); pushAdmins({ type: 'admin_sync', orderId: o.public_id });
   res.json({ ok: true });
 });
 V.get('/buy/:id/qr.svg', async (req, res) => {
@@ -411,6 +453,7 @@ V.post('/sell', limiter(20), (req, res) => {
   const r = createOut(req.user, 'sell', micro(v), { inr: Math.round(v * CFG.SELL_RATE * 100) / 100, rate: CFG.SELL_RATE, upi });
   if (r.err) return res.status(r.code).json({ error: r.err });
   notifyAdminOrder(r.order, req.user, 'New SELL order received');
+  pushUser(req.user.id, { type: 'sync' }); pushAdmins({ type: 'admin_sync', orderId: r.order.public_id });
   res.status(201).json(item(r.order));
 });
 V.post('/withdraw', limiter(20), (req, res) => {
@@ -422,6 +465,7 @@ V.post('/withdraw', limiter(20), (req, res) => {
   const r = createOut(req.user, 'withdraw', micro(v), { address, chain: 'bsc' });
   if (r.err) return res.status(r.code).json({ error: r.err });
   notifyAdminOrder(r.order, req.user, 'New WITHDRAW order received');
+  pushUser(req.user.id, { type: 'sync' }); pushAdmins({ type: 'admin_sync', orderId: r.order.public_id });
   res.status(201).json(item(r.order));
 });
 app.use('/api/v2', V);
@@ -433,15 +477,22 @@ const ipOk = (req, res, next) => (CFG.ADMIN_IPS.length && !CFG.ADMIN_IPS.map(cle
 const keyFails = new Map(); setInterval(() => keyFails.clear(), 900000).unref();
 const adminAuth = (req, res, next) => {
   if ((keyFails.get(req.ip) || 0) >= 10) return res.status(429).json({ error: 'Too many wrong keys. Try again in 15 minutes.' });
-  const a = Buffer.from(String(req.get('x-admin-key') || '')), b = Buffer.from(CFG.ADMIN_KEY);
+  const rawKey = req.get('x-admin-key') || (req.path === '/events' && typeof req.query.key === 'string' ? req.query.key : '');
+  const a = Buffer.from(String(rawKey || '')), b = Buffer.from(CFG.ADMIN_KEY);
   if (a.length !== b.length || !crypto.timingSafeEqual(a, b)) { keyFails.set(req.ip, (keyFails.get(req.ip) || 0) + 1); return res.status(401).json({ error: 'Wrong admin key.' }); }
   next();
 };
-A.use(ipOk, limiter(240), adminAuth);
+A.use(ipOk, limiter(240), adminAuth, (req, res, next) => { res.set('Cache-Control', 'no-store'); next(); });
 const userView = u => ({ uid: u.uid, email: u.email, phone: u.phone, createdAt: u.created_at, suspended: !!u.wd_suspended, suspendReason: u.wd_reason, suspendedAt: u.wd_suspended_at, balance: usdt(balance(u.id)) });
 const orderView = o => { const u = S('SELECT * FROM users WHERE id=?').get(o.user_id); return { ...item(o), utr: o.utr, txid: o.txid, chain: o.chain, rate: o.rate, updatedAt: o.updated_at, user: { uid: u.uid, email: u.email, phone: u.phone } }; };
 
 A.get('/ping', (req, res) => res.json({ ok: true }));
+A.get('/events', (req, res) => {
+  sseHeaders(res);
+  adminStreams.add(res);
+  sseWrite(res, { type: 'admin_init' });
+  req.on('close', () => adminStreams.delete(res));
+});
 A.get('/find', (req, res) => {
   expireOrders();
   const raw = String(req.query.q || '').trim().slice(0, 80); if (!raw) return res.json({ kind: 'none' });
@@ -508,6 +559,7 @@ A.post('/orders/:id/status', (req, res) => {
   if (txid && !/^0x[a-fA-F0-9]{64}$/.test(txid)) return res.status(400).json({ error: 'That transaction hash does not look right (0x + 64 characters).' });
   const r = setStatus(String(req.params.id).toUpperCase(), to, reason, txid);
   if (r.err) return res.status(r.code).json({ error: r.err });
+  pushUser(r.order.user_id, { type: 'order', order: item(r.order) }); pushAdmins({ type: 'admin_sync', orderId: r.order.public_id });
   res.json({ order: orderView(r.order) });
 });
 A.post('/orders/:id/timer', (req, res) => {
@@ -520,7 +572,9 @@ A.post('/orders/:id/timer', (req, res) => {
   const t = now(), endsAt = t + Math.round(mins * 60 * 1000);
   S('UPDATE orders SET timer_ends_at=?, updated_at=? WHERE id=?').run(endsAt, t, o.id);
   audit('withdraw_timer_set', S('SELECT uid FROM users WHERE id=?').get(o.user_id).uid, { order: o.public_id, minutes: Math.round(mins * 100) / 100, endsAt });
-  res.json({ order: orderView(S('SELECT * FROM orders WHERE id=?').get(o.id)) });
+  const fresh = S('SELECT * FROM orders WHERE id=?').get(o.id);
+  pushUser(o.user_id, { type: 'order', order: item(fresh) }); pushAdmins({ type: 'admin_sync', orderId: o.public_id });
+  res.json({ order: orderView(fresh) });
 });
 
 const editBalance = db.transaction((u, newMicro, expectedMicro, reason) => {
@@ -537,18 +591,24 @@ A.post('/user/:uid/balance', (req, res) => {
   if (!Number.isFinite(nb) || nb < 0 || nb > 1e7) return res.status(400).json({ error: 'Enter a valid new balance (0 or more).' });
   if (!reason) return res.status(400).json({ error: 'Write a short reason for this change.' });
   const r = editBalance(u, micro(nb), b.expected === undefined ? null : micro(b.expected), reason);
-  if (r.err) return res.status(r.code).json({ error: r.err }); res.json(r);
+  if (r.err) return res.status(r.code).json({ error: r.err });
+  pushUser(u.id, { type: 'sync' }); pushAdmins({ type: 'admin_sync' });
+  res.json(r);
 });
 A.post('/user/:uid/suspend', (req, res) => {
   const u = S('SELECT * FROM users WHERE uid=?').get(String(req.params.uid).toUpperCase()); if (!u) return res.status(404).json({ error: 'User not found.' });
   const reason = reasonOf(req.body); if (!reason) return res.status(400).json({ error: 'Write a short reason.' });
   S('UPDATE users SET wd_suspended=1, wd_reason=?, wd_suspended_at=? WHERE id=?').run(reason, now(), u.id);
-  audit('suspend_withdrawals', u.uid, { reason }); res.json({ ok: true });
+  audit('suspend_withdrawals', u.uid, { reason });
+  pushUser(u.id, { type: 'sync' }); pushAdmins({ type: 'admin_sync' });
+  res.json({ ok: true });
 });
 A.post('/user/:uid/unsuspend', (req, res) => {
   const u = S('SELECT * FROM users WHERE uid=?').get(String(req.params.uid).toUpperCase()); if (!u) return res.status(404).json({ error: 'User not found.' });
   S('UPDATE users SET wd_suspended=0, wd_reason=NULL, wd_suspended_at=NULL WHERE id=?').run(u.id);
-  audit('lift_suspension', u.uid, { reason: reasonOf(req.body) || undefined }); res.json({ ok: true });
+  audit('lift_suspension', u.uid, { reason: reasonOf(req.body) || undefined });
+  pushUser(u.id, { type: 'sync' }); pushAdmins({ type: 'admin_sync' });
+  res.json({ ok: true });
 });
 A.get('/backup', async (req, res) => {                                         // a safe copy of the whole database
   const tmp = path.join(DATA_DIR, `backup-${now()}.db`);
@@ -592,6 +652,7 @@ A.post('/user/:uid/deactivate', (req, res) => {
   S('UPDATE users SET deactivated=1, deactivate_reason=?, deactivated_at=? WHERE id=?').run(reason, now(), u.id);
   S('DELETE FROM sessions WHERE user_id=?').run(u.id);                          // log them out everywhere right away
   audit('deactivate_user', u.uid, { reason });
+  pushUser(u.id, { type: 'deactivated', error: blockedMsg({ deactivate_reason: reason }) }); pushAdmins({ type: 'admin_sync' });
   res.json({ ok: true });
 });
 
@@ -637,12 +698,15 @@ A.post('/notifications', (req, res) => {
   const t = now();
   const r = S('INSERT INTO notifications(user_id,title,message,created_at) VALUES(?,?,?,?)').run(targetUser ? targetUser.id : null, title, message, t);
   audit('push_notification', targetUser ? targetUser.uid : 'ALL', { title });
+  targetUser ? pushUser(targetUser.id, { type: 'sync' }) : pushAllUsers({ type: 'sync' });
+  pushAdmins({ type: 'admin_sync' });
   res.status(201).json({ id: Number(r.lastInsertRowid), title, message, at: t, target: targetUser ? targetUser.uid : 'ALL' });
 });
 A.post('/notifications/:id/delete', (req, res) => {
   const id = Number(req.params.id);
   if (!Number.isInteger(id)) return res.status(400).json({ error: 'Invalid ID.' });
   S('DELETE FROM notifications WHERE id=?').run(id);
+  pushAllUsers({ type: 'sync' }); pushAdmins({ type: 'admin_sync' });
   res.json({ ok: true });
 });
 
@@ -671,6 +735,7 @@ A.post('/settings/buy-sell', (req, res) => {
   S("INSERT INTO settings(key,value) VALUES('buy_sell_enabled',?) ON CONFLICT(key) DO UPDATE SET value=excluded.value").run(enabled ? '1' : '0');
   S("INSERT INTO settings(key,value) VALUES('buy_sell_reason',?) ON CONFLICT(key) DO UPDATE SET value=excluded.value").run(reason);
   audit(enabled ? 'enable_buy_sell' : 'disable_buy_sell', null, reason ? { reason } : {});
+  pushAllUsers({ type: 'settings', rates: ratesPayload() }); pushAdmins({ type: 'admin_sync' });
   res.json({ buySellEnabled: enabled, buySellReason: reason });
 });
 
@@ -768,6 +833,7 @@ A.post('/cashqr/toggle', (req, res) => {
   const enabled = !!(req.body || {}).enabled;
   S("INSERT INTO settings(key,value) VALUES('cashqr_enabled',?) ON CONFLICT(key) DO UPDATE SET value=excluded.value").run(enabled ? '1' : '0');
   audit(enabled ? 'enable_cashqr' : 'disable_cashqr', null, {});
+  pushAllUsers({ type: 'settings', rates: ratesPayload() }); pushAdmins({ type: 'admin_sync' });
   res.json({ enabled });
 });
 A.post('/cashqr/preview', async (req, res) => {
@@ -787,7 +853,9 @@ A.post('/cashqr/:id/qr', (req, res) => {
   const t = now(), qrExp = t + CASHQR_TTL_MS, ordExp = Math.max(o.expires_at || 0, qrExp + 60000);
   S("UPDATE orders SET pay_method='cashqr', status='pending', fail_reason=NULL, qr_payload=?, qr_expires_at=?, expires_at=?, updated_at=? WHERE id=?").run(payload, qrExp, ordExp, t, o.id);
   audit('cashqr_attached', S('SELECT uid FROM users WHERE id=?').get(o.user_id).uid, { order: o.public_id, qrExpiresAt: qrExp });
-  res.json({ order: orderView(S('SELECT * FROM orders WHERE id=?').get(o.id)) });
+  const fresh = S('SELECT * FROM orders WHERE id=?').get(o.id);
+  pushUser(o.user_id, { type: 'order', order: item(fresh) }); pushAdmins({ type: 'admin_sync', orderId: o.public_id });
+  res.json({ order: orderView(fresh) });
 });
 
 app.use('/api/admin', A);
