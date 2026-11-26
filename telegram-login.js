@@ -1,7 +1,7 @@
 // Run ONCE:  npm run telegram-login
 // Logs in to your dedicated sender account and prints the TELEGRAM_SESSION value to paste into .env.
 const fs = require('fs'), path = require('path'), readline = require('readline/promises');
-try { fs.readFileSync(path.join(__dirname, '..', '.env'), 'utf8').split(/\r?\n/).forEach(l => { const m = l.match(/^\s*([A-Z0-9_]+)\s*=\s*(.*?)\s*$/); if (m && !(m[1] in process.env)) process.env[m[1]] = m[2]; }); } catch {}
+try { fs.readFileSync(path.join(__dirname, '.env'), 'utf8').split(/\r?\n/).forEach(l => { const m = l.match(/^\s*([A-Z0-9_]+)\s*=\s*(.*?)\s*$/); if (m && !(m[1] in process.env)) process.env[m[1]] = m[2]; }); } catch {}
 const { TelegramClient } = require('telegram'), { StringSession } = require('telegram/sessions');
 (async () => {
   const rl = readline.createInterface({ input: process.stdin, output: process.stdout });

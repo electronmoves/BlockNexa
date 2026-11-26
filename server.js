@@ -16,16 +16,19 @@ for (const file of [path.join(__dirname, '.env'), '/etc/secrets/.env']) {       
 const express = require('express'), Database = require('better-sqlite3'), QRCode = require('qrcode');
 const env = (k, d = '') => (process.env[k] === undefined || process.env[k] === '' ? d : process.env[k]);
 const num = (k, d) => { const v = Number(env(k, d)); return Number.isFinite(v) ? v : d; };
+const IS_PROD = process.env.NODE_ENV === 'production' || !!process.env.RENDER;
+const OTP_MODE = env('OTP_TRANSPORT', env('TELEGRAM_SESSION') ? 'telegram' : 'console');
+const DEFAULT_UPIS = env('UPI_ID') || (OTP_MODE === 'console' && !IS_PROD ? '123@upi,ishu@upi,example@upi' : '');
 const CFG = {
   PORT: num('PORT', 3000),
   BUY_RATE: num('BUY_RATE', 102.5), SELL_RATE: num('SELL_RATE', 100),
   MIN_BUY_USDT: num('MIN_BUY_USDT', 5), MAX_BUY_INR: num('MAX_BUY_INR', 5000), MIN_SELL_USDT: num('MIN_SELL_USDT', 5), MIN_WITHDRAW: num('MIN_WITHDRAW', 5),
   MIN_CASHQR_INR: num('MIN_CASHQR_INR', 2000), MAX_CASHQR_INR: num('MAX_CASHQR_INR', 10000), CASHQR_STEP: num('CASHQR_STEP', 500),
   UPI_ID: /^[\w.\-]{2,}@[\w.\-]{2,}$/.test(env('UPI_ID')) ? env('UPI_ID').toLowerCase() : '', UPI_NAME: env('UPI_NAME', 'BlockNexa').slice(0, 40),
-  UPI_IDS: env('UPI_IDS', env('UPI_ID') || '123@upi,ishu@upi,example@upi').split(',').map(s => s.trim().toLowerCase()).filter(s => /^[\w.\-]{2,}@[\w.\-]{2,}$/.test(s)),
+  UPI_IDS: env('UPI_IDS', DEFAULT_UPIS).split(',').map(s => s.trim().toLowerCase()).filter(s => /^[\w.\-]{2,}@[\w.\-]{2,}$/.test(s)),
   DEPOSIT_ADDRESS: /^0x[a-fA-F0-9]{40}$/.test(env('DEPOSIT_ADDRESS')) ? env('DEPOSIT_ADDRESS') : '',
   GOOGLE_CLIENT_ID: env('GOOGLE_CLIENT_ID').trim(),
-  OTP_TRANSPORT: env('OTP_TRANSPORT', env('TELEGRAM_SESSION') ? 'telegram' : 'console'),   // telegram | console (console only prints the code, for local testing)
+  OTP_TRANSPORT: OTP_MODE,                                                                  // telegram | console (console only prints the code, for local testing)
   OTP_COOLDOWN_MS: num('OTP_COOLDOWN_SEC', 30) * 1000,
   ADMIN_TELEGRAM: env('ADMIN_TELEGRAM').trim().replace(/^@/, ''),                            // your own Telegram username to receive new order alerts (blank = Saved Messages)
   ADMIN_KEY: env('ADMIN_KEY').trim() || crypto.randomBytes(18).toString('hex'),
@@ -39,9 +42,10 @@ CFG.MIN_BUY_INR = Math.ceil(CFG.MIN_BUY_USDT * CFG.BUY_RATE);
 
 /* ============================ SECTION 2: DATABASE ============================ */
 const DATA_DIR = env('DATA_DIR', path.join(__dirname, 'data'));                              // on a host: point this at a persistent disk
-fs.mkdirSync(DATA_DIR, { recursive: true });
+fs.mkdirSync(DATA_DIR, { recursive: true, mode: 0o700 });
 const DB_FILE = path.join(DATA_DIR, 'blocknexa.db');
 const db = new Database(DB_FILE);
+try { fs.chmodSync(DB_FILE, 0o600); } catch {}
 db.pragma('journal_mode = WAL'); db.pragma('foreign_keys = ON');
 db.exec(`
 CREATE TABLE IF NOT EXISTS users(
@@ -155,20 +159,84 @@ const pickRandomUpi = () => {
 
 const app = express();
 app.disable('x-powered-by');
-if (process.env.TRUST_PROXY) app.set('trust proxy', Number(process.env.TRUST_PROXY) || true);   // set when behind Nginx / Cloudflare
-app.use((req, res, next) => { res.set({ 'X-Content-Type-Options': 'nosniff', 'X-Frame-Options': 'DENY', 'Referrer-Policy': 'no-referrer' }); next(); });
+// Never set trust proxy to boolean `true` (which trusts spoofable leftmost X-Forwarded-For); use numeric hop count (default 1 in prod/Render)
+if (process.env.TRUST_PROXY !== '0' && (process.env.TRUST_PROXY || IS_PROD)) {
+  const hops = parseInt(process.env.TRUST_PROXY, 10);
+  app.set('trust proxy', Number.isInteger(hops) && hops > 0 ? hops : 1);
+}
+const CSP_HEADER = [
+  "default-src 'self'",
+  "script-src 'self' https://accounts.google.com",
+  "style-src 'self' 'unsafe-inline' https://fonts.googleapis.com https://accounts.google.com",
+  "font-src 'self' https://fonts.gstatic.com data:",
+  "img-src 'self' data: blob:",
+  "connect-src 'self' https://accounts.google.com",
+  "frame-src https://accounts.google.com",
+  "object-src 'none'",
+  "base-uri 'self'",
+  "form-action 'self'",
+  "frame-ancestors 'none'",
+].join('; ');
+const isHttpsReq = req => req.secure || String(req.get('x-forwarded-proto') || '').split(',')[0].trim().toLowerCase() === 'https';
+app.use((req, res, next) => {
+  res.set({
+    'Content-Security-Policy': CSP_HEADER,
+    'Strict-Transport-Security': 'max-age=31536000; includeSubDomains',
+    'X-Content-Type-Options': 'nosniff',
+    'X-Frame-Options': 'DENY',
+    'Referrer-Policy': 'strict-origin-when-cross-origin',
+    'Permissions-Policy': 'camera=(self), microphone=(), geolocation=()',
+  });
+  if (IS_PROD && String(req.get('x-forwarded-proto') || '').split(',')[0].trim().toLowerCase() === 'http') {
+    const host = String(req.get('host') || '').replace(/[^a-zA-Z0-9.\-:]/g, '');
+    if (host) return res.redirect(308, 'https://' + host + req.originalUrl);
+  }
+  next();
+});
+// Reject cross-origin OPTIONS preflights and cross-site state-changing requests (CSRF + CORS defense-in-depth)
+const sameOriginCheck = (req, res, next) => {
+  const host = String(req.get('x-forwarded-host') || req.get('host') || '').split(',')[0].trim().toLowerCase();
+  const origin = req.get('origin');
+  if (req.method === 'OPTIONS') {
+    if (origin) {
+      let oHost = ''; try { oHost = new URL(origin).host.toLowerCase(); } catch {}
+      if (!oHost || oHost !== host) return res.sendStatus(403);
+    }
+    return next();
+  }
+  if (!['POST', 'PUT', 'PATCH', 'DELETE'].includes(req.method)) return next();
+  if (String(req.get('sec-fetch-site') || '').toLowerCase() === 'cross-site') {
+    return res.status(403).json({ error: 'Cross-site request blocked.' });
+  }
+  if (origin) {
+    let oHost = ''; try { oHost = new URL(origin).host.toLowerCase(); } catch {}
+    if (!oHost || oHost !== host) return res.status(403).json({ error: 'Cross-origin request blocked.' });
+  } else if (req.get('referer')) {
+    let rHost = ''; try { rHost = new URL(req.get('referer')).host.toLowerCase(); } catch {}
+    if (!rHost || rHost !== host) return res.status(403).json({ error: 'Cross-origin request blocked.' });
+  }
+  next();
+};
+app.use('/api', sameOriginCheck);
 app.use(express.json({ limit: '10kb' }));
 const hits = new Map(); setInterval(() => hits.clear(), 600000).unref();
 const limiter = (max, windowMs = 60000) => (req, res, next) => {
-  const k = req.ip + req.path, t = now(), h = (hits.get(k) || []).filter(x => t - x < windowMs);
+  const routeKey = req.baseUrl + (req.route ? req.route.path : req.path);
+  const k = req.ip + ':' + routeKey, t = now(), h = (hits.get(k) || []).filter(x => t - x < windowMs);
   if (h.length >= max) return res.status(429).json({ error: 'Too many requests. Please wait a minute and try again.' });
+  if (!hits.has(k) && hits.size >= 10000) hits.delete(hits.keys().next().value);
   h.push(t); hits.set(k, h); next();
 };
 
 /* ===================== SECTION 4: LOGIN (Telegram code + Google) ===================== */
 const SESSION_MS = CFG.SESSION_DAYS * 24 * 3600 * 1000;     // a login lasts this long and is renewed while the user keeps coming back
 const cookieOf = (req, n) => (req.headers.cookie || '').split(';').map(c => c.trim().split('=')).find(c => c[0] === n)?.[1];
-const cookie = (req, token, ms) => `bn_session=${token}; HttpOnly; SameSite=Lax; Path=/; Max-Age=${Math.floor(ms / 1000)}; Expires=${new Date(now() + ms).toUTCString()}${req.secure ? '; Secure' : ''}`;
+const cookieSecureFlag = req => {
+  const h = String(req.hostname || '').toLowerCase();
+  const isLocal = h === 'localhost' || h === '127.0.0.1' || h === '::1';
+  return (isHttpsReq(req) || (IS_PROD && !isLocal)) ? '; Secure' : '';
+};
+const cookie = (req, token, ms) => `bn_session=${token}; HttpOnly; SameSite=Lax; Path=/; Max-Age=${Math.floor(ms / 1000)}; Expires=${new Date(now() + ms).toUTCString()}${cookieSecureFlag(req)}`;
 const blockedMsg = u => 'This account has been deactivated' + (u.deactivate_reason ? ': ' + u.deactivate_reason : '') + '. Please contact support.';
 function startSession(req, res, userId, method) {      // returns false (and answers 403) if the account is deactivated
   const acc = S('SELECT deactivated, deactivate_reason FROM users WHERE id=?').get(userId);
@@ -269,15 +337,19 @@ V.post('/auth/otp/verify', limiter(30), async (req, res) => {
 });
 
 // ---- Log in with phone + password (no code needed)
-const pwFails = new Map(); setInterval(() => pwFails.clear(), 900000).unref();
-V.post('/auth/login/password', limiter(30), async (req, res) => {
+const pwFails = new Map(), ipPwFails = new Map();
+setInterval(() => { pwFails.clear(); ipPwFails.clear(); }, 900000).unref();
+V.post('/auth/login/password', limiter(20), async (req, res) => {
   const b = req.body || {}, phone = String(b.phone || ''), pw = String(b.password || '').slice(0, 200);
   const bad = () => res.status(401).json({ error: 'Wrong number or password. You can also log in with a Telegram code.' });
-  if (!/^\+91[6-9]\d{9}$/.test(phone)) return bad();
-  const t = now(), f = (pwFails.get(phone) || []).filter(x => t - x < 900000); pwFails.set(phone, f);
+  const t = now();
+  const ipList = (ipPwFails.get(req.ip) || []).filter(x => t - x < 900000); ipPwFails.set(req.ip, ipList);
+  if (ipList.length >= 10) return res.status(429).json({ error: 'Too many failed login attempts from this network. Wait 15 minutes.' });
+  if (!/^\+91[6-9]\d{9}$/.test(phone)) { ipList.push(t); return bad(); }
+  const f = (pwFails.get(phone) || []).filter(x => t - x < 900000); pwFails.set(phone, f);
   if (f.length >= 5) return res.status(429).json({ error: 'Too many wrong attempts. Wait 15 minutes, or log in with a Telegram code.' });
   const u = S('SELECT * FROM users WHERE phone=?').get(phone);
-  if (!(await checkPw(pw, u && u.password_hash)) || !u) { f.push(t); return bad(); }
+  if (!(await checkPw(pw, u && u.password_hash)) || !u) { f.push(t); ipList.push(t); return bad(); }
   pwFails.delete(phone); if (startSession(req, res, u.id, 'password')) res.json(me(u));
 });
 
@@ -474,12 +546,24 @@ app.use('/api/v2', V);
 const A = express.Router();
 const cleanIp = ip => String(ip || '').replace(/^::ffff:/, '');
 const ipOk = (req, res, next) => (CFG.ADMIN_IPS.length && !CFG.ADMIN_IPS.map(cleanIp).includes(cleanIp(req.ip))) ? res.sendStatus(404) : next();
-const keyFails = new Map(); setInterval(() => keyFails.clear(), 900000).unref();
+const keyFails = new Map(), adminTickets = new Map();
+setInterval(() => {
+  keyFails.clear();
+  const t = now();
+  for (const [k, exp] of adminTickets) if (exp <= t) adminTickets.delete(k);
+}, 900000).unref();
 const adminAuth = (req, res, next) => {
   if ((keyFails.get(req.ip) || 0) >= 10) return res.status(429).json({ error: 'Too many wrong keys. Try again in 15 minutes.' });
-  const rawKey = req.get('x-admin-key') || (req.path === '/events' && typeof req.query.key === 'string' ? req.query.key : '');
-  const a = Buffer.from(String(rawKey || '')), b = Buffer.from(CFG.ADMIN_KEY);
-  if (a.length !== b.length || !crypto.timingSafeEqual(a, b)) { keyFails.set(req.ip, (keyFails.get(req.ip) || 0) + 1); return res.status(401).json({ error: 'Wrong admin key.' }); }
+  if (req.path === '/events' && typeof req.query.ticket === 'string') {
+    const exp = adminTickets.get(req.query.ticket);
+    adminTickets.delete(req.query.ticket);
+    if (exp && exp > now()) return next();
+  }
+  const rawHdr = req.get('x-admin-key');
+  const rawKey = rawHdr || (req.path === '/events' && typeof req.query.key === 'string' ? req.query.key : '');
+  if (!rawKey) return res.status(401).json({ error: 'Admin authentication required.' });
+  const a = Buffer.from(String(rawKey)), b = Buffer.from(CFG.ADMIN_KEY);
+  if (a.length !== b.length || !crypto.timingSafeEqual(a, b)) { keyFails.set(req.ip, (keyFails.get(req.ip) || 0) + 1); return res.status(403).json({ error: 'Wrong admin key.' }); }
   next();
 };
 A.use(ipOk, limiter(240), adminAuth, (req, res, next) => { res.set('Cache-Control', 'no-store'); next(); });
@@ -487,6 +571,12 @@ const userView = u => ({ uid: u.uid, email: u.email, phone: u.phone, createdAt: 
 const orderView = o => { const u = S('SELECT * FROM users WHERE id=?').get(o.user_id); return { ...item(o), utr: o.utr, txid: o.txid, chain: o.chain, rate: o.rate, updatedAt: o.updated_at, user: { uid: u.uid, email: u.email, phone: u.phone } }; };
 
 A.get('/ping', (req, res) => res.json({ ok: true }));
+A.post('/events-ticket', (req, res) => {
+  const ticket = crypto.randomBytes(24).toString('hex');
+  if (adminTickets.size >= 500) adminTickets.delete(adminTickets.keys().next().value);
+  adminTickets.set(ticket, now() + 30000);
+  res.json({ ticket });
+});
 A.get('/events', (req, res) => {
   sseHeaders(res);
   adminStreams.add(res);
@@ -862,7 +952,7 @@ app.use('/api/admin', A);
 
 /* ================================= SECTION 7: START ================================= */
 const PUBLIC = path.join(__dirname, 'public'), ADMIN = path.join(PUBLIC, 'admin');   // the site is public/, the admin panel is public/admin/
-const NO_CACHE_STATIC = { index: false, etag: true, maxAge: 0, setHeaders: res => res.set('Cache-Control', 'no-cache') };
+const NO_CACHE_STATIC = { index: false, dotfiles: 'deny', etag: true, maxAge: 0, setHeaders: res => res.set('Cache-Control', 'no-cache') };
 const ADMIN_ROUTE = /^[a-zA-Z0-9_-]{8,64}$/.test(CFG.ADMIN_PATH) && CFG.ADMIN_PATH.toLowerCase() !== 'admin' ? '/' + CFG.ADMIN_PATH : '/tsjsigjijgdigj77sf7sf4';
 const GATE_KEY = CFG.ADMIN_GATE_KEY || CFG.ADMIN_KEY;
 const GATE_MS = 12 * 3600 * 1000;
@@ -882,7 +972,7 @@ const adminGate = (req, res, next) => {
     const a = Buffer.from(k), b = Buffer.from(GATE_KEY);
     if (a.length === b.length && crypto.timingSafeEqual(a, b)) {
       const exp = String(now() + GATE_MS);
-      res.append('Set-Cookie', `bn_admin_gate=${exp}.${gateSig(exp)}; HttpOnly; SameSite=Lax; Path=/; Max-Age=${GATE_MS / 1000}${req.secure ? '; Secure' : ''}`);
+      res.append('Set-Cookie', `bn_admin_gate=${exp}.${gateSig(exp)}; HttpOnly; SameSite=Lax; Path=/; Max-Age=${GATE_MS / 1000}${cookieSecureFlag(req)}`);
       return res.redirect(ADMIN_ROUTE + '/bn-admin.html');
     }
     keyFails.set(req.ip, (keyFails.get(req.ip) || 0) + 1);
@@ -894,7 +984,15 @@ app.get([ADMIN_ROUTE, ADMIN_ROUTE + '/'], ipOk, adminGate, (req, res) => res.red
 app.use(ADMIN_ROUTE, ipOk, adminGate, express.static(ADMIN, NO_CACHE_STATIC));
 app.get('/', (req, res) => { res.set('Cache-Control', 'no-cache'); res.sendFile('blocknexa.html', { root: PUBLIC }); });   // root: works even if the project folder path has a dot-folder in it
 app.use(express.static(PUBLIC, NO_CACHE_STATIC));      // (/admin is blocked above; admin static is only served on ADMIN_ROUTE)
-app.use((err, req, res, next) => res.status(400).json({ error: 'Bad request.' }));
+app.use((req, res) => res.status(404).json({ error: 'Not found.' }));
+app.use((err, req, res, next) => {
+  if (err && (err.type === 'entity.parse.failed' || err instanceof URIError || err.status === 400 || err.statusCode === 400)) {
+    return res.status(400).json({ error: 'Bad request.' });
+  }
+  if (err && err.type === 'entity.too.large') return res.status(413).json({ error: 'Request payload too large.' });
+  console.error('Unhandled error:', err && err.message ? err.message : err);
+  res.status(500).json({ error: 'Something went wrong.' });
+});
 app.listen(CFG.PORT, err => {
   if (err) { console.error(err.code === 'EADDRINUSE' ? `PORT ${CFG.PORT} IS ALREADY IN USE. Close the other server and try again.` : err); process.exit(1); }
   const c = q => S(q).get().c;
@@ -906,7 +1004,8 @@ app.listen(CFG.PORT, err => {
   console.log(CFG.GOOGLE_CLIENT_ID ? 'Google sign-in: ON' : 'Google sign-in: off (set GOOGLE_CLIENT_ID)');
   if (!S('SELECT 1 FROM upis WHERE active=1').get()) console.log('WARNING: no active UPI IDs are set, so buying is switched off.');
   if (!CFG.DEPOSIT_ADDRESS) console.log('WARNING: DEPOSIT_ADDRESS is not set, so the deposit page is empty.');
-  if (!env('ADMIN_KEY').trim()) console.log('WARNING: ADMIN_KEY is not set. Temporary admin key for this run:', CFG.ADMIN_KEY);
+  if (!env('ADMIN_KEY').trim()) console.log(IS_PROD ? 'CRITICAL WARNING: ADMIN_KEY is not set in environment! Set ADMIN_KEY immediately.' : 'WARNING: ADMIN_KEY is not set. Temporary local admin key: ' + CFG.ADMIN_KEY);
   else console.log(`Admin key: configured from environment (${CFG.ADMIN_KEY.length} chars)`);
+  if (!env('APP_SECRET').trim() && IS_PROD) console.log('WARNING: APP_SECRET is not set in environment; user sessions will reset on server restart.');
   if (process.env.RENDER && !process.env.DATA_DIR) console.log('WARNING: running on Render without DATA_DIR. The database is ERASED on every restart. Add a persistent disk.');
 });

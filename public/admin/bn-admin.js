@@ -14,7 +14,7 @@
     const r = await fetch('/api/admin' + path, { method: o.method || 'GET', cache: 'no-store', headers: { 'x-admin-key': KEY, ...(o.body ? { 'Content-Type': 'application/json' } : {}) }, body: o.body ? JSON.stringify(o.body) : undefined });
     if (o.raw && r.ok) return r;
     const d = await r.json().catch(() => ({}));
-    if (r.status === 401) lock();
+    if (r.status === 401 || (r.status === 403 && !o.body)) lock();
     if (!r.ok) throw new Error(d.error || 'Request failed');
     return d;
   }
@@ -89,12 +89,15 @@
     try { const s = await api('/settings/buy-sell', { method: 'POST', body: { enabled: next, reason: r.text, adminKey: r.secret } }); paintTradeBtn(s.buySellEnabled); toast(s.buySellEnabled ? 'Buy, Sell & Withdrawals turned ON' : 'Buy, Sell & Withdrawals turned OFF (deposits still work)'); }
     catch (e) { toast(e.message, true); }
   }
-  function stopAdminStream() { if (adminEs) { try { adminEs.close(); } catch {} adminEs = null; } }
-  function startAdminStream() {
+  let adminReconn = null;
+  function stopAdminStream() { clearTimeout(adminReconn); adminReconn = null; if (adminEs) { try { adminEs.close(); } catch {} adminEs = null; } }
+  async function startAdminStream() {
     stopAdminStream();
     if (!KEY || typeof EventSource === 'undefined') return;
     try {
-      adminEs = new EventSource('/api/admin/events?key=' + encodeURIComponent(KEY));
+      const { ticket } = await api('/events-ticket', { method: 'POST', body: {} });
+      if (!KEY || !ticket) return;
+      adminEs = new EventSource('/api/admin/events?ticket=' + encodeURIComponent(ticket));
       adminEs.onmessage = e => {
         try {
           const ev = JSON.parse(e.data);
@@ -108,6 +111,7 @@
           }
         } catch {}
       };
+      adminEs.onerror = () => { stopAdminStream(); if (KEY) adminReconn = setTimeout(startAdminStream, 4000); };
     } catch {}
   }
   function lock() { stopAdminStream(); KEY = ''; sessionStorage.removeItem('bn_admin_key'); $('#panel').hidden = true; $('#login').hidden = false; }
@@ -690,12 +694,13 @@
       throw new Error('Could not detect a clear QR code in that photo. Crop closer to the ATM QR or paste/generate the QR below.');
     } finally { URL.revokeObjectURL(url); }
   }
+  const svgImgHtml = svg => `<img src="data:image/svg+xml;utf8,${encodeURIComponent(svg)}" alt="Clean QR preview">`;
   async function attachCleanQr(order, payload, afterFn) {
     try {
       const p = await api('/cashqr/preview', { method: 'POST', body: { payload } });
       const ok = await ask({
         title: `Send clean QR to #${order.id}?`,
-        html: `<p>Amount: <b>₹${f2(order.inr)}</b> · User: <b>${esc(order.user.uid)}</b></p><div class="cqr-prev">${p.svg}</div><p class="mut">Once sent, this CashQR will stay active for <b>1 minute</b> on the user’s screen.</p>`,
+        html: `<p>Amount: <b>₹${f2(order.inr)}</b> · User: <b>${esc(order.user.uid)}</b></p><div class="cqr-prev">${svgImgHtml(p.svg)}</div><p class="mut">Once sent, this CashQR will stay active for <b>1 minute</b> on the user’s screen.</p>`,
         ok: 'Send 1-min QR to user'
       });
       if (!ok) return;
@@ -737,7 +742,7 @@
       try {
         const p = await api('/cashqr/preview', { method: 'POST', body: { payload: txt } });
         if (!$('#mQrPrev', c)) return;
-        $('#mQrPrev', c).innerHTML = p.svg;
+        $('#mQrPrev', c).innerHTML = svgImgHtml(p.svg);
         $('#mQrPrevWrap', c).hidden = false;
       } catch (e) { $('#merr', c).textContent = e.message; }
     };
