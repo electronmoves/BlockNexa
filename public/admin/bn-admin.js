@@ -215,24 +215,46 @@
       : 'Waiting for QR';
     const showQrAssign = o.kind === 'buy' && (o.status === 'pending' || (isCqr && o.status !== 'success'));
     const showAutoWd = o.kind === 'withdraw' && o.status === 'pending';
-    const sealHtml = o.kind !== 'withdraw' ? '' : o.sealOk
-      ? '<span style="color:var(--success)">✓ Verified (Order + Ledger HMAC)</span>'
-      : `<span class="why">⚠ ${esc(o.sealError || 'Seal verification failed')}</span>`;
+    const showSellBox = o.kind === 'sell' && o.status === 'pending';
+    const showBuyTamper = o.kind === 'buy' && o.tamper;
+    const sealHtml = o.sealOk
+      ? `<span style="color:var(--success)">✓ ${o.kind === 'buy' ? 'Buy Order & Ledger Verified' : o.kind === 'sell' ? 'Sell Order & Ledger Verified' : 'Withdraw Order & Ledger Verified'} (SEAL_SIGNATURES)</span>`
+      : o.missingKeys
+        ? '<span style="color:#FBBF24">⚠ SEAL_SIGNATURES missing in .env (verification locked)</span>'
+        : `<span class="why">🚨 FORGED / TAMPER: ${esc(o.sealError || 'Seal verification failed')}</span>`;
     const txHtml = o.txid ? `<a class="link mono" href="https://bscscan.com/tx/${encodeURIComponent(o.txid)}" target="_blank" rel="noopener">${esc(o.txid)}</a>` : '';
     $('#main').innerHTML = `<div style="max-width:620px;margin:0 auto"><div class="card"><div class="head"><h2>Order #${esc(o.id)}</h2>${adminBadge(o)}</div>
       <div class="kv">
         ${kv('Type', isCqr ? 'Buy · CashQR (ATM)' : TYPE[o.kind])}${kv('Payment method', o.kind === 'buy' ? (isCqr ? 'CashQR (ATM High Limit)' : 'UPI') : '')}${kv('Amount', (o.inr ? '₹' + f2(o.inr) + ' → ' : '') + f2(o.usdt) + ' USDT')}${kv('Rate', o.rate ? '₹' + o.rate + ' per USDT' : '')}
         ${kv('CashQR status', cqrStatusHtml)}
         ${kv('Integrity seal', sealHtml)}
-        ${kv('UTR', o.utr ? esc(o.utr) : o.kind === 'buy' ? 'Not submitted yet' : '')}${kv('Paid to UPI', esc(o.upi))}${kv('Wallet', esc(o.address))}${kv('Chain', esc(o.chain && o.chain.toUpperCase()))}${kv('Transaction hash', txHtml)}
+        ${kv('UTR', o.utr ? esc(o.utr) : o.kind === 'buy' ? 'Not submitted yet' : '')}${kv(o.kind === 'sell' ? 'Payout UPI ID' : 'Paid to UPI', esc(o.upi))}${kv('Wallet', esc(o.address))}${kv('Chain', esc(o.chain && o.chain.toUpperCase()))}${kv('Transaction hash', txHtml)}
         ${kv('Countdown timer', wdTimerText)}
         ${kv('Payout note', o.payoutError ? `<span class="why">${esc(o.payoutError)}</span>` : '')}
         ${kv('User ID', `<button class="link" data-uid="${esc(o.user.uid)}">${esc(o.user.uid)}</button>`)}${kv('User email', esc(o.user.email))}${kv('User phone', esc(o.user.phone))}
         ${kv('Date', day(o.at))}${kv('Time', clock(o.at))}${kv('Last update', day(o.updatedAt) + ' ' + clock(o.updatedAt))}${o.reason ? `<div><span>Failure reason</span><b class="why">${esc(o.reason)}</b></div>` : ''}
       </div>
-      ${showAutoWd ? `<div class="cqr-box" style="border-color:${o.sealOk ? 'var(--primary)' : 'var(--error)'}">
+      ${showBuyTamper ? `<div class="cqr-box" style="border-color:var(--error)">
         <div>
-          <b>${o.sealOk ? `BSC Hot Wallet Auto-Payout · ${f2(o.usdt)} USDT` : '⚠ Auto-Payout Blocked (Integrity Check Failed)'}</b>
+          <b class="why">🚨 Buy Order Blocked — Database Tamper Detected!</b>
+          <small style="display:block;margin-top:3px">${esc(o.sealError || 'Buy order amount or ledger failed SEAL_SIGNATURES verification.')}</small>
+        </div>
+      </div>` : ''}
+      ${showSellBox ? `<div class="cqr-box" style="border-color:${o.sealOk ? 'var(--primary)' : o.missingKeys ? 'var(--accent)' : 'var(--error)'}">
+        <div>
+          <b>${o.sealOk ? `✓ Sell Seal & Balance Verified · Pay ₹${f2(o.inr)}` : o.missingKeys ? `Sell Payout · ₹${f2(o.inr)} (Set SEAL_SIGNATURES in .env)` : '🚨 Sell Payout Blocked — Forged Order or Balance!'}</b>
+          <small style="display:block;margin-top:3px">${o.sealOk
+            ? `Verified ${f2(o.usdt)} USDT held from ${esc(o.user.uid)}'s authentic ledger. Send <b>₹${f2(o.inr)}</b> to UPI <b class="mono">${esc(o.upi)}</b>, then mark Success.`
+            : esc(o.sealError || 'Order or ledger seal did not match.')}</small>
+        </div>
+        <div class="cqr-acts">
+          <button class="btn ghost" id="cpSellUpi">Copy UPI (${esc(o.upi)})</button>
+          <button class="btn" id="sellQuickOk" ${o.tamper ? 'disabled' : ''}>✓ Paid ₹${f2(o.inr)} · Mark Success</button>
+        </div>
+      </div>` : ''}
+      ${showAutoWd ? `<div class="cqr-box" style="border-color:${o.sealOk ? 'var(--primary)' : o.missingKeys ? 'var(--accent)' : 'var(--error)'}">
+        <div>
+          <b>${o.sealOk ? `BSC Hot Wallet Auto-Payout · ${f2(o.usdt)} USDT` : o.missingKeys ? '⚠ Add SEAL_SIGNATURES in .env to Unlock Auto-Payout' : '🚨 Auto-Payout Blocked (Integrity Check Failed)'}</b>
           <small style="display:block;margin-top:3px">${o.sealOk
             ? (o.payoutState === 'broadcasted' ? `Broadcasted on BSC (${esc(o.txid || '')}) — waiting for confirmation.` : '1-click sends BEP20 USDT from your Hot Wallet, saves the BSC transaction hash automatically, and marks this order Success.')
             : esc(o.sealError || 'Order or ledger seal did not match.')}</small>
@@ -254,7 +276,7 @@
           <button class="btn ghost" id="ordPasteQr">Paste QR Text</button>
         </div>
       </div>` : ''}
-      <div style="display:flex;gap:10px;margin-top:16px;flex-wrap:wrap">${o.status === 'pending' ? `<button class="btn ghost" id="setTimer">${o.timerEndsAt ? 'Edit timer' : 'Set timer'}</button>` : ''}${can('success') ? '<button class="btn" id="ok">Mark success</button>' : ''}${can('failed') ? '<button class="btn danger" id="bad">Mark failed</button>' : ''}</div>
+      <div style="display:flex;gap:10px;margin-top:16px;flex-wrap:wrap">${o.status === 'pending' ? `<button class="btn ghost" id="setTimer">${o.timerEndsAt ? 'Edit timer' : 'Set timer'}</button>` : ''}${can('success') ? `<button class="btn" id="ok" ${o.tamper ? 'disabled' : ''}>Mark success</button>` : ''}${can('failed') ? '<button class="btn danger" id="bad">Mark failed</button>' : ''}</div>
       ${o.kind !== 'buy' && o.status !== 'pending' ? '<p class="mut" style="margin-top:12px">Finished sells and withdrawals are locked. Use Edit balance on the user to correct anything.</p>' : ''}</div></div>`;
     bind(o);
   }
@@ -325,9 +347,15 @@
         const timerAttr = o.timerEndsAt ? ` data-cqr-t="${o.timerEndsAt}"` : (isCqr && !o.utr ? (o.hasQr && o.qrExpiresAt > Date.now() ? ` data-cqr-t="${o.qrExpiresAt}"` : o.expiresAt ? ` data-cqr-t="${o.expiresAt}"` : '') : '');
         const bCls = o.utr ? 'success' : o.timerEndsAt ? 'processing' : 'pending';
         const isWd = o.kind === 'withdraw' && o.sealOk && !o.payoutState;
-        return `<div class="row" data-pid="${esc(o.id)}" style="cursor:pointer">
+        const sealPill = o.sealOk
+          ? '<span class="active-badge">✓ Seal OK</span>'
+          : o.tamper
+            ? '<span class="deact-badge">🚨 FORGED</span>'
+            : '';
+        return `<div class="row" data-pid="${esc(o.id)}" style="cursor:pointer;${o.tamper ? 'border-color:var(--error)' : ''}">
           <span class="t ${o.kind}">${isCqr ? 'CashQR' : TYPE[o.kind]}</span>
           <span class="m"><b>#${esc(o.id)} · ${f2(o.usdt)} USDT${o.inr ? ' · ₹' + f2(o.inr) : ''}</b><small>${esc(o.user.uid)} · ${day(o.at)} ${clock(o.at)}${isCqr ? ' · <b>CashQR (ATM)</b>' : o.upi ? ' · UPI: <b>' + esc(o.upi) + '</b>' : o.address ? ' · <span class="mono">' + esc(o.address.slice(0, 10) + '…' + o.address.slice(-6)) + '</span>' : ''}${o.kind === 'buy' ? (o.utr ? ' · UTR: <b>' + esc(o.utr) + '</b>' : isCqr ? (o.hasQr ? ' · QR sent to user' : ' · Waiting for you to assign QR') : ' · no UTR yet') : ''}</small></span>
+          ${sealPill}
           ${isCqr && !o.utr ? `<button type="button" class="btn ub-act" data-assign-pid="${esc(o.id)}">${o.hasQr ? 'Replace QR' : 'Assign QR'}</button>` : ''}
           ${isWd ? `<button type="button" class="btn ub-act" data-send-pid="${esc(o.id)}">Approve &amp; Send</button>` : ''}
           <span class="badge ${bCls}"${timerAttr}>${lbl(o)}</span>
@@ -370,6 +398,14 @@
     if (order) {
       if ($('#ordAutoSend', m)) $('#ordAutoSend', m).onclick = () => approveAndSendPayout(order, upd => showOrder(upd));
       if ($('#ordGoPayouts', m)) $('#ordGoPayouts', m).onclick = () => payoutsPanel(true);
+      if ($('#cpSellUpi', m) && order.upi) {
+        $('#cpSellUpi', m).onclick = e => {
+          navigator.clipboard && navigator.clipboard.writeText(order.upi);
+          e.target.textContent = 'Copied UPI!';
+          setTimeout(() => { e.target.textContent = `Copy UPI (${order.upi})`; }, 1400);
+        };
+      }
+      if ($('#sellQuickOk', m)) $('#sellQuickOk', m).onclick = () => changeStatus(order, 'success');
       if ($('#ordAssignQr', m)) $('#ordAssignQr', m).onclick = () => openAssignQrModal(order, upd => showOrder(upd));
       if ($('#ordScanQr', m) && $('#ordQrFile', m)) {
         $('#ordScanQr', m).onclick = () => $('#ordQrFile', m).click();
@@ -948,6 +984,12 @@
       const d = await api('/payouts' + (forceRefresh ? '?refresh=1' : ''));
       const w = d.wallet || {};
       const explorer = esc(w.explorer || 'https://bscscan.com');
+      const sealSetupBanner = !d.sealKeysConfigured
+        ? `<div class="cqr-box" style="border-color:#FBBF24">
+            <div><b style="color:#FBBF24">⚠ SEAL_SIGNATURES Not Set in .env</b>
+              <small style="display:block;margin-top:4px">Add <b>SEAL_SIGNATURES</b> (your 10 comma-separated internal signature keys) to <b>.env</b> / Render Environment Variables so <b>✓ Seal &amp; Ledger Verified</b> unlocks for Buy, Sell, and Withdraw orders.</small>
+            </div>
+          </div>` : '';
       const walletSetupBanner = !w.configured
         ? `<div class="cqr-box" style="border-color:var(--accent)">
             <div><b>Hot Wallet Not Configured Yet</b>
@@ -962,12 +1004,14 @@
         const busy = o.payoutState === 'locked' || o.payoutState === 'broadcasted' || inFlightPayouts.has(o.id);
         const sealBadge = o.sealOk
           ? '<span class="active-badge">✓ Seal &amp; Ledger Verified</span>'
-          : '<span class="deact-badge">⚠ Tamper / Seal Mismatch</span>';
+          : o.missingKeys
+            ? '<span class="badge pending">⚠ Set SEAL_SIGNATURES</span>'
+            : '<span class="deact-badge">🚨 Tamper / Forged</span>';
         const stateBadge = o.payoutState === 'broadcasted'
           ? '<span class="badge processing">Broadcasted on BSC</span>'
           : o.timerEndsAt ? `<span class="badge processing" data-cqr-t="${o.timerEndsAt}">Processing · ${fmtRem(o.timerEndsAt)}</span>`
           : '<span class="badge pending">Pending</span>';
-        return `<div class="cqr-card" style="${o.sealOk ? '' : 'border-color:var(--error)'}">
+        return `<div class="cqr-card" style="${o.sealOk ? '' : o.missingKeys ? 'border-color:#FBBF24' : 'border-color:var(--error)'}">
           <div class="cqr-top">
             <div>
               <b>#${esc(o.id)} · ${f2(o.usdt)} USDT</b> <small>· BSC (BEP20)</small><br>
@@ -1001,13 +1045,14 @@
           <div class="head">
             <div>
               <h2>BSC Hot Wallet Payouts</h2>
-              <small>1-click approves, verifies cryptographic order &amp; ledger seals, sends BEP20 USDT on BNB Smart Chain, and saves the tx hash automatically</small>
+              <small>1-click approves, verifies ${d.sealKeysConfigured ? `<b>${d.sealKeysCount}-Key SEAL_SIGNATURES</b>` : 'cryptographic'} order &amp; ledger seals, sends BEP20 USDT on BNB Smart Chain, and saves the tx hash automatically</small>
             </div>
             <div style="display:flex;gap:8px;flex-wrap:wrap">
               <button class="btn ${d.enabled ? '' : 'danger'}" id="payToggle">Payouts: ${d.enabled ? 'ON' : 'OFF'}</button>
               <button class="btn ghost" id="payRefresh">Refresh Wallet</button>
             </div>
           </div>
+          ${sealSetupBanner}
           ${walletSetupBanner}
           <div class="hw-grid">
             <div class="hw-stat">

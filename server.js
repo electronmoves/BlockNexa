@@ -37,6 +37,7 @@ const CFG = {
   ADMIN_PATH: env('ADMIN_PATH', 'tsjsigjijgdigj77sf7sf4').trim().replace(/^\/+|\/+$/g, ''), // secret admin URL path (/admin is always 404)
   ADMIN_IPS: env('ADMIN_IPS').split(',').map(s => s.trim()).filter(Boolean),                // optional: only these IPs may use the admin panel
   APP_SECRET: env('APP_SECRET') || crypto.randomBytes(32).toString('hex'),
+  SEAL_SIGNATURES: (env('SEAL_SIGNATURES') || env('SEAL_KEYS')).split(',').map(s => s.trim()).filter(s => s.length >= 8),
   SESSION_DAYS: Math.max(7, num('SESSION_DAYS', 30)),                                       // how long a login lasts (never less than 7 days)
 };
 CFG.MIN_BUY_INR = Math.ceil(CFG.MIN_BUY_USDT * CFG.BUY_RATE);
@@ -109,63 +110,136 @@ const ID_CHARS = 'ABCDEFGHJKMNPQRSTUVWXYZ23456789';                             
 const newOrderId = () => { for (;;) { const id = Array.from({ length: 6 }, () => ID_CHARS[crypto.randomInt(ID_CHARS.length)]).join(''); if (!S('SELECT 1 FROM orders WHERE public_id=?').get(id)) return id; } };
 const newUid = () => { for (;;) { const u = 'BN-' + crypto.randomInt(100000, 1000000); if (!S('SELECT 1 FROM users WHERE uid=?').get(u)) return u; } };
 const balance = userId => S('SELECT COALESCE(SUM(usdt_micro),0) b FROM ledger WHERE user_id=?').get(userId).b;
-const ledgerSig = (prevSig, userId, orderId, type, amt, createdAt) =>
-  hmac(`ledger-v1:${prevSig || 'GENESIS'}:${userId}:${orderId || 0}:${type}:${amt}:${createdAt}`);
-const orderSeal = (pid, userId, usdtMicro, address, createdAt) =>
-  hmac(`wd-seal-v1:${pid}:${userId}:${usdtMicro}:${String(address || '').trim().toLowerCase()}:${createdAt}`);
+const sealKeysConfigured = () => CFG.SEAL_SIGNATURES.length > 0;
+const signWithRing = payload => {
+  if (!sealKeysConfigured()) return null;
+  const k = CFG.SEAL_SIGNATURES[crypto.randomInt(CFG.SEAL_SIGNATURES.length)];
+  return crypto.createHmac('sha256', CFG.APP_SECRET + ':' + k).update(payload).digest('hex');
+};
+const verifyWithRing = (payload, sig) => {
+  if (!sealKeysConfigured() || typeof sig !== 'string' || !/^[a-f0-9]{64}$/.test(sig)) return false;
+  const sigBuf = Buffer.from(sig);
+  let matched = 0;
+  for (const k of CFG.SEAL_SIGNATURES) {
+    const cand = Buffer.from(crypto.createHmac('sha256', CFG.APP_SECRET + ':' + k).update(payload).digest('hex'));
+    if (cand.length === sigBuf.length && crypto.timingSafeEqual(cand, sigBuf)) matched = 1;
+  }
+  return matched === 1;
+};
+const ledgerPayload = (prevSig, userId, orderId, type, amt, createdAt) =>
+  `ledger-v2:${prevSig || 'GENESIS'}:${userId}:${orderId || 0}:${type}:${amt}:${createdAt}`;
+const buyOrderPayload = (pid, userId, inr, usdtMicro, createdAt) =>
+  `buy-seal-v2:${pid}:${userId}:${Math.round(Number(inr || 0) * 100)}:${usdtMicro}:${createdAt}`;
+const sellOrderPayload = (pid, userId, usdtMicro, inr, upi, createdAt) =>
+  `sell-seal-v2:${pid}:${userId}:${usdtMicro}:${Math.round(Number(inr || 0) * 100)}:${String(upi || '').trim().toLowerCase()}:${createdAt}`;
+const wdOrderPayload = (pid, userId, usdtMicro, address, createdAt) =>
+  `wd-seal-v2:${pid}:${userId}:${usdtMicro}:${String(address || '').trim().toLowerCase()}:${createdAt}`;
+const orderPayloadOf = o => o.type === 'buy'
+  ? buyOrderPayload(o.public_id, o.user_id, o.inr, o.usdt_micro, o.created_at)
+  : o.type === 'sell'
+    ? sellOrderPayload(o.public_id, o.user_id, o.usdt_micro, o.inr, o.upi, o.created_at)
+    : wdOrderPayload(o.public_id, o.user_id, o.usdt_micro, o.address, o.created_at);
+
 const addLedger = (userId, orderId, type, amt, reason, admin) => {
   const t = now();
   const prev = S('SELECT sig FROM ledger WHERE user_id=? ORDER BY id DESC LIMIT 1').get(userId);
-  const sig = ledgerSig(prev && prev.sig, userId, orderId, type, amt, t);
+  const sig = signWithRing(ledgerPayload(prev && prev.sig, userId, orderId, type, amt, t));
   return S('INSERT INTO ledger(user_id,order_id,type,usdt_micro,reason,admin,created_at,sig) VALUES(?,?,?,?,?,?,?,?)')
     .run(userId, orderId, type, amt, reason || null, admin || null, t, sig);
 };
 const bscPayout = createBscPayout();
-{ // One-time baseline seal migration for pre-existing legitimate rows (guarded by HMAC so it cannot be re-triggered by DB edits)
-  const guardVal = hmac('seals-init-v1');
-  const mark = S("SELECT value FROM settings WHERE key='seals_initialized'").get();
-  if (!mark) {
+{ // One-time baseline v2 ring-seal migration for pre-existing legitimate rows (locked by both settings + .seal_v2.lock file)
+  const lockFile = path.join(DATA_DIR, '.seal_v2.lock');
+  const mark = S("SELECT value FROM settings WHERE key='seals_v2_initialized'").get();
+  if (sealKeysConfigured() && !mark && !fs.existsSync(lockFile)) {
     db.transaction(() => {
+      for (const o of S('SELECT * FROM orders ORDER BY id ASC').all()) {
+        if (!verifyWithRing(orderPayloadOf(o), o.order_sig)) {
+          S('UPDATE orders SET order_sig=? WHERE id=?').run(signWithRing(orderPayloadOf(o)), o.id);
+        }
+      }
       for (const u of S('SELECT id FROM users ORDER BY id ASC').all()) {
         let prevSig = null;
         for (const r of S('SELECT * FROM ledger WHERE user_id=? ORDER BY id ASC').all(u.id)) {
-          const sig = r.sig || ledgerSig(prevSig, r.user_id, r.order_id, r.type, r.usdt_micro, r.created_at);
-          if (!r.sig) S('UPDATE ledger SET sig=? WHERE id=?').run(sig, r.id);
+          const sig = signWithRing(ledgerPayload(prevSig, r.user_id, r.order_id, r.type, r.usdt_micro, r.created_at));
+          S('UPDATE ledger SET sig=? WHERE id=?').run(sig, r.id);
           prevSig = sig;
         }
       }
-      for (const o of S("SELECT * FROM orders WHERE type='withdraw' AND order_sig IS NULL").all()) {
-        S('UPDATE orders SET order_sig=? WHERE id=?').run(orderSeal(o.public_id, o.user_id, o.usdt_micro, o.address, o.created_at), o.id);
-      }
-      S("INSERT INTO settings(key,value) VALUES('seals_initialized',?)").run(guardVal);
+      const lockSig = signWithRing('seals-v2-init-locked');
+      S("INSERT INTO settings(key,value) VALUES('seals_v2_initialized',?) ON CONFLICT(key) DO UPDATE SET value=excluded.value").run(lockSig);
     })();
+    try { fs.writeFileSync(lockFile, String(now()), { mode: 0o600 }); } catch {}
   }
 }
-function verifyWithdrawIntegrity(o) {
-  if (!o || o.type !== 'withdraw') return { ok: false, reason: 'Not a withdrawal order.', tamper: false };
-  if (o.chain !== 'bsc' || !/^0x[a-fA-F0-9]{40}$/.test(String(o.address || ''))) {
-    return { ok: false, reason: 'Invalid withdrawal network or wallet format.', tamper: false };
+
+function verifyUserLedger(userId) {
+  if (!sealKeysConfigured()) {
+    return { ok: false, tamper: false, missingKeys: true, reason: 'SEAL_SIGNATURES missing in .env — add your 10 internal seal signatures to enable verification.' };
   }
-  const addrOk = bscPayout.validateAddressSync(o.address, CFG.DEPOSIT_ADDRESS);
-  if (!addrOk.ok) return { ok: false, reason: addrOk.error, tamper: false };
-  const expectedOrderSig = orderSeal(o.public_id, o.user_id, o.usdt_micro, o.address, o.created_at);
-  if (!o.order_sig || !same(o.order_sig, expectedOrderSig)) {
-    return { ok: false, reason: 'Order cryptographic seal mismatch (possible database tampering on order #' + o.public_id + ').', tamper: true };
-  }
-  const rows = S('SELECT * FROM ledger WHERE user_id=? ORDER BY id ASC').all(o.user_id);
-  let prevSig = null, sum = 0, hasHold = false;
+  const rows = S('SELECT * FROM ledger WHERE user_id=? ORDER BY id ASC').all(userId);
+  let prevSig = null, sum = 0;
   for (const r of rows) {
-    const expectedLedgerSig = ledgerSig(prevSig, r.user_id, r.order_id, r.type, r.usdt_micro, r.created_at);
-    if (!r.sig || !same(r.sig, expectedLedgerSig)) {
-      return { ok: false, reason: 'User ledger cryptographic chain broken (possible forged balance in database).', tamper: true };
+    if (!verifyWithRing(ledgerPayload(prevSig, r.user_id, r.order_id, r.type, r.usdt_micro, r.created_at), r.sig)) {
+      return { ok: false, tamper: true, reason: 'User ledger signature chain broken (forged or altered balance entry detected).' };
+    }
+    if (r.type === 'buy_credit' && r.order_id) {
+      const bo = S('SELECT * FROM orders WHERE id=?').get(r.order_id);
+      if (!bo || bo.type !== 'buy' || bo.user_id !== userId || bo.usdt_micro !== r.usdt_micro || !verifyWithRing(orderPayloadOf(bo), bo.order_sig)) {
+        return { ok: false, tamper: true, reason: 'Ledger buy_credit does not match a valid sealed Buy order (forged Buy credit detected).' };
+      }
     }
     prevSig = r.sig;
     sum += r.usdt_micro;
-    if (r.order_id === o.id && r.type === 'withdraw_hold' && r.usdt_micro === -o.usdt_micro) hasHold = true;
   }
-  if (!hasHold) return { ok: false, reason: 'Missing matching withdraw_hold ledger entry for this order.', tamper: true };
-  if (sum < 0) return { ok: false, reason: 'User ledger balance is negative (' + f2(sum) + ' USDT).', tamper: true };
-  return { ok: true, checksumAddress: addrOk.checksum };
+  if (sum < 0) return { ok: false, tamper: true, reason: 'User ledger balance is negative (' + f2(sum) + ' USDT).' };
+  return { ok: true, rows, balanceMicro: sum };
+}
+
+function verifyOrderIntegrity(o) {
+  if (!o) return { ok: false, reason: 'Order not found.', tamper: false };
+  if (!sealKeysConfigured()) {
+    return { ok: false, tamper: false, missingKeys: true, reason: 'SEAL_SIGNATURES missing in .env — add your 10 internal seal signatures to enable verification.' };
+  }
+  if (o.type === 'buy') {
+    if (!verifyWithRing(buyOrderPayload(o.public_id, o.user_id, o.inr, o.usdt_micro, o.created_at), o.order_sig)) {
+      return { ok: false, tamper: true, reason: `Buy order seal mismatch (possible database tampering on Buy #${o.public_id}).` };
+    }
+    const led = verifyUserLedger(o.user_id);
+    if (!led.ok) return led;
+    return { ok: true };
+  }
+  if (o.type === 'sell') {
+    if (!/^[\w.\-]{2,}@[\w.\-]{2,}$/.test(String(o.upi || '').trim())) {
+      return { ok: false, tamper: false, reason: 'Invalid payout UPI format on sell order.' };
+    }
+    if (!verifyWithRing(sellOrderPayload(o.public_id, o.user_id, o.usdt_micro, o.inr, o.upi, o.created_at), o.order_sig)) {
+      return { ok: false, tamper: true, reason: `Sell order seal mismatch (possible forged UPI or amount on Sell #${o.public_id}).` };
+    }
+    const led = verifyUserLedger(o.user_id);
+    if (!led.ok) return led;
+    if (!led.rows.some(r => r.order_id === o.id && r.type === 'sell_hold' && r.usdt_micro === -o.usdt_micro)) {
+      return { ok: false, tamper: true, reason: `Missing matching sell_hold ledger deduction for Sell #${o.public_id}.` };
+    }
+    return { ok: true };
+  }
+  if (o.type === 'withdraw') {
+    if (o.chain !== 'bsc' || !/^0x[a-fA-F0-9]{40}$/.test(String(o.address || ''))) {
+      return { ok: false, reason: 'Invalid withdrawal network or wallet format.', tamper: false };
+    }
+    const addrOk = bscPayout.validateAddressSync(o.address, CFG.DEPOSIT_ADDRESS);
+    if (!addrOk.ok) return { ok: false, reason: addrOk.error, tamper: false };
+    if (!verifyWithRing(wdOrderPayload(o.public_id, o.user_id, o.usdt_micro, o.address, o.created_at), o.order_sig)) {
+      return { ok: false, tamper: true, reason: `Withdrawal seal mismatch (possible forged wallet or amount on Withdraw #${o.public_id}).` };
+    }
+    const led = verifyUserLedger(o.user_id);
+    if (!led.ok) return led;
+    if (!led.rows.some(r => r.order_id === o.id && r.type === 'withdraw_hold' && r.usdt_micro === -o.usdt_micro)) {
+      return { ok: false, tamper: true, reason: `Missing matching withdraw_hold ledger deduction for Withdraw #${o.public_id}.` };
+    }
+    return { ok: true, checksumAddress: addrOk.checksum };
+  }
+  return { ok: false, reason: 'Unknown order type.', tamper: false };
 }
 const payoutsEnabled = () => { const r = S("SELECT value FROM settings WHERE key='payouts_enabled'").get(); return !r || r.value !== '0'; };
 const audit = (action, target, details) => S('INSERT INTO audit(at,action,target,details) VALUES(?,?,?,?)').run(now(), action, target || null, JSON.stringify(details || {}));
@@ -553,7 +627,9 @@ V.post('/buy', limiter(20), (req, res) => {
     if (!Number.isInteger(inr) || inr < CFG.MIN_CASHQR_INR || inr > CFG.MAX_CASHQR_INR || inr % CFG.CASHQR_STEP !== 0) {
       return res.status(400).json({ error: `Enter an ATM amount between ₹${CFG.MIN_CASHQR_INR} and ₹${CFG.MAX_CASHQR_INR} (multiple of ₹${CFG.CASHQR_STEP}).` });
     }
-    S("INSERT INTO orders(public_id,user_id,type,pay_method,inr,rate,usdt_micro,expires_at,created_at,updated_at) VALUES(?,?,'buy','cashqr',?,?,?,?,?,?)").run(pid, req.user.id, inr, CFG.BUY_RATE, Math.round(inr * 1e6 / CFG.BUY_RATE), exp, t, t);
+    const um = Math.round(inr * 1e6 / CFG.BUY_RATE);
+    const sig = signWithRing(buyOrderPayload(pid, req.user.id, inr, um, t));
+    S("INSERT INTO orders(public_id,user_id,type,pay_method,inr,rate,usdt_micro,order_sig,expires_at,created_at,updated_at) VALUES(?,?,'buy','cashqr',?,?,?,?,?,?,?)").run(pid, req.user.id, inr, CFG.BUY_RATE, um, sig, exp, t, t);
     const created = S('SELECT * FROM orders WHERE public_id=?').get(pid);
     notifyAdminOrder(created, req.user, 'New CashQR request (upload ATM QR within 5 min)');
     pushUser(req.user.id, { type: 'sync' }); pushAdmins({ type: 'admin_sync', orderId: created.public_id });
@@ -562,7 +638,9 @@ V.post('/buy', limiter(20), (req, res) => {
   const upi = pickRandomUpi();
   if (!upi) return res.status(503).json({ error: 'Payments are not set up yet. Please contact support.' });
   if (!Number.isInteger(inr) || inr < CFG.MIN_BUY_INR || inr > CFG.MAX_BUY_INR) return res.status(400).json({ error: `Enter a whole amount between ₹${CFG.MIN_BUY_INR} and ₹${CFG.MAX_BUY_INR}.` });
-  S("INSERT INTO orders(public_id,user_id,type,pay_method,inr,rate,usdt_micro,upi,expires_at,created_at,updated_at) VALUES(?,?,'buy','upi',?,?,?,?,?,?,?)").run(pid, req.user.id, inr, CFG.BUY_RATE, Math.round(inr * 1e6 / CFG.BUY_RATE), upi, exp, t, t);
+  const um = Math.round(inr * 1e6 / CFG.BUY_RATE);
+  const sig = signWithRing(buyOrderPayload(pid, req.user.id, inr, um, t));
+  S("INSERT INTO orders(public_id,user_id,type,pay_method,inr,rate,usdt_micro,upi,order_sig,expires_at,created_at,updated_at) VALUES(?,?,'buy','upi',?,?,?,?,?,?,?,?)").run(pid, req.user.id, inr, CFG.BUY_RATE, um, upi, sig, exp, t, t);
   const created = S('SELECT * FROM orders WHERE public_id=?').get(pid);
   notifyAdminOrder(created, req.user, 'New BUY order received');
   pushUser(req.user.id, { type: 'sync' }); pushAdmins({ type: 'admin_sync', orderId: created.public_id });
@@ -624,7 +702,9 @@ const createOut = db.transaction((user, type, m, x) => {
   const bal = balance(user.id);
   if (bal < m) return { err: `Insufficient balance. You have ${f2(bal)} USDT.`, code: 400 };
   const pid = newOrderId();
-  const sig = type === 'withdraw' ? orderSeal(pid, user.id, m, x.address, t) : null;
+  const sig = signWithRing(type === 'withdraw'
+    ? wdOrderPayload(pid, user.id, m, x.address, t)
+    : sellOrderPayload(pid, user.id, m, x.inr, x.upi, t));
   const r = S('INSERT INTO orders(public_id,user_id,type,usdt_micro,inr,rate,upi,address,chain,req_id,order_sig,created_at,updated_at) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?)')
     .run(pid, user.id, type, m, x.inr || null, x.rate || null, x.upi || null, x.address || null, x.chain || null, reqId, sig, t, t);
   addLedger(user.id, r.lastInsertRowid, type === 'sell' ? 'sell_hold' : 'withdraw_hold', -m);
@@ -689,10 +769,25 @@ A.use(ipOk, limiter(240), adminAuth, (req, res, next) => { res.set('Cache-Contro
 const userView = u => ({ uid: u.uid, email: u.email, phone: u.phone, createdAt: u.created_at, suspended: !!u.wd_suspended, suspendReason: u.wd_reason, suspendedAt: u.wd_suspended_at, balance: usdt(balance(u.id)) });
 const orderView = o => {
   const u = S('SELECT * FROM users WHERE id=?').get(o.user_id);
-  const extra = o.type === 'withdraw'
-    ? (() => { const v = verifyWithdrawIntegrity(o); return { payoutState: o.payout_state || null, payoutError: o.payout_error || null, sealOk: v.ok, sealError: v.ok ? null : v.reason, tamper: !!v.tamper }; })()
-    : {};
+  const v = verifyOrderIntegrity(o);
+  const extra = {
+    payoutState: o.payout_state || null,
+    payoutError: o.payout_error || null,
+    sealOk: v.ok,
+    sealError: v.ok ? null : v.reason,
+    tamper: !!v.tamper,
+    missingKeys: !!v.missingKeys,
+  };
   return { ...item(o), utr: o.utr, txid: o.txid, chain: o.chain, rate: o.rate, updatedAt: o.updated_at, ...extra, user: { uid: u.uid, email: u.email, phone: u.phone } };
+};
+
+const handleTamperBlock = (o, integrity) => {
+  const u = S('SELECT uid FROM users WHERE id=?').get(o.user_id);
+  S("INSERT INTO settings(key,value) VALUES('payouts_enabled','0') ON CONFLICT(key) DO UPDATE SET value='0'").run();
+  S('UPDATE orders SET payout_error=?, updated_at=? WHERE id=?').run(integrity.reason, now(), o.id);
+  audit('security_tamper_blocked', u && u.uid, { order: o.public_id, type: o.type, reason: integrity.reason });
+  notifyAdminText(`🚨 SECURITY ALERT (BlockNexa)\nTampered ${o.type.toUpperCase()} order or forged ledger blocked!\nOrder: #${o.public_id}\nUser: ${(u && u.uid) || o.user_id}\nReason: ${integrity.reason}\nHot Wallet Payouts have been AUTOMATICALLY LOCKED OFF.`);
+  pushAdmins({ type: 'admin_sync', orderId: o.public_id });
 };
 
 A.get('/ping', (req, res) => res.json({ ok: true }));
@@ -772,7 +867,21 @@ A.post('/orders/:id/status', (req, res) => {
   if (!['success', 'failed'].includes(to)) return res.status(400).json({ error: 'Status must be success or failed.' });
   if (to === 'failed' && !reason) return res.status(400).json({ error: 'Write a short reason (at least 3 characters). The user will see it.' });
   if (txid && !/^0x[a-fA-F0-9]{64}$/.test(txid)) return res.status(400).json({ error: 'That transaction hash does not look right (0x + 64 characters).' });
-  const r = setStatus(String(req.params.id).toUpperCase(), to, reason, txid);
+  const pid = String(req.params.id).toUpperCase();
+  if (to === 'success' && sealKeysConfigured()) {
+    const existing = S('SELECT * FROM orders WHERE public_id=?').get(pid);
+    if (existing) {
+      const integrity = verifyOrderIntegrity(existing);
+      if (!integrity.ok) {
+        if (integrity.tamper) {
+          handleTamperBlock(existing, integrity);
+          return res.status(403).json({ error: integrity.reason + ' Approval blocked & Payouts auto-locked OFF for safety.' });
+        }
+        return res.status(400).json({ error: integrity.reason });
+      }
+    }
+  }
+  const r = setStatus(pid, to, reason, txid);
   if (r.err) return res.status(r.code).json({ error: r.err });
   pushUser(r.order.user_id, { type: 'order', order: item(r.order) }); pushAdmins({ type: 'admin_sync', orderId: r.order.public_id });
   res.json({ order: orderView(r.order) });
@@ -941,7 +1050,7 @@ A.get('/settings', (req, res) => {
   const cashQrPendingCount = S("SELECT COUNT(*) c FROM orders WHERE type='buy' AND pay_method='cashqr' AND status='pending'").get().c;
   const withdrawPendingCount = S("SELECT COUNT(*) c FROM orders WHERE type='withdraw' AND status='pending'").get().c;
   const upis = S('SELECT upi FROM upis WHERE active=1 ORDER BY id ASC').all().map(r => r.upi);
-  res.json({ buySellEnabled: buySellEnabled(), buySellReason: buySellReason(), cashQrEnabled: cashQrEnabled(), payoutsEnabled: payoutsEnabled(), pendingCount, cashQrPendingCount, withdrawPendingCount, upis });
+  res.json({ buySellEnabled: buySellEnabled(), buySellReason: buySellReason(), cashQrEnabled: cashQrEnabled(), payoutsEnabled: payoutsEnabled(), sealKeysConfigured: sealKeysConfigured(), sealKeysCount: CFG.SEAL_SIGNATURES.length, pendingCount, cashQrPendingCount, withdrawPendingCount, upis });
 });
 A.post('/settings/buy-sell', (req, res) => {
   const b = req.body || {}, bad = checkAdminKey(req, b.adminKey);
@@ -1110,7 +1219,7 @@ A.get('/payouts', async (req, res) => {
   const recent = S("SELECT * FROM orders WHERE type='withdraw' AND status!='pending' ORDER BY updated_at DESC, id DESC LIMIT 30").all().map(orderView);
   const since24h = now() - 24 * 3600 * 1000;
   const sent24hMicro = S("SELECT COALESCE(SUM(usdt_micro),0) s FROM orders WHERE type='withdraw' AND status='success' AND updated_at>=?").get(since24h).s;
-  res.json({ enabled: payoutsEnabled(), wallet, sent24hUsdt: usdt(sent24hMicro), pending, recent });
+  res.json({ enabled: payoutsEnabled(), sealKeysConfigured: sealKeysConfigured(), sealKeysCount: CFG.SEAL_SIGNATURES.length, wallet, sent24hUsdt: usdt(sent24hMicro), pending, recent });
 });
 
 A.post('/payouts/toggle', (req, res) => {
@@ -1139,16 +1248,11 @@ A.post('/payouts/:id/send', limiter(30), async (req, res) => {
     return res.status(409).json({ error: 'USDT amount mismatch between screen and database. Reload and inspect this order.' });
   }
 
-  // Cryptographic anti-forgery verification (Order HMAC seal + User Ledger hash-chain)
-  const integrity = verifyWithdrawIntegrity(o);
+  // Cryptographic anti-forgery verification (10-key SEAL_SIGNATURES Order Seal + User Ledger Hash-Chain)
+  const integrity = verifyOrderIntegrity(o);
   if (!integrity.ok) {
-    const u = S('SELECT uid FROM users WHERE id=?').get(o.user_id);
     if (integrity.tamper) {
-      S("INSERT INTO settings(key,value) VALUES('payouts_enabled','0') ON CONFLICT(key) DO UPDATE SET value='0'").run();
-      S('UPDATE orders SET payout_error=?, updated_at=? WHERE id=?').run(integrity.reason, now(), o.id);
-      audit('security_tamper_blocked', u && u.uid, { order: o.public_id, reason: integrity.reason });
-      notifyAdminText(`🚨 SECURITY ALERT (BlockNexa)\nTampered order or forged balance blocked!\nOrder: #${o.public_id}\nUser: ${(u && u.uid) || o.user_id}\nReason: ${integrity.reason}\nHot Wallet Payouts have been AUTOMATICALLY LOCKED OFF.`);
-      pushAdmins({ type: 'admin_sync', orderId: o.public_id });
+      handleTamperBlock(o, integrity);
       return res.status(403).json({ error: integrity.reason + ' Payouts have been auto-locked OFF for safety.' });
     }
     return res.status(400).json({ error: integrity.reason });
@@ -1269,6 +1373,7 @@ app.listen(CFG.PORT, err => {
   if (!CFG.DEPOSIT_ADDRESS) console.log('WARNING: DEPOSIT_ADDRESS is not set, so the deposit page is empty.');
   if (!env('ADMIN_KEY').trim()) console.log(IS_PROD ? 'CRITICAL WARNING: ADMIN_KEY is not set in environment! Set ADMIN_KEY immediately.' : 'WARNING: ADMIN_KEY is not set. Temporary local admin key: ' + CFG.ADMIN_KEY);
   else console.log(`Admin key: configured from environment (${CFG.ADMIN_KEY.length} chars)`);
+  console.log(sealKeysConfigured() ? `Seal signatures: ${CFG.SEAL_SIGNATURES.length} secret signature(s) active in ring` : 'WARNING: SEAL_SIGNATURES is not set in .env — Seal & Ledger verification is locked until configured.');
   if (!env('APP_SECRET').trim() && IS_PROD) console.log('WARNING: APP_SECRET is not set in environment; user sessions will reset on server restart.');
   if (process.env.RENDER && !process.env.DATA_DIR) console.log('WARNING: running on Render without DATA_DIR. The database is ERASED on every restart. Add a persistent disk.');
 });
