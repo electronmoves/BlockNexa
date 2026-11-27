@@ -111,6 +111,11 @@ aside{display:grid;gap:14px}
 .cqr-acts{display:flex;gap:8px;flex-wrap:wrap}
 .cqr-prev{width:176px;height:176px;margin:10px auto;background:#fff;border-radius:14px;padding:8px;display:grid;place-items:center}.cqr-prev svg,.cqr-prev img{width:100%;height:100%}
 .cqr-box{margin-top:14px;padding:14px;border-radius:14px;background:var(--elev);border:1.5px solid var(--primary);display:grid;gap:10px}
+/* ===== BSC Hot Wallet Payouts ===== */
+.hw-grid{display:grid;gap:12px;margin-top:14px}@media(min-width:760px){.hw-grid{grid-template-columns:1.4fr 1fr 1fr 1fr}}
+.hw-stat{background:var(--elev);border:1px solid var(--border);border-radius:14px;padding:14px;display:grid;gap:4px}
+.hw-stat b{font:700 20px var(--display)}
+.mono{font-family:ui-monospace,Consolas,monospace;font-size:12.5px;word-break:break-all}
 @media(prefers-reduced-motion:reduce){*,*::before,*::after{animation:none!important;transition:none!important}}
 </style></head><body>
 <div id="login"><div class="card"><div class="brand"><span class="mark"></span>BlockNexa Admin</div>
@@ -120,9 +125,9 @@ aside{display:grid;gap:14px}
 <div id="panel" hidden><div class="wrap">
   <div class="bar"><div class="brand"><span class="mark"></span>Admin</div>
     <form class="search" id="sf"><input id="q" placeholder="Search by Order ID (#A7K2M9), User ID, UTR, phone or email" aria-label="Search"><button class="btn">Search</button></form>
-    <div class="nav"><button class="btn" id="nTrade" title="Turn Buy & Sell ON or OFF for all users">Buy &amp; Sell: ON</button><button class="btn ghost" id="nPending">Pending</button><button class="btn ghost" id="nCashQr">CashQR</button><button class="btn ghost" id="nUsers">Userbase</button><button class="btn ghost" id="nTxLog">Transaction log</button><button class="btn ghost" id="nNotifs">Notifications</button><button class="btn ghost" id="nAudit">Admin log</button><button class="btn ghost" id="nBackup">Backup</button><button class="btn ghost" id="nLock">Lock</button></div></div>
+    <div class="nav"><button class="btn" id="nTrade" title="Turn Buy & Sell ON or OFF for all users">Buy &amp; Sell: ON</button><button class="btn ghost" id="nPending">Pending</button><button class="btn ghost" id="nPayouts">Payouts</button><button class="btn ghost" id="nCashQr">CashQR</button><button class="btn ghost" id="nUsers">Userbase</button><button class="btn ghost" id="nTxLog">Transaction log</button><button class="btn ghost" id="nNotifs">Notifications</button><button class="btn ghost" id="nAudit">Admin log</button><button class="btn ghost" id="nBackup">Backup</button><button class="btn ghost" id="nLock">Lock</button></div></div>
   <main id="main"><p class="empty">Search for a user or an order to begin, or open Pending.</p></main></div></div>
 <div class="mdl" id="mdl" hidden><div class="mcard" id="mcard"></div></div>
-<script src="jsQR.js?v=4"></script>
-<script src="bn-admin.js?v=4"></script>
+<script src="jsQR.js?v=5"></script>
+<script src="bn-admin.js?v=5"></script>
 </body></html>

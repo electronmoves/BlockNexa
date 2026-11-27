@@ -280,6 +280,7 @@
   function screen(root, title, body, back = '#/home') {
     root.innerHTML = `<div class="wrap"><div class="narrow"><div class="top"><a class="iconbtn" href="${back}" aria-label="Back">${icon('back')}</a><h2 class="ttl">${title}</h2><span style="width:42px"></span></div>${body}</div></div>`;
   }
+  const makeReqId = () => (window.crypto && crypto.randomUUID ? crypto.randomUUID() : 'req_' + Date.now() + '_' + Math.random().toString(36).slice(2, 12));
   function row(x, i = 0) {
     const k = KIND[x.kind];
     let [c, l] = ST[x.status];
@@ -287,7 +288,8 @@
     if (x.kind === 'buy' && x.status === 'pending' && x.method === 'cashqr') l = x.hasQr ? 'QR Ready · Tap' : 'Getting QR · Tap';
     const timerSpan = (x.status === 'pending' && x.kind === 'withdraw' && x.timerEndsAt)
       ? `<span data-ends="${x.timerEndsAt}" style="color:var(--accent-soft);font-weight:600">${fmtLeft(x.timerEndsAt)}</span>` : '';
-    const detail = x.kind === 'buy' ? (x.method === 'cashqr' ? `₹${fmt(x.inr)} · CashQR` : `₹${fmt(x.inr)} paid`) : x.kind === 'sell' ? `₹${fmt(x.inr)} to your UPI` : `to ${short(x.address)}${timerSpan}`;
+    const txSpan = (x.kind === 'withdraw' && x.txid) ? ` · Tx: ${esc(short(x.txid))}` : '';
+    const detail = x.kind === 'buy' ? (x.method === 'cashqr' ? `₹${fmt(x.inr)} · CashQR` : `₹${fmt(x.inr)} paid`) : x.kind === 'sell' ? `₹${fmt(x.inr)} to your UPI` : `to ${short(x.address)}${txSpan}${timerSpan}`;
     const openAttr = x.kind === 'buy' && x.status === 'pending' ? ` data-open-buy="${esc(x.id)}" style="--i:${Math.min(i, 10)};cursor:pointer"` : ` style="--i:${Math.min(i, 10)}"`;
     return `<div class="row"${openAttr}><span class="rico ${k.tone}">${icon(k.ic)}</span><div class="rmid"><b>${k.label} <small>#${esc(x.id)}</small></b>
       <small>${when(x.at)} · ${detail}</small>${x.reason ? `<small class="why">Reason: ${esc(x.reason)}</small>` : ''}</div>
@@ -592,19 +594,23 @@
         <label class="field"><input id="upi" class="sm" placeholder="Your UPI ID (to receive INR)" autocomplete="off" spellcheck="false" aria-label="Your UPI ID"></label>
         <div class="kv"><div><span>You get</span><b id="get">₹0.00</b></div></div>
         <p class="err" id="err" role="alert"></p><button class="btn blue" id="go" style="background:var(--accent);color:#fff">Sell USDT</button></div>`);
-      const amt = $('#amt', root), upd = () => $('#get', root).textContent = '₹' + fmt((+amt.value || 0) * rt.sell);
-      amt.oninput = upd; $('#max', root).onclick = () => { amt.value = Math.floor(bal.usdt * 1e6) / 1e6; upd(); };
+      let reqId = makeReqId(), submitting = false;
+      const amt = $('#amt', root), upd = () => { reqId = makeReqId(); $('#get', root).textContent = '₹' + fmt((+amt.value || 0) * rt.sell); };
+      amt.oninput = upd; $('#upi', root).oninput = () => { reqId = makeReqId(); };
+      $('#max', root).onclick = () => { amt.value = Math.floor(bal.usdt * 1e6) / 1e6; upd(); };
       $('#go', root).onclick = async e => {
+        if (submitting) return;
         if (rt.buySellEnabled === false) { renderSellForm(true); return; }
         const v = +amt.value, upi = $('#upi', root).value.trim(), err = $('#err', root); err.textContent = '';
         if (!(v >= rt.minSellUsdt)) return err.textContent = `Minimum sale is ${rt.minSellUsdt} USDT.`;
         if (v > bal.usdt) return err.textContent = `Insufficient balance. You have ${fmt(bal.usdt)} USDT.`;
         if (!UPI.test(upi)) return err.textContent = 'Enter a valid UPI ID, like name@bank.';
-        if (!await ask({ title: 'Confirm sale', rows: [['You sell', fmt(v) + ' USDT'], ['Rate', '₹' + rt.sell + ' per USDT'], ['You get', '₹' + fmt(v * rt.sell)], ['Paid to', upi]], note: 'The USDT is set aside for this order. If the payout fails, it returns to your balance.', ok: 'Sell now' })) return;
-        if (rt.buySellEnabled === false) { renderSellForm(true); return; }
+        submitting = true;
+        if (!await ask({ title: 'Confirm sale', rows: [['You sell', fmt(v) + ' USDT'], ['Rate', '₹' + rt.sell + ' per USDT'], ['You get', '₹' + fmt(v * rt.sell)], ['Paid to', upi]], note: 'The USDT is set aside for this order. If the payout fails, it returns to your balance.', ok: 'Sell now' })) { submitting = false; return; }
+        if (rt.buySellEnabled === false) { submitting = false; renderSellForm(true); return; }
         e.target.disabled = true;
-        try { activeTradeSync = null; const o = await api().sellCreate({ usdt: v, upi }); done(root, 'Sale requested', 'We will pay your UPI soon', [['Order', '#' + o.id], ['You sold', fmt(o.usdt) + ' USDT'], ['You get', '₹' + fmt(o.inr)], ['Paid to', o.upi], ['Status', 'Processing']], 'sell'); }
-        catch (x) { err.textContent = msg(x); e.target.disabled = false; }
+        try { activeTradeSync = null; const o = await api().sellCreate({ usdt: v, upi, reqId }); done(root, 'Sale requested', 'We will pay your UPI soon', [['Order', '#' + o.id], ['You sold', fmt(o.usdt) + ' USDT'], ['You get', '₹' + fmt(o.inr)], ['Paid to', o.upi], ['Status', 'Processing']], 'sell'); }
+        catch (x) { submitting = false; err.textContent = msg(x); e.target.disabled = false; }
       };
     };
     activeTradeSync = (newRt, notify = true) => {
@@ -644,19 +650,24 @@
         <label class="field"><input id="addr" class="sm" placeholder="Paste your BSC (BEP20) wallet address" autocomplete="off" spellcheck="false" aria-label="Wallet address"></label>
         <p class="err" id="err" role="alert">${low ? `You need at least ${rt.minWithdraw} USDT to withdraw.` : ''}</p>
         <button class="btn" id="go">Confirm withdrawal</button></div>`);
-      $('#max', root).onclick = () => $('#amt', root).value = Math.floor(bal.usdt * 1e6) / 1e6;
+      let reqId = makeReqId(), submitting = false;
+      $('#amt', root).oninput = () => { reqId = makeReqId(); };
+      $('#addr', root).oninput = () => { reqId = makeReqId(); };
+      $('#max', root).onclick = () => { $('#amt', root).value = Math.floor(bal.usdt * 1e6) / 1e6; reqId = makeReqId(); };
       $('#go', root).onclick = async e => {
+        if (submitting) return;
         if (rt.buySellEnabled === false) { renderWdForm(true); return; }
         const v = +$('#amt', root).value, a = $('#addr', root).value.trim(), err = $('#err', root); err.textContent = '';
         if (!(v > 0)) return err.textContent = 'Enter the amount you want to withdraw.';
         if (v < rt.minWithdraw) return err.textContent = `Minimum withdrawal is ${rt.minWithdraw} USDT.`;
         if (v > bal.usdt) return err.textContent = `Insufficient balance. You have ${fmt(bal.usdt)} USDT.`;
         if (!ADDR.test(a)) return err.textContent = 'Enter a valid BSC (BEP20) address. It starts with 0x and has 42 characters.';
-        if (!await ask({ title: 'Confirm withdrawal', rows: [['Amount', v + ' USDT'], ['Network', 'BSC (BEP20)'], ['To address', a]], note: 'Check the address carefully. Crypto sent to a wrong address cannot be recovered.', ok: 'Withdraw' })) return;
-        if (rt.buySellEnabled === false) { renderWdForm(true); return; }
+        submitting = true;
+        if (!await ask({ title: 'Confirm withdrawal', rows: [['Amount', v + ' USDT'], ['Network', 'BSC (BEP20)'], ['To address', a]], note: 'Check the address carefully. Crypto sent to a wrong address cannot be recovered.', ok: 'Withdraw' })) { submitting = false; return; }
+        if (rt.buySellEnabled === false) { submitting = false; renderWdForm(true); return; }
         e.target.disabled = true;
-        try { activeTradeSync = null; const o = await api().withdraw({ amount: v, address: a }); done(root, 'Withdrawal requested', 'We will send it shortly', [['Request', '#' + o.id], ['Amount', fmt(o.usdt) + ' USDT'], ['To', short(o.address)], ['Status', 'Processing']], 'withdraw'); }
-        catch (x) { err.textContent = msg(x); e.target.disabled = false; }
+        try { activeTradeSync = null; const o = await api().withdraw({ amount: v, address: a, reqId }); done(root, 'Withdrawal requested', 'We will send it shortly', [['Request', '#' + o.id], ['Amount', fmt(o.usdt) + ' USDT'], ['To', short(o.address)], ['Status', 'Processing']], 'withdraw'); }
+        catch (x) { submitting = false; err.textContent = msg(x); e.target.disabled = false; }
       };
     };
     activeTradeSync = (newRt, notify = true) => {

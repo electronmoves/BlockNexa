@@ -64,8 +64,12 @@
       const s = await api('/settings');
       paintTradeBtn(s.buySellEnabled);
       if (Array.isArray(s.upis)) activeUpis = s.upis;
-      const np = $('#nPending'), nc = $('#nCashQr');
+      const np = $('#nPending'), nc = $('#nCashQr'), nw = $('#nPayouts');
       if (np) np.textContent = s.pendingCount ? `Pending (${s.pendingCount})` : 'Pending';
+      if (nw) {
+        nw.textContent = s.withdrawPendingCount ? `Payouts (${s.withdrawPendingCount})` : 'Payouts';
+        nw.className = 'btn ' + (s.withdrawPendingCount ? '' : 'ghost');
+      }
       if (nc) {
         nc.textContent = s.cashQrPendingCount ? `CashQR (${s.cashQrPendingCount})` : 'CashQR';
         nc.className = 'btn ' + (s.cashQrPendingCount ? '' : 'ghost');
@@ -105,6 +109,7 @@
           loadSettings();
           if (!$('#mdl').hidden) return;
           if (panelMode === 'pending') pending();
+          else if (panelMode === 'payouts') payoutsPanel(false);
           else if (panelMode === 'cashqr') cashQrPanel();
           else if (panelMode === 'order' && openOrderId && (!ev.orderId || ev.orderId === openOrderId)) {
             api('/find?q=' + encodeURIComponent(openOrderId)).then(r => { if (r.kind === 'order' && panelMode === 'order' && openOrderId === r.order.id && $('#mdl').hidden) showOrder(r.order); }).catch(() => {});
@@ -184,15 +189,34 @@
       : (o.status === 'pending' && o.expiresAt) ? `<span data-cqr-t="${o.expiresAt}">Waiting for QR · ${fmtRem(o.expiresAt)}</span>`
       : 'Waiting for QR';
     const showQrAssign = o.kind === 'buy' && (o.status === 'pending' || (isCqr && o.status !== 'success'));
+    const showAutoWd = o.kind === 'withdraw' && o.status === 'pending';
+    const sealHtml = o.kind !== 'withdraw' ? '' : o.sealOk
+      ? '<span style="color:var(--success)">✓ Verified (Order + Ledger HMAC)</span>'
+      : `<span class="why">⚠ ${esc(o.sealError || 'Seal verification failed')}</span>`;
+    const txHtml = o.txid ? `<a class="link mono" href="https://bscscan.com/tx/${encodeURIComponent(o.txid)}" target="_blank" rel="noopener">${esc(o.txid)}</a>` : '';
     $('#main').innerHTML = `<div style="max-width:620px;margin:0 auto"><div class="card"><div class="head"><h2>Order #${esc(o.id)}</h2><span class="badge ${o.status}">${wdLabel}</span></div>
       <div class="kv">
         ${kv('Type', isCqr ? 'Buy · CashQR (ATM)' : TYPE[o.kind])}${kv('Payment method', o.kind === 'buy' ? (isCqr ? 'CashQR (ATM High Limit)' : 'UPI') : '')}${kv('Amount', (o.inr ? '₹' + f2(o.inr) + ' → ' : '') + f2(o.usdt) + ' USDT')}${kv('Rate', o.rate ? '₹' + o.rate + ' per USDT' : '')}
         ${kv('CashQR status', cqrStatusHtml)}
-        ${kv('UTR', o.utr ? esc(o.utr) : o.kind === 'buy' ? 'Not submitted yet' : '')}${kv('Paid to UPI', esc(o.upi))}${kv('Wallet', esc(o.address))}${kv('Chain', esc(o.chain && o.chain.toUpperCase()))}${kv('Transaction hash', esc(o.txid))}
+        ${kv('Integrity seal', sealHtml)}
+        ${kv('UTR', o.utr ? esc(o.utr) : o.kind === 'buy' ? 'Not submitted yet' : '')}${kv('Paid to UPI', esc(o.upi))}${kv('Wallet', esc(o.address))}${kv('Chain', esc(o.chain && o.chain.toUpperCase()))}${kv('Transaction hash', txHtml)}
         ${kv('Withdraw timer', wdTimerText)}
+        ${kv('Payout note', o.payoutError ? `<span class="why">${esc(o.payoutError)}</span>` : '')}
         ${kv('User ID', `<button class="link" data-uid="${esc(o.user.uid)}">${esc(o.user.uid)}</button>`)}${kv('User email', esc(o.user.email))}${kv('User phone', esc(o.user.phone))}
         ${kv('Date', day(o.at))}${kv('Time', clock(o.at))}${kv('Last update', day(o.updatedAt) + ' ' + clock(o.updatedAt))}${o.reason ? `<div><span>Failure reason</span><b class="why">${esc(o.reason)}</b></div>` : ''}
       </div>
+      ${showAutoWd ? `<div class="cqr-box" style="border-color:${o.sealOk ? 'var(--primary)' : 'var(--error)'}">
+        <div>
+          <b>${o.sealOk ? `BSC Hot Wallet Auto-Payout · ${f2(o.usdt)} USDT` : '⚠ Auto-Payout Blocked (Integrity Check Failed)'}</b>
+          <small style="display:block;margin-top:3px">${o.sealOk
+            ? (o.payoutState === 'broadcasted' ? `Broadcasted on BSC (${esc(o.txid || '')}) — waiting for confirmation.` : '1-click sends BEP20 USDT from your Hot Wallet, saves the BSC transaction hash automatically, and marks this order Success.')
+            : esc(o.sealError || 'Order or ledger seal did not match.')}</small>
+        </div>
+        <div class="cqr-acts">
+          <button class="btn" id="ordAutoSend" ${(!o.sealOk || o.payoutState === 'locked' || o.payoutState === 'broadcasted') ? 'disabled' : ''}>${o.payoutState === 'broadcasted' ? 'Waiting BSC confirmation…' : o.payoutState === 'locked' ? 'Sending on BSC…' : `⚡ Approve & Auto-Send ${f2(o.usdt)} USDT`}</button>
+          <button class="btn ghost" id="ordGoPayouts">Open Payouts tab</button>
+        </div>
+      </div>` : ''}
       ${showQrAssign ? `<div class="cqr-box">
         <div>
           <b>${o.hasQr && o.qrExpiresAt > Date.now() ? 'CashQR Active on User Screen' : 'Assign CashQR to User'} · ₹${f2(o.inr)}</b>
@@ -273,10 +297,12 @@
       const rowP = o => {
         const isCqr = o.kind === 'buy' && o.method === 'cashqr';
         const timerAttr = isCqr && !o.utr ? (o.hasQr && o.qrExpiresAt > Date.now() ? ` data-cqr-t="${o.qrExpiresAt}"` : o.expiresAt ? ` data-cqr-t="${o.expiresAt}"` : '') : '';
+        const isWd = o.kind === 'withdraw' && o.sealOk && !o.payoutState;
         return `<div class="row" data-pid="${esc(o.id)}" style="cursor:pointer">
           <span class="t ${o.kind}">${isCqr ? 'CashQR' : TYPE[o.kind]}</span>
-          <span class="m"><b>#${esc(o.id)} · ${f2(o.usdt)} USDT${o.inr ? ' · ₹' + f2(o.inr) : ''}</b><small>${esc(o.user.uid)} · ${day(o.at)} ${clock(o.at)}${isCqr ? ' · <b>CashQR (ATM)</b>' : o.upi ? ' · UPI: <b>' + esc(o.upi) + '</b>' : ''}${o.kind === 'buy' ? (o.utr ? ' · UTR: <b>' + esc(o.utr) + '</b>' : isCqr ? (o.hasQr ? ' · QR sent to user' : ' · Waiting for you to assign QR') : ' · no UTR yet') : ''}</small></span>
+          <span class="m"><b>#${esc(o.id)} · ${f2(o.usdt)} USDT${o.inr ? ' · ₹' + f2(o.inr) : ''}</b><small>${esc(o.user.uid)} · ${day(o.at)} ${clock(o.at)}${isCqr ? ' · <b>CashQR (ATM)</b>' : o.upi ? ' · UPI: <b>' + esc(o.upi) + '</b>' : o.address ? ' · <span class="mono">' + esc(o.address.slice(0, 10) + '…' + o.address.slice(-6)) + '</span>' : ''}${o.kind === 'buy' ? (o.utr ? ' · UTR: <b>' + esc(o.utr) + '</b>' : isCqr ? (o.hasQr ? ' · QR sent to user' : ' · Waiting for you to assign QR') : ' · no UTR yet') : ''}</small></span>
           ${isCqr && !o.utr ? `<button type="button" class="btn ub-act" data-assign-pid="${esc(o.id)}">${o.hasQr ? 'Replace QR' : 'Assign QR'}</button>` : ''}
+          ${isWd ? `<button type="button" class="btn ub-act" data-send-pid="${esc(o.id)}">Approve &amp; Send</button>` : ''}
           <span class="badge ${o.utr ? 'success' : 'pending'}"${timerAttr}>${lbl(o)}</span>
         </div>`;
       };
@@ -307,9 +333,16 @@
       const o = (window._pending || []).find(x => x.id === b.dataset.assignPid);
       if (o) openAssignQrModal(o, () => pending());
     });
+    m.querySelectorAll('[data-send-pid]').forEach(b => b.onclick = e => {
+      e.stopPropagation();
+      const o = (window._pending || []).find(x => x.id === b.dataset.sendPid);
+      if (o) approveAndSendPayout(o, () => pending());
+    });
     m.querySelectorAll('[data-f]').forEach(b => b.onclick = () => { const [g, v] = b.dataset.f.split(':'); view[g] = v; renderUser(); });
     if ($('#eb', m)) $('#eb', m).onclick = editBalance; if ($('#susp', m)) $('#susp', m).onclick = suspend; if ($('#unsusp', m)) $('#unsusp', m).onclick = unsuspend; if ($('#setPw', m)) $('#setPw', m).onclick = resetPassword;
     if (order) {
+      if ($('#ordAutoSend', m)) $('#ordAutoSend', m).onclick = () => approveAndSendPayout(order, upd => showOrder(upd));
+      if ($('#ordGoPayouts', m)) $('#ordGoPayouts', m).onclick = () => payoutsPanel(true);
       if ($('#ordAssignQr', m)) $('#ordAssignQr', m).onclick = () => openAssignQrModal(order, upd => showOrder(upd));
       if ($('#ordScanQr', m) && $('#ordQrFile', m)) {
         $('#ordScanQr', m).onclick = () => $('#ordQrFile', m).click();
@@ -856,7 +889,180 @@
     });
   }, 1000);
 
+  // ---------- BSC Hot Wallet Payouts (Option 1: 1-Click Approve & Auto-Send) ----------
+  const inFlightPayouts = new Set();
+  async function approveAndSendPayout(order, afterFn) {
+    if (!order || inFlightPayouts.has(order.id)) return;
+    if (!order.sealOk) return toast(order.sealError || 'Integrity seal failed — cannot auto-send.', true);
+    const ok = await ask({
+      title: `Auto-Send ${f2(order.usdt)} USDT on BSC?`,
+      html: `<div class="kv" style="margin:10px 0">
+        <div><span>Order</span><b>#${esc(order.id)}</b></div>
+        <div><span>User</span><b>${esc(order.user.uid)}</b></div>
+        <div><span>Amount</span><b style="color:var(--success)">${f2(order.usdt)} USDT (BEP20)</b></div>
+        <div><span>To wallet</span><b class="mono">${esc(order.address)}</b></div>
+        <div><span>Security seal</span><b style="color:var(--success)">✓ Order + Ledger Verified</b></div>
+      </div><p class="mut">Your Hot Wallet will sign &amp; broadcast this BEP20 transfer, wait for BSC confirmation (~3–5s), fill in the transaction hash automatically, and mark this withdrawal <b>Success</b>.</p>`,
+      ok: `Send ${f2(order.usdt)} USDT Now`
+    });
+    if (!ok) return;
+    inFlightPayouts.add(order.id);
+    toast(`Sending ${f2(order.usdt)} USDT on BSC for #${order.id}…`);
+    try {
+      const res = await api(`/payouts/${encodeURIComponent(order.id)}/send`, {
+        method: 'POST',
+        body: { expectedUsdt: order.usdt, expectedAddress: order.address },
+      });
+      toast(`✓ Sent ${f2(order.usdt)} USDT! Tx: ${String(res.txHash || '').slice(0, 14)}…`);
+      loadSettings();
+      if (typeof afterFn === 'function') afterFn(res.order);
+      else payoutsPanel(true);
+    } catch (e) {
+      toast(e.message, true);
+      if (panelMode === 'payouts') payoutsPanel(false);
+      else if (panelMode === 'order' && openOrderId === order.id) {
+        api('/find?q=' + encodeURIComponent(order.id)).then(r => { if (r.kind === 'order') showOrder(r.order); }).catch(() => {});
+      }
+    } finally {
+      inFlightPayouts.delete(order.id);
+    }
+  }
+
+  async function payoutsPanel(forceRefresh = false) {
+    panelMode = 'payouts'; openOrderId = '';
+    try {
+      loadSettings();
+      const d = await api('/payouts' + (forceRefresh ? '?refresh=1' : ''));
+      const w = d.wallet || {};
+      const explorer = esc(w.explorer || 'https://bscscan.com');
+      const walletSetupBanner = !w.configured
+        ? `<div class="cqr-box" style="border-color:var(--accent)">
+            <div><b>Hot Wallet Not Configured Yet</b>
+              <small style="display:block;margin-top:4px">${w.keyInvalid ? '<span class="why">HOT_WALLET_PRIVATE_KEY in .env has an invalid format (must be 64 hex characters).</span>' : 'Add <b>HOT_WALLET_PRIVATE_KEY</b> (your dedicated MetaMask payout account key) to <b>.env</b> / Render Environment Variables and fund it with BEP20 USDT + ~$3 of Smart Chain BNB for gas.'}</small>
+            </div>
+          </div>`
+        : w.rpcError
+          ? `<div class="cqr-box" style="border-color:var(--error)"><div><b class="why">BSC RPC Warning</b><small style="display:block;margin-top:4px">${esc(w.rpcError)}</small></div></div>`
+          : '';
+
+      const pCard = o => {
+        const busy = o.payoutState === 'locked' || o.payoutState === 'broadcasted' || inFlightPayouts.has(o.id);
+        const sealBadge = o.sealOk
+          ? '<span class="active-badge">✓ Seal &amp; Ledger Verified</span>'
+          : '<span class="deact-badge">⚠ Tamper / Seal Mismatch</span>';
+        const stateBadge = o.payoutState === 'broadcasted'
+          ? '<span class="badge pending">Broadcasted on BSC</span>'
+          : o.timerEndsAt ? `<span class="badge pending" data-cqr-t="${o.timerEndsAt}">Processing · ${fmtRem(o.timerEndsAt)}</span>`
+          : '<span class="badge pending">Pending</span>';
+        return `<div class="cqr-card" style="${o.sealOk ? '' : 'border-color:var(--error)'}">
+          <div class="cqr-top">
+            <div>
+              <b>#${esc(o.id)} · ${f2(o.usdt)} USDT</b> <small>· BSC (BEP20)</small><br>
+              <small><button class="link" data-uid="${esc(o.user.uid)}">${esc(o.user.uid)}</button> · ${esc(o.user.email || o.user.phone || '')} · ${day(o.at)} ${clock(o.at)}</small>
+            </div>
+            <div style="display:flex;gap:6px;align-items:center;flex-wrap:wrap">${sealBadge}${stateBadge}</div>
+          </div>
+          <div class="mono" style="color:var(--text2)">To: <b style="color:var(--text)">${esc(o.address)}</b></div>
+          ${o.txid ? `<small class="mono">Tx: <a class="link" href="${explorer}/tx/${encodeURIComponent(o.txid)}" target="_blank" rel="noopener">${esc(o.txid)}</a></small>` : ''}
+          ${!o.sealOk ? `<small class="why"><b>Blocked:</b> ${esc(o.sealError || 'Cryptographic seal verification failed.')}</small>` : ''}
+          ${o.payoutError ? `<small class="why">${esc(o.payoutError)}</small>` : ''}
+          <div class="cqr-acts">
+            <button class="btn" data-pay-send="${esc(o.id)}" ${(!d.enabled || !w.configured || !o.sealOk || busy) ? 'disabled' : ''}>${o.payoutState === 'broadcasted' ? 'Waiting BSC confirmation…' : busy ? 'Sending on BSC…' : `⚡ Approve & Auto-Send ${f2(o.usdt)} USDT`}</button>
+            <button class="btn ghost" data-pay-open="${esc(o.id)}">Open / Manual</button>
+          </div>
+        </div>`;
+      };
+
+      const rRow = o => `<div class="row" data-pay-open="${esc(o.id)}" style="cursor:pointer">
+        <span class="t withdraw">Withdraw</span>
+        <span class="m">
+          <b>#${esc(o.id)} · ${f2(o.usdt)} USDT</b>
+          <small>${esc(o.user.uid)} · ${day(o.updatedAt)} ${clock(o.updatedAt)} · To <span class="mono">${esc(o.address ? o.address.slice(0, 10) + '…' + o.address.slice(-6) : '')}</span>${o.txid ? ` · Tx: <a class="link mono" data-stop-click="1" href="${explorer}/tx/${encodeURIComponent(o.txid)}" target="_blank" rel="noopener">${esc(o.txid.slice(0, 10))}…</a>` : ''}${o.reason ? ' · <span class="why">' + esc(o.reason) + '</span>' : ''}</small>
+        </span>
+        <span class="badge ${o.status}">${STAT[o.status]}</span>
+      </div>`;
+
+      $('#main').innerHTML = `
+        <div class="card">
+          <div class="head">
+            <div>
+              <h2>BSC Hot Wallet Payouts</h2>
+              <small>1-click approves, verifies cryptographic order &amp; ledger seals, sends BEP20 USDT on BNB Smart Chain, and saves the tx hash automatically</small>
+            </div>
+            <div style="display:flex;gap:8px;flex-wrap:wrap">
+              <button class="btn ${d.enabled ? '' : 'danger'}" id="payToggle">Payouts: ${d.enabled ? 'ON' : 'OFF'}</button>
+              <button class="btn ghost" id="payRefresh">Refresh Wallet</button>
+            </div>
+          </div>
+          ${walletSetupBanner}
+          <div class="hw-grid">
+            <div class="hw-stat">
+              <small class="mut">Hot Wallet Address (BEP20)</small>
+              ${w.address ? `<span class="mono" style="color:var(--text)">${esc(w.address)}</span><div style="display:flex;gap:10px;margin-top:4px"><button class="link" id="cpHwAddr" type="button">Copy address</button><a class="link" href="${explorer}/address/${encodeURIComponent(w.address)}" target="_blank" rel="noopener">View on BscScan ↗</a></div>` : '<span class="mut">Not configured (.env)</span>'}
+            </div>
+            <div class="hw-stat">
+              <small class="mut">Hot Wallet USDT</small>
+              <b style="color:var(--success)">${w.configured && w.usdt !== null ? f2(w.usdt) + ' USDT' : '—'}</b>
+              <small class="mut">Binance-Peg BSC-USD</small>
+            </div>
+            <div class="hw-stat">
+              <small class="mut">BNB Gas Balance</small>
+              <b style="color:${w.lowGas ? 'var(--error)' : 'var(--text)'}">${w.configured && w.bnb !== null ? Number(w.bnb).toFixed(5) + ' BNB' : '—'}</b>
+              <small class="${w.lowGas ? 'why' : 'mut'}">${w.lowGas ? '⚠ Low gas — top up Smart Chain BNB' : 'Used for BEP20 transfer fees'}</small>
+            </div>
+            <div class="hw-stat">
+              <small class="mut">Sent (Last 24h)</small>
+              <b>${f2(d.sent24hUsdt || 0)} USDT</b>
+              <small class="mut">${d.pending.length} pending in queue</small>
+            </div>
+          </div>
+          <h3 style="margin:20px 0 6px;font-size:16px">Pending Withdrawals (${d.pending.length})</h3>
+          <div class="cqr-list">${d.pending.length ? d.pending.map(pCard).join('') : '<p class="empty">No pending withdrawals right now.</p>'}</div>
+          ${d.recent.length ? `<h3 style="margin:22px 0 6px;font-size:15px">Recent Withdrawals &amp; Payout History</h3>${d.recent.map(rRow).join('')}` : ''}
+        </div>`;
+
+      window._payList = [...d.pending, ...d.recent];
+      const m = $('#main');
+      $('#payRefresh', m).onclick = () => payoutsPanel(true);
+      if ($('#cpHwAddr', m) && w.address) {
+        $('#cpHwAddr', m).onclick = e => {
+          navigator.clipboard && navigator.clipboard.writeText(w.address);
+          e.target.textContent = 'Copied!';
+          setTimeout(() => { e.target.textContent = 'Copy address'; }, 1400);
+        };
+      }
+      $('#payToggle', m).onclick = async () => {
+        const next = !d.enabled;
+        const r = await ask({
+          title: next ? 'Turn Hot Wallet Payouts ON?' : 'Lock Hot Wallet Payouts OFF?',
+          html: next
+            ? '<p>Re-enables 1-click BSC Hot Wallet payouts from the Admin Panel.</p>'
+            : '<p>Locks the Hot Wallet so no automatic BSC transfers can be sent until you turn it back ON with your admin key.</p>',
+          secret: { label: 'Enter admin key to confirm', placeholder: 'Admin key' },
+          ok: next ? 'Turn Payouts ON' : 'Lock Payouts OFF',
+          danger: !next
+        });
+        if (!r) return;
+        try {
+          const res = await api('/payouts/toggle', { method: 'POST', body: { enabled: next, adminKey: r.secret } });
+          toast(res.enabled ? 'Hot Wallet Payouts turned ON' : 'Hot Wallet Payouts locked OFF');
+          payoutsPanel(false);
+        } catch (e) { toast(e.message, true); }
+      };
+      m.querySelectorAll('[data-uid]').forEach(b => b.onclick = () => openUser(b.dataset.uid));
+      m.querySelectorAll('[data-stop-click]').forEach(a => a.onclick = e => e.stopPropagation());
+      m.querySelectorAll('[data-pay-send]').forEach(b => b.onclick = () => {
+        const o = window._payList.find(x => x.id === b.dataset.paySend);
+        if (o) approveAndSendPayout(o, () => payoutsPanel(true));
+      });
+      m.querySelectorAll('[data-pay-open]').forEach(b => b.onclick = () => {
+        const o = window._payList.find(x => x.id === b.dataset.payOpen);
+        if (o) showOrder(o);
+      });
+    } catch (e) { toast(e.message, true); }
+  }
+
   $('#nTrade').onclick = toggleTrade;
-  $('#nPending').onclick = pending; $('#nCashQr').onclick = cashQrPanel; $('#nUsers').onclick = () => { panelMode = 'users'; userbase(0); }; $('#nTxLog').onclick = () => { panelMode = 'txlog'; txLog(); }; $('#nNotifs').onclick = () => { panelMode = 'notifs'; pushNotifs(); }; $('#nAudit').onclick = () => { panelMode = 'audit'; auditLog(); }; $('#nBackup').onclick = backup; $('#nLock').onclick = lock;
+  $('#nPending').onclick = pending; $('#nPayouts').onclick = () => payoutsPanel(true); $('#nCashQr').onclick = cashQrPanel; $('#nUsers').onclick = () => { panelMode = 'users'; userbase(0); }; $('#nTxLog').onclick = () => { panelMode = 'txlog'; txLog(); }; $('#nNotifs').onclick = () => { panelMode = 'notifs'; pushNotifs(); }; $('#nAudit').onclick = () => { panelMode = 'audit'; auditLog(); }; $('#nBackup').onclick = backup; $('#nLock').onclick = lock;
   if (KEY) api('/ping').then(() => { $('#login').hidden = true; $('#panel').hidden = false; startAdminStream(); loadSettings(); pending(); }).catch(() => {});
 })();

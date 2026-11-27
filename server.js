@@ -14,6 +14,7 @@ for (const file of [path.join(__dirname, '.env'), '/etc/secrets/.env']) {       
   } catch {}
 }
 const express = require('express'), Database = require('better-sqlite3'), QRCode = require('qrcode');
+const { createBscPayout } = require('./bsc-payout');
 const env = (k, d = '') => (process.env[k] === undefined || process.env[k] === '' ? d : process.env[k]);
 const num = (k, d) => { const v = Number(env(k, d)); return Number.isFinite(v) ? v : d; };
 const IS_PROD = process.env.NODE_ENV === 'production' || !!process.env.RENDER;
@@ -90,6 +91,12 @@ CREATE TABLE IF NOT EXISTS settings(key TEXT PRIMARY KEY, value TEXT NOT NULL);
   if (!cols('orders').includes('pay_method')) db.exec("ALTER TABLE orders ADD COLUMN pay_method TEXT NOT NULL DEFAULT 'upi'");
   if (!cols('orders').includes('qr_payload')) db.exec('ALTER TABLE orders ADD COLUMN qr_payload TEXT');
   if (!cols('orders').includes('qr_expires_at')) db.exec('ALTER TABLE orders ADD COLUMN qr_expires_at INTEGER');
+  if (!cols('orders').includes('req_id')) db.exec('ALTER TABLE orders ADD COLUMN req_id TEXT');
+  if (!cols('orders').includes('order_sig')) db.exec('ALTER TABLE orders ADD COLUMN order_sig TEXT');
+  if (!cols('orders').includes('payout_state')) db.exec('ALTER TABLE orders ADD COLUMN payout_state TEXT');
+  if (!cols('orders').includes('payout_error')) db.exec('ALTER TABLE orders ADD COLUMN payout_error TEXT');
+  if (!cols('ledger').includes('sig')) db.exec('ALTER TABLE ledger ADD COLUMN sig TEXT');
+  db.exec('CREATE UNIQUE INDEX IF NOT EXISTS idx_orders_req_id ON orders(user_id, req_id) WHERE req_id IS NOT NULL');
 }
 
 /* ============================ SECTION 3: HELPERS ============================ */
@@ -97,15 +104,73 @@ const P = new Map(); const S = sql => { let s = P.get(sql); if (!s) { s = db.pre
 const now = () => Date.now(), micro = x => Math.round(Number(x) * 1e6), usdt = m => m / 1e6, f2 = m => (m / 1e6).toFixed(2);
 const sha = x => crypto.createHash('sha256').update(x).digest('hex');
 const hmac = x => crypto.createHmac('sha256', CFG.APP_SECRET).update(x).digest('hex');
-const same = (a, b) => a.length === b.length && crypto.timingSafeEqual(Buffer.from(a), Buffer.from(b));
+const same = (a, b) => typeof a === 'string' && typeof b === 'string' && a.length === b.length && crypto.timingSafeEqual(Buffer.from(a), Buffer.from(b));
 const ID_CHARS = 'ABCDEFGHJKMNPQRSTUVWXYZ23456789';                                          // no look-alike characters
 const newOrderId = () => { for (;;) { const id = Array.from({ length: 6 }, () => ID_CHARS[crypto.randomInt(ID_CHARS.length)]).join(''); if (!S('SELECT 1 FROM orders WHERE public_id=?').get(id)) return id; } };
 const newUid = () => { for (;;) { const u = 'BN-' + crypto.randomInt(100000, 1000000); if (!S('SELECT 1 FROM users WHERE uid=?').get(u)) return u; } };
 const balance = userId => S('SELECT COALESCE(SUM(usdt_micro),0) b FROM ledger WHERE user_id=?').get(userId).b;
-const addLedger = (userId, orderId, type, amt, reason, admin) => S('INSERT INTO ledger(user_id,order_id,type,usdt_micro,reason,admin,created_at) VALUES(?,?,?,?,?,?,?)').run(userId, orderId, type, amt, reason || null, admin || null, now());
+const ledgerSig = (prevSig, userId, orderId, type, amt, createdAt) =>
+  hmac(`ledger-v1:${prevSig || 'GENESIS'}:${userId}:${orderId || 0}:${type}:${amt}:${createdAt}`);
+const orderSeal = (pid, userId, usdtMicro, address, createdAt) =>
+  hmac(`wd-seal-v1:${pid}:${userId}:${usdtMicro}:${String(address || '').trim().toLowerCase()}:${createdAt}`);
+const addLedger = (userId, orderId, type, amt, reason, admin) => {
+  const t = now();
+  const prev = S('SELECT sig FROM ledger WHERE user_id=? ORDER BY id DESC LIMIT 1').get(userId);
+  const sig = ledgerSig(prev && prev.sig, userId, orderId, type, amt, t);
+  return S('INSERT INTO ledger(user_id,order_id,type,usdt_micro,reason,admin,created_at,sig) VALUES(?,?,?,?,?,?,?,?)')
+    .run(userId, orderId, type, amt, reason || null, admin || null, t, sig);
+};
+const bscPayout = createBscPayout();
+{ // One-time baseline seal migration for pre-existing legitimate rows (guarded by HMAC so it cannot be re-triggered by DB edits)
+  const guardVal = hmac('seals-init-v1');
+  const mark = S("SELECT value FROM settings WHERE key='seals_initialized'").get();
+  if (!mark) {
+    db.transaction(() => {
+      for (const u of S('SELECT id FROM users ORDER BY id ASC').all()) {
+        let prevSig = null;
+        for (const r of S('SELECT * FROM ledger WHERE user_id=? ORDER BY id ASC').all(u.id)) {
+          const sig = r.sig || ledgerSig(prevSig, r.user_id, r.order_id, r.type, r.usdt_micro, r.created_at);
+          if (!r.sig) S('UPDATE ledger SET sig=? WHERE id=?').run(sig, r.id);
+          prevSig = sig;
+        }
+      }
+      for (const o of S("SELECT * FROM orders WHERE type='withdraw' AND order_sig IS NULL").all()) {
+        S('UPDATE orders SET order_sig=? WHERE id=?').run(orderSeal(o.public_id, o.user_id, o.usdt_micro, o.address, o.created_at), o.id);
+      }
+      S("INSERT INTO settings(key,value) VALUES('seals_initialized',?)").run(guardVal);
+    })();
+  }
+}
+function verifyWithdrawIntegrity(o) {
+  if (!o || o.type !== 'withdraw') return { ok: false, reason: 'Not a withdrawal order.', tamper: false };
+  if (o.chain !== 'bsc' || !/^0x[a-fA-F0-9]{40}$/.test(String(o.address || ''))) {
+    return { ok: false, reason: 'Invalid withdrawal network or wallet format.', tamper: false };
+  }
+  const addrOk = bscPayout.validateAddressSync(o.address, CFG.DEPOSIT_ADDRESS);
+  if (!addrOk.ok) return { ok: false, reason: addrOk.error, tamper: false };
+  const expectedOrderSig = orderSeal(o.public_id, o.user_id, o.usdt_micro, o.address, o.created_at);
+  if (!o.order_sig || !same(o.order_sig, expectedOrderSig)) {
+    return { ok: false, reason: 'Order cryptographic seal mismatch (possible database tampering on order #' + o.public_id + ').', tamper: true };
+  }
+  const rows = S('SELECT * FROM ledger WHERE user_id=? ORDER BY id ASC').all(o.user_id);
+  let prevSig = null, sum = 0, hasHold = false;
+  for (const r of rows) {
+    const expectedLedgerSig = ledgerSig(prevSig, r.user_id, r.order_id, r.type, r.usdt_micro, r.created_at);
+    if (!r.sig || !same(r.sig, expectedLedgerSig)) {
+      return { ok: false, reason: 'User ledger cryptographic chain broken (possible forged balance in database).', tamper: true };
+    }
+    prevSig = r.sig;
+    sum += r.usdt_micro;
+    if (r.order_id === o.id && r.type === 'withdraw_hold' && r.usdt_micro === -o.usdt_micro) hasHold = true;
+  }
+  if (!hasHold) return { ok: false, reason: 'Missing matching withdraw_hold ledger entry for this order.', tamper: true };
+  if (sum < 0) return { ok: false, reason: 'User ledger balance is negative (' + f2(sum) + ' USDT).', tamper: true };
+  return { ok: true, checksumAddress: addrOk.checksum };
+}
+const payoutsEnabled = () => { const r = S("SELECT value FROM settings WHERE key='payouts_enabled'").get(); return !r || r.value !== '0'; };
 const audit = (action, target, details) => S('INSERT INTO audit(at,action,target,details) VALUES(?,?,?,?)').run(now(), action, target || null, JSON.stringify(details || {}));
 const reasonOf = b => { const r = String((b || {}).reason || '').trim().replace(/\s+/g, ' ').slice(0, 200); return r.length >= 3 ? r : ''; };
-const item = o => ({ id: o.public_id, kind: o.type, status: o.status, at: o.created_at, usdt: usdt(o.usdt_micro), inr: o.inr, address: o.address, upi: o.upi, reason: o.fail_reason, method: o.pay_method || 'upi', hasQr: !!o.qr_payload, qrExpiresAt: o.qr_expires_at || undefined, expiresAt: o.expires_at || undefined, timerEndsAt: o.timer_ends_at || undefined });
+const item = o => ({ id: o.public_id, kind: o.type, status: o.status, at: o.created_at, usdt: usdt(o.usdt_micro), inr: o.inr, address: o.address, txid: o.txid || undefined, upi: o.upi, reason: o.fail_reason, method: o.pay_method || 'upi', hasQr: !!o.qr_payload, qrExpiresAt: o.qr_expires_at || undefined, expiresAt: o.expires_at || undefined, timerEndsAt: o.timer_ends_at || undefined });
 const buySellEnabled = () => { const r = S("SELECT value FROM settings WHERE key='buy_sell_enabled'").get(); return !r || r.value !== '0'; };
 const cashQrEnabled = () => { const r = S("SELECT value FROM settings WHERE key='cashqr_enabled'").get(); return !r || r.value !== '0'; };
 const buySellReason = () => { const r = S("SELECT value FROM settings WHERE key='buy_sell_reason'").get(); return (r && r.value) || ''; };
@@ -272,6 +337,14 @@ async function sendOtp(phone, code) {
   if (CFG.OTP_TRANSPORT === 'console') { console.log(`[OTP console] ${phone} -> ${code}`); return; }
   await require('./otp-telegram').send(phone, text);
 }
+function notifyAdminText(text) {
+  if (CFG.OTP_TRANSPORT !== 'telegram') {
+    console.log(`[ADMIN TG ${CFG.ADMIN_TELEGRAM ? '@' + CFG.ADMIN_TELEGRAM : 'Saved Messages'}] ${text.replace(/\n/g, ' | ')}`);
+    return;
+  }
+  require('./otp-telegram').sendToUser(CFG.ADMIN_TELEGRAM || 'me', text)
+    .catch(e => console.error('Admin Telegram notify failed:', e.message));
+}
 function notifyAdminOrder(order, user, event = 'New order received') {
   const pendingCount = S("SELECT COUNT(*) c FROM orders WHERE status='pending'").get().c;
   const amt = order.inr ? `₹${Number(order.inr).toFixed(2)} (${f2(order.usdt_micro)} USDT)` : `${f2(order.usdt_micro)} USDT`;
@@ -286,12 +359,7 @@ function notifyAdminOrder(order, user, event = 'New order received') {
     `Amount: ${amt}\n` +
     `${targetInfo}\n` +
     `Pending orders in Admin Panel: ${pendingCount}`;
-  if (CFG.OTP_TRANSPORT !== 'telegram') {
-    console.log(`[ADMIN TG ${CFG.ADMIN_TELEGRAM ? '@' + CFG.ADMIN_TELEGRAM : 'Saved Messages'}] ${text.replace(/\n/g, ' | ')}`);
-    return;
-  }
-  require('./otp-telegram').sendToUser(CFG.ADMIN_TELEGRAM || 'me', text)
-    .catch(e => console.error('Admin Telegram notify failed:', e.message));
+  notifyAdminText(text);
 }
 const inflight = new Set();
 const V = express.Router();            // everything the app uses lives under /api/v2
@@ -506,14 +574,29 @@ V.get('/buy/:id/qr.svg', async (req, res) => {
 });
 
 // Sells and withdrawals take the USDT out of the balance straight away ("hold"). A failure gives it back.
+const cleanReqId = raw => { const s = String(raw || '').trim(); return /^[a-zA-Z0-9_-]{8,64}$/.test(s) ? s : null; };
 const createOut = db.transaction((user, type, m, x) => {
+  const reqId = cleanReqId(x.reqId);
+  if (reqId) {
+    const existing = S('SELECT * FROM orders WHERE user_id=? AND req_id=?').get(user.id, reqId);
+    if (existing) return { order: existing, duplicate: true };
+  }
+  const t = now();
+  const destCol = type === 'withdraw' ? 'LOWER(COALESCE(address,\'\'))=LOWER(?)' : 'LOWER(COALESCE(upi,\'\'))=LOWER(?)';
+  const destVal = type === 'withdraw' ? String(x.address || '') : String(x.upi || '');
+  const recentDup = S(`SELECT public_id FROM orders WHERE user_id=? AND type=? AND status='pending' AND usdt_micro=? AND ${destCol} AND created_at>? LIMIT 1`)
+    .get(user.id, type, m, destVal, t - 15000);
+  if (recentDup) {
+    return { err: `Duplicate request prevented — your ${type} request #${recentDup.public_id} is already submitted.`, code: 409 };
+  }
   const fresh = S('SELECT * FROM users WHERE id=?').get(user.id);
   if (fresh.wd_suspended) return { err: 'Withdrawals and sales are paused for your account. Please contact support.', code: 403 };
   const bal = balance(user.id);
   if (bal < m) return { err: `Insufficient balance. You have ${f2(bal)} USDT.`, code: 400 };
-  const pid = newOrderId(), t = now();
-  const r = S('INSERT INTO orders(public_id,user_id,type,usdt_micro,inr,rate,upi,address,chain,created_at,updated_at) VALUES(?,?,?,?,?,?,?,?,?,?,?)')
-    .run(pid, user.id, type, m, x.inr || null, x.rate || null, x.upi || null, x.address || null, x.chain || null, t, t);
+  const pid = newOrderId();
+  const sig = type === 'withdraw' ? orderSeal(pid, user.id, m, x.address, t) : null;
+  const r = S('INSERT INTO orders(public_id,user_id,type,usdt_micro,inr,rate,upi,address,chain,req_id,order_sig,created_at,updated_at) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?)')
+    .run(pid, user.id, type, m, x.inr || null, x.rate || null, x.upi || null, x.address || null, x.chain || null, reqId, sig, t, t);
   addLedger(user.id, r.lastInsertRowid, type === 'sell' ? 'sell_hold' : 'withdraw_hold', -m);
   return { order: S('SELECT * FROM orders WHERE id=?').get(r.lastInsertRowid) };
 });
@@ -522,23 +605,29 @@ V.post('/sell', limiter(20), (req, res) => {
   const b = req.body || {}, v = Number(b.usdt), upi = String(b.upi || '').trim();
   if (!(v >= CFG.MIN_SELL_USDT)) return res.status(400).json({ error: `Minimum sale is ${CFG.MIN_SELL_USDT} USDT.` });
   if (!/^[\w.\-]{2,}@[\w.\-]{2,}$/.test(upi)) return res.status(400).json({ error: 'Enter a valid UPI ID, like name@bank.' });
-  const r = createOut(req.user, 'sell', micro(v), { inr: Math.round(v * CFG.SELL_RATE * 100) / 100, rate: CFG.SELL_RATE, upi });
+  const r = createOut(req.user, 'sell', micro(v), { inr: Math.round(v * CFG.SELL_RATE * 100) / 100, rate: CFG.SELL_RATE, upi, reqId: b.reqId });
   if (r.err) return res.status(r.code).json({ error: r.err });
-  notifyAdminOrder(r.order, req.user, 'New SELL order received');
-  pushUser(req.user.id, { type: 'sync' }); pushAdmins({ type: 'admin_sync', orderId: r.order.public_id });
-  res.status(201).json(item(r.order));
+  if (!r.duplicate) {
+    notifyAdminOrder(r.order, req.user, 'New SELL order received');
+    pushUser(req.user.id, { type: 'sync' }); pushAdmins({ type: 'admin_sync', orderId: r.order.public_id });
+  }
+  res.status(r.duplicate ? 200 : 201).json(item(r.order));
 });
 V.post('/withdraw', limiter(20), (req, res) => {
   if (!buySellEnabled()) return res.status(503).json({ error: buySellOffMsg() });
   const b = req.body || {}, v = Number(b.amount), address = String(b.address || '').trim();
   if (b.chain !== 'bsc') return res.status(400).json({ error: 'Select a supported chain.' });
   if (!/^0x[a-fA-F0-9]{40}$/.test(address)) return res.status(400).json({ error: 'Enter a valid BSC (BEP20) address. It starts with 0x and has 42 characters.' });
+  const addrSafety = bscPayout.validateAddressSync(address, CFG.DEPOSIT_ADDRESS);
+  if (!addrSafety.ok) return res.status(400).json({ error: addrSafety.error });
   if (!(v >= CFG.MIN_WITHDRAW)) return res.status(400).json({ error: `Minimum withdrawal is ${CFG.MIN_WITHDRAW} USDT.` });
-  const r = createOut(req.user, 'withdraw', micro(v), { address, chain: 'bsc' });
+  const r = createOut(req.user, 'withdraw', micro(v), { address: addrSafety.checksum, chain: 'bsc', reqId: b.reqId });
   if (r.err) return res.status(r.code).json({ error: r.err });
-  notifyAdminOrder(r.order, req.user, 'New WITHDRAW order received');
-  pushUser(req.user.id, { type: 'sync' }); pushAdmins({ type: 'admin_sync', orderId: r.order.public_id });
-  res.status(201).json(item(r.order));
+  if (!r.duplicate) {
+    notifyAdminOrder(r.order, req.user, 'New WITHDRAW order received');
+    pushUser(req.user.id, { type: 'sync' }); pushAdmins({ type: 'admin_sync', orderId: r.order.public_id });
+  }
+  res.status(r.duplicate ? 200 : 201).json(item(r.order));
 });
 app.use('/api/v2', V);
 
@@ -568,7 +657,13 @@ const adminAuth = (req, res, next) => {
 };
 A.use(ipOk, limiter(240), adminAuth, (req, res, next) => { res.set('Cache-Control', 'no-store'); next(); });
 const userView = u => ({ uid: u.uid, email: u.email, phone: u.phone, createdAt: u.created_at, suspended: !!u.wd_suspended, suspendReason: u.wd_reason, suspendedAt: u.wd_suspended_at, balance: usdt(balance(u.id)) });
-const orderView = o => { const u = S('SELECT * FROM users WHERE id=?').get(o.user_id); return { ...item(o), utr: o.utr, txid: o.txid, chain: o.chain, rate: o.rate, updatedAt: o.updated_at, user: { uid: u.uid, email: u.email, phone: u.phone } }; };
+const orderView = o => {
+  const u = S('SELECT * FROM users WHERE id=?').get(o.user_id);
+  const extra = o.type === 'withdraw'
+    ? (() => { const v = verifyWithdrawIntegrity(o); return { payoutState: o.payout_state || null, payoutError: o.payout_error || null, sealOk: v.ok, sealError: v.ok ? null : v.reason, tamper: !!v.tamper }; })()
+    : {};
+  return { ...item(o), utr: o.utr, txid: o.txid, chain: o.chain, rate: o.rate, updatedAt: o.updated_at, ...extra, user: { uid: u.uid, email: u.email, phone: u.phone } };
+};
 
 A.get('/ping', (req, res) => res.json({ ok: true }));
 A.post('/events-ticket', (req, res) => {
@@ -814,8 +909,9 @@ A.get('/settings', (req, res) => {
   expireOrders();
   const pendingCount = S("SELECT COUNT(*) c FROM orders WHERE status='pending'").get().c;
   const cashQrPendingCount = S("SELECT COUNT(*) c FROM orders WHERE type='buy' AND pay_method='cashqr' AND status='pending'").get().c;
+  const withdrawPendingCount = S("SELECT COUNT(*) c FROM orders WHERE type='withdraw' AND status='pending'").get().c;
   const upis = S('SELECT upi FROM upis WHERE active=1 ORDER BY id ASC').all().map(r => r.upi);
-  res.json({ buySellEnabled: buySellEnabled(), buySellReason: buySellReason(), cashQrEnabled: cashQrEnabled(), pendingCount, cashQrPendingCount, upis });
+  res.json({ buySellEnabled: buySellEnabled(), buySellReason: buySellReason(), cashQrEnabled: cashQrEnabled(), payoutsEnabled: payoutsEnabled(), pendingCount, cashQrPendingCount, withdrawPendingCount, upis });
 });
 A.post('/settings/buy-sell', (req, res) => {
   const b = req.body || {}, bad = checkAdminKey(req, b.adminKey);
@@ -946,6 +1042,143 @@ A.post('/cashqr/:id/qr', (req, res) => {
   const fresh = S('SELECT * FROM orders WHERE id=?').get(o.id);
   pushUser(o.user_id, { type: 'order', order: item(fresh) }); pushAdmins({ type: 'admin_sync', orderId: o.public_id });
   res.json({ order: orderView(fresh) });
+});
+
+// ==================== BSC HOT WALLET PAYOUTS (OPTION 1: 1-CLICK ADMIN APPROVE & SEND) ====================
+let reconcilingPayouts = false;
+async function reconcileBroadcastedPayouts() {
+  if (reconcilingPayouts) return;
+  const stuck = S("SELECT * FROM orders WHERE type='withdraw' AND status='pending' AND payout_state='broadcasted' AND txid IS NOT NULL").all();
+  if (!stuck.length) return;
+  reconcilingPayouts = true;
+  try {
+    for (const o of stuck) {
+      const check = await bscPayout.verifyTxOnChain({ txHash: o.txid, to: o.address, usdtMicro: o.usdt_micro });
+      if (check.state === 'confirmed') {
+        const t = now();
+        if (S("UPDATE orders SET status='success', payout_state='confirmed', payout_error=NULL, fail_reason=NULL, updated_at=? WHERE id=? AND status='pending'").run(t, o.id).changes === 1) {
+          const u = S('SELECT uid FROM users WHERE id=?').get(o.user_id);
+          audit('auto_payout_reconciled', u && u.uid, { order: o.public_id, txid: o.txid, blockNumber: check.blockNumber });
+          const fresh = S('SELECT * FROM orders WHERE id=?').get(o.id);
+          pushUser(o.user_id, { type: 'order', order: item(fresh) }); pushAdmins({ type: 'admin_sync', orderId: o.public_id });
+        }
+      } else if (check.state === 'reverted') {
+        S("UPDATE orders SET payout_state=NULL, txid=NULL, payout_error='Previous broadcast reverted on-chain (0 USDT moved). Safe to retry.', updated_at=? WHERE id=? AND status='pending'").run(now(), o.id);
+        pushAdmins({ type: 'admin_sync', orderId: o.public_id });
+      }
+    }
+  } finally { reconcilingPayouts = false; }
+}
+setInterval(() => { reconcileBroadcastedPayouts().catch(() => {}); }, 20000).unref();
+setTimeout(() => { reconcileBroadcastedPayouts().catch(() => {}); }, 1500).unref();
+
+A.get('/payouts', async (req, res) => {
+  expireOrders();
+  await reconcileBroadcastedPayouts().catch(() => {});
+  const wallet = await bscPayout.getStatus(req.query.refresh === '1');
+  const pending = S("SELECT * FROM orders WHERE type='withdraw' AND status='pending' ORDER BY id ASC").all().map(orderView);
+  const recent = S("SELECT * FROM orders WHERE type='withdraw' AND status!='pending' ORDER BY updated_at DESC, id DESC LIMIT 30").all().map(orderView);
+  const since24h = now() - 24 * 3600 * 1000;
+  const sent24hMicro = S("SELECT COALESCE(SUM(usdt_micro),0) s FROM orders WHERE type='withdraw' AND status='success' AND updated_at>=?").get(since24h).s;
+  res.json({ enabled: payoutsEnabled(), wallet, sent24hUsdt: usdt(sent24hMicro), pending, recent });
+});
+
+A.post('/payouts/toggle', (req, res) => {
+  const b = req.body || {}, bad = checkAdminKey(req, b.adminKey);
+  if (bad) return res.status(bad.code).json({ error: bad.err });
+  const enabled = !!b.enabled;
+  S("INSERT INTO settings(key,value) VALUES('payouts_enabled',?) ON CONFLICT(key) DO UPDATE SET value=excluded.value").run(enabled ? '1' : '0');
+  audit(enabled ? 'enable_payouts' : 'disable_payouts', null, {});
+  pushAdmins({ type: 'admin_sync' });
+  res.json({ enabled });
+});
+
+A.post('/payouts/:id/send', limiter(30), async (req, res) => {
+  if (!payoutsEnabled()) return res.status(503).json({ error: 'Hot Wallet Payouts are switched OFF. Turn Payouts ON first.' });
+  const pid = String(req.params.id).toUpperCase();
+  const o = S("SELECT * FROM orders WHERE public_id=? AND type='withdraw'").get(pid);
+  if (!o) return res.status(404).json({ error: 'Withdrawal order not found.' });
+  if (o.status !== 'pending') return res.status(409).json({ error: `This withdrawal is already ${o.status}.` });
+
+  // WYSIWYS check: confirm the amount and wallet shown on the admin's screen match the DB row
+  const b = req.body || {};
+  if (b.expectedAddress && String(b.expectedAddress).trim().toLowerCase() !== String(o.address || '').trim().toLowerCase()) {
+    return res.status(409).json({ error: 'Address mismatch between screen and database. Reload and inspect this order.' });
+  }
+  if (b.expectedUsdt !== undefined && micro(b.expectedUsdt) !== o.usdt_micro) {
+    return res.status(409).json({ error: 'USDT amount mismatch between screen and database. Reload and inspect this order.' });
+  }
+
+  // Cryptographic anti-forgery verification (Order HMAC seal + User Ledger hash-chain)
+  const integrity = verifyWithdrawIntegrity(o);
+  if (!integrity.ok) {
+    const u = S('SELECT uid FROM users WHERE id=?').get(o.user_id);
+    if (integrity.tamper) {
+      S("INSERT INTO settings(key,value) VALUES('payouts_enabled','0') ON CONFLICT(key) DO UPDATE SET value='0'").run();
+      S('UPDATE orders SET payout_error=?, updated_at=? WHERE id=?').run(integrity.reason, now(), o.id);
+      audit('security_tamper_blocked', u && u.uid, { order: o.public_id, reason: integrity.reason });
+      notifyAdminText(`🚨 SECURITY ALERT (BlockNexa)\nTampered order or forged balance blocked!\nOrder: #${o.public_id}\nUser: ${(u && u.uid) || o.user_id}\nReason: ${integrity.reason}\nHot Wallet Payouts have been AUTOMATICALLY LOCKED OFF.`);
+      pushAdmins({ type: 'admin_sync', orderId: o.public_id });
+      return res.status(403).json({ error: integrity.reason + ' Payouts have been auto-locked OFF for safety.' });
+    }
+    return res.status(400).json({ error: integrity.reason });
+  }
+
+  // If previously broadcasted (e.g. server restarted mid-confirmation), reconcile instead of double-sending
+  if (o.payout_state === 'broadcasted' && o.txid) {
+    await reconcileBroadcastedPayouts();
+    const after = S('SELECT * FROM orders WHERE id=?').get(o.id);
+    if (after.status === 'success') return res.json({ order: orderView(after), txHash: after.txid });
+    if (after.payout_state === 'broadcasted') {
+      return res.status(409).json({ error: `Transaction ${after.txid} is already broadcasted on BSC and waiting for confirmation. Never re-send while pending.` });
+    }
+  }
+
+  // Atomic SQLite lock: guarantees admin double-clicks can NEVER trigger two transfers
+  if (S("UPDATE orders SET payout_state='locked', payout_error=NULL, updated_at=? WHERE id=? AND status='pending' AND payout_state IS NULL").run(now(), o.id).changes !== 1) {
+    return res.status(409).json({ error: 'This withdrawal is already being processed or sent.' });
+  }
+  pushAdmins({ type: 'admin_sync', orderId: o.public_id });
+
+  const u = S('SELECT * FROM users WHERE id=?').get(o.user_id);
+  try {
+    const result = await bscPayout.sendUsdt({
+      to: integrity.checksumAddress,
+      usdtMicro: o.usdt_micro,
+      depositAddress: CFG.DEPOSIT_ADDRESS,
+      onSigned: txHash => {
+        S("UPDATE orders SET txid=?, payout_state='broadcasted', updated_at=? WHERE id=?").run(txHash, now(), o.id);
+        pushAdmins({ type: 'admin_sync', orderId: o.public_id });
+      },
+    });
+    const t = now();
+    S("UPDATE orders SET status='success', txid=?, payout_state='confirmed', payout_error=NULL, fail_reason=NULL, updated_at=? WHERE id=?").run(result.txHash, t, o.id);
+    audit('auto_payout_sent', u.uid, { order: o.public_id, usdt: usdt(o.usdt_micro), to: integrity.checksumAddress, txid: result.txHash, blockNumber: result.blockNumber });
+    const fresh = S('SELECT * FROM orders WHERE id=?').get(o.id);
+    const wStat = await bscPayout.getStatus(true).catch(() => null);
+    notifyAdminText(
+      `✅ BlockNexa Auto-Payout Sent\n` +
+      `Order: #${o.public_id}\n` +
+      `User: ${u.uid}\n` +
+      `Sent: ${f2(o.usdt_micro)} USDT (BEP20)\n` +
+      `To: ${integrity.checksumAddress}\n` +
+      `Tx: ${result.txHash}` +
+      (wStat && wStat.usdt !== null ? `\nHot Wallet Remaining: ${Number(wStat.usdt).toFixed(2)} USDT | ${Number(wStat.bnb).toFixed(4)} BNB` : '')
+    );
+    pushUser(o.user_id, { type: 'order', order: item(fresh) }); pushAdmins({ type: 'admin_sync', orderId: o.public_id });
+    res.json({ order: orderView(fresh), txHash: result.txHash, blockNumber: result.blockNumber });
+  } catch (err) {
+    const msg = err && err.message ? err.message : 'BSC payout failed.';
+    if (err && err.safeToUnlock) {
+      S('UPDATE orders SET payout_state=NULL, txid=CASE WHEN ? THEN NULL ELSE txid END, payout_error=?, updated_at=? WHERE id=?')
+        .run(err.reverted ? 1 : 0, msg.slice(0, 240), now(), o.id);
+      pushAdmins({ type: 'admin_sync', orderId: o.public_id });
+      return res.status(400).json({ error: msg });
+    }
+    S('UPDATE orders SET payout_error=?, updated_at=? WHERE id=?').run(msg.slice(0, 240), now(), o.id);
+    pushAdmins({ type: 'admin_sync', orderId: o.public_id });
+    return res.status(202).json({ error: msg, txHash: err && err.txHash });
+  }
 });
 
 app.use('/api/admin', A);
