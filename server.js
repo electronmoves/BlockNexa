@@ -170,7 +170,28 @@ function verifyWithdrawIntegrity(o) {
 const payoutsEnabled = () => { const r = S("SELECT value FROM settings WHERE key='payouts_enabled'").get(); return !r || r.value !== '0'; };
 const audit = (action, target, details) => S('INSERT INTO audit(at,action,target,details) VALUES(?,?,?,?)').run(now(), action, target || null, JSON.stringify(details || {}));
 const reasonOf = b => { const r = String((b || {}).reason || '').trim().replace(/\s+/g, ' ').slice(0, 200); return r.length >= 3 ? r : ''; };
-const item = o => ({ id: o.public_id, kind: o.type, status: o.status, at: o.created_at, usdt: usdt(o.usdt_micro), inr: o.inr, address: o.address, txid: o.txid || undefined, upi: o.upi, reason: o.fail_reason, method: o.pay_method || 'upi', hasQr: !!o.qr_payload, qrExpiresAt: o.qr_expires_at || undefined, expiresAt: o.expires_at || undefined, timerEndsAt: o.timer_ends_at || undefined });
+const item = o => ({
+  id: o.public_id,
+  kind: o.type,
+  status: o.status,
+  at: o.created_at,
+  updatedAt: o.updated_at || o.created_at,
+  usdt: usdt(o.usdt_micro),
+  inr: o.inr || undefined,
+  rate: o.rate || undefined,
+  address: o.address || undefined,
+  chain: o.chain || undefined,
+  txid: o.txid || undefined,
+  upi: o.upi || undefined,
+  utr: o.utr || undefined,
+  reason: o.fail_reason || undefined,
+  method: o.pay_method || 'upi',
+  hasQr: !!o.qr_payload,
+  qrExpiresAt: o.qr_expires_at || undefined,
+  expiresAt: o.expires_at || undefined,
+  timerEndsAt: o.timer_ends_at || undefined,
+  payoutState: o.payout_state === 'broadcasted' ? 'broadcasted' : undefined,
+});
 const buySellEnabled = () => { const r = S("SELECT value FROM settings WHERE key='buy_sell_enabled'").get(); return !r || r.value !== '0'; };
 const cashQrEnabled = () => { const r = S("SELECT value FROM settings WHERE key='cashqr_enabled'").get(); return !r || r.value !== '0'; };
 const buySellReason = () => { const r = S("SELECT value FROM settings WHERE key='buy_sell_reason'").get(); return (r && r.value) || ''; };
@@ -195,7 +216,7 @@ setInterval(() => {
 
 const expireOrders = () => {
   const t = now();
-  const c1 = S("UPDATE orders SET status='failed', fail_reason='Order expired after 5 minutes without approval.', updated_at=? WHERE type='buy' AND COALESCE(pay_method,'upi')='upi' AND status='pending' AND expires_at IS NOT NULL AND expires_at<=?").run(t, t).changes;
+  const c1 = S("UPDATE orders SET status='failed', fail_reason='Order expired after 5 minutes without payment.', updated_at=? WHERE type='buy' AND COALESCE(pay_method,'upi')='upi' AND utr IS NULL AND status='pending' AND expires_at IS NOT NULL AND expires_at<=?").run(t, t).changes;
   const c2 = S("UPDATE orders SET status='failed', fail_reason='CashQR request timed out after 5 minutes.', updated_at=? WHERE type='buy' AND pay_method='cashqr' AND qr_payload IS NULL AND status='pending' AND expires_at IS NOT NULL AND expires_at<=?").run(t, t).changes;
   const c3 = S("UPDATE orders SET status='failed', fail_reason='CashQR expired after 1 minute without payment.', updated_at=? WHERE type='buy' AND pay_method='cashqr' AND qr_payload IS NOT NULL AND utr IS NULL AND status='pending' AND qr_expires_at IS NOT NULL AND qr_expires_at<=?").run(t, t).changes;
   if (c1 + c2 + c3 > 0) { pushAllUsers({ type: 'sync' }); pushAdmins({ type: 'admin_sync' }); }
@@ -458,21 +479,29 @@ V.post('/auth/logout', (req, res) => {
 /* ============================ SECTION 5: USER API ============================ */
 V.use((req, res, next) => { res.set('Cache-Control', 'no-store'); next(); });
 V.get('/rates', (req, res) => res.json(ratesPayload()));
-V.use(['/me', '/home', '/events', '/account', '/balance', '/history', '/buy', '/sell', '/withdraw', '/deposit', '/notifications'], requireAuth);
+V.use(['/me', '/home', '/events', '/orders', '/account', '/balance', '/history', '/buy', '/sell', '/withdraw', '/deposit', '/notifications'], requireAuth);
 V.get('/me', (req, res) => res.json(me(req.user)));
 V.get('/home', (req, res) => {
   expireOrders();
-  const uid = req.user.id;
+  const uid = req.user.id, t = now();
   const rd = S('SELECT last_read_at FROM notification_reads WHERE user_id=?').get(uid);
   const lastRead = rd ? rd.last_read_at : 0;
   const nRows = S('SELECT id, user_id, title, message, created_at FROM notifications WHERE user_id IS NULL OR user_id=? ORDER BY id DESC LIMIT 50').all(uid);
   const nList = nRows.map(n => ({ id: n.id, title: n.title, message: n.message, at: n.created_at, personal: n.user_id !== null, unread: n.created_at > lastRead }));
+  const activeBuys = S("SELECT * FROM orders WHERE user_id=? AND type='buy' AND status='pending' AND utr IS NULL AND (expires_at IS NULL OR expires_at>?) ORDER BY id DESC LIMIT 5").all(uid, t).map(item);
   res.json({
     balance: { usdt: usdt(balance(uid)) },
     rates: ratesPayload(),
-    recent: S('SELECT * FROM orders WHERE user_id=? ORDER BY id DESC LIMIT 6').all(uid).map(item),
+    activeBuys,
+    recent: S('SELECT * FROM orders WHERE user_id=? ORDER BY id DESC LIMIT 8').all(uid).map(item),
     notifications: { unread: nList.filter(n => n.unread).length, list: nList }
   });
+});
+V.get('/orders/:id', (req, res) => {
+  expireOrders();
+  const o = S('SELECT * FROM orders WHERE public_id=? AND user_id=?').get(String(req.params.id).toUpperCase(), req.user.id);
+  if (!o) return res.status(404).json({ error: 'Order not found.' });
+  res.json(item(o));
 });
 V.get('/events', (req, res) => {
   sseHeaders(res);
@@ -555,9 +584,10 @@ V.post('/buy/:id/paid', limiter(20), (req, res) => {
   if (!/^\d{12}$/.test(utr)) return res.status(400).json({ error: 'Enter the 12-digit reference / UTR number from your payment app.' });
   try { if (S("UPDATE orders SET utr=?, updated_at=? WHERE id=? AND status='pending'").run(utr, now(), o.id).changes !== 1) return res.status(409).json({ error: 'This order is no longer waiting for payment.' }); }
   catch { return res.status(409).json({ error: 'This reference number was already used on another order.' }); }
-  notifyAdminOrder(S('SELECT * FROM orders WHERE id=?').get(o.id), req.user, o.pay_method === 'cashqr' ? 'Payment submitted for CashQR order' : 'UTR submitted for BUY order');
-  pushUser(req.user.id, { type: 'sync' }); pushAdmins({ type: 'admin_sync', orderId: o.public_id });
-  res.json({ ok: true });
+  const fresh = S('SELECT * FROM orders WHERE id=?').get(o.id);
+  notifyAdminOrder(fresh, req.user, o.pay_method === 'cashqr' ? 'Payment submitted for CashQR order' : 'UTR submitted for BUY order');
+  pushUser(req.user.id, { type: 'order', order: item(fresh) }); pushAdmins({ type: 'admin_sync', orderId: o.public_id });
+  res.json({ ok: true, order: item(fresh) });
 });
 V.get('/buy/:id/qr.svg', async (req, res) => {
   expireOrders();
@@ -750,13 +780,13 @@ A.post('/orders/:id/status', (req, res) => {
 A.post('/orders/:id/timer', (req, res) => {
   const pid = String(req.params.id).toUpperCase(), o = S('SELECT * FROM orders WHERE public_id=?').get(pid);
   if (!o) return res.status(404).json({ error: 'Order not found.' });
-  if (o.type !== 'withdraw' || o.status !== 'pending') return res.status(409).json({ error: 'Timer can only be set on pending withdrawals.' });
+  if (o.status !== 'pending') return res.status(409).json({ error: 'Timer can only be set on pending orders.' });
   const raw = (req.body || {}).minutes;
   const mins = raw === undefined ? 60 : Number(raw);
   if (!Number.isFinite(mins) || mins < 1 || mins > 1440) return res.status(400).json({ error: 'Enter a timer between 1 and 1440 minutes.' });
   const t = now(), endsAt = t + Math.round(mins * 60 * 1000);
   S('UPDATE orders SET timer_ends_at=?, updated_at=? WHERE id=?').run(endsAt, t, o.id);
-  audit('withdraw_timer_set', S('SELECT uid FROM users WHERE id=?').get(o.user_id).uid, { order: o.public_id, minutes: Math.round(mins * 100) / 100, endsAt });
+  audit('order_timer_set', S('SELECT uid FROM users WHERE id=?').get(o.user_id).uid, { order: o.public_id, type: o.type, minutes: Math.round(mins * 100) / 100, endsAt });
   const fresh = S('SELECT * FROM orders WHERE id=?').get(o.id);
   pushUser(o.user_id, { type: 'order', order: item(fresh) }); pushAdmins({ type: 'admin_sync', orderId: o.public_id });
   res.json({ order: orderView(fresh) });

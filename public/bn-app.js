@@ -104,7 +104,7 @@
 // Errors: HTTP 4xx with { error: "message the user can read" }
 (function () {
   const BN = window.BN, B = '/api/v2';
-  BN.state = { rates: null, balance: null, recent: null, notifications: null };
+  BN.state = { rates: null, balance: null, recent: null, activeBuys: null, notifications: null };
   async function req(method, path, body) {
     const r = await fetch(B + path, { method, cache: 'no-store', headers: body ? { 'Content-Type': 'application/json' } : {}, body: body ? JSON.stringify(body) : undefined, credentials: 'same-origin' });
     const d = await r.json().catch(() => ({}));
@@ -112,7 +112,7 @@
     if (!r.ok) { const e = new Error(d.error || 'Something went wrong. Please try again.'); e.status = r.status; throw e; }
     if (path === '/rates') BN.state.rates = d;
     else if (path === '/balance') BN.state.balance = d;
-    else if (path === '/home') { BN.state.balance = d.balance; BN.state.rates = d.rates; BN.state.recent = d.recent; BN.state.notifications = d.notifications; }
+    else if (path === '/home') { BN.state.balance = d.balance; BN.state.rates = d.rates; BN.state.recent = d.recent; BN.state.activeBuys = d.activeBuys || []; BN.state.notifications = d.notifications; }
     return d;
   }
   const live = {
@@ -124,8 +124,9 @@
     loginPassword: (phone, password) => req('POST', '/auth/login/password', { phone, password }),
     setPassword: b => req('POST', '/account/password', b),
     home: () => req('GET', '/home'),
+    order: id => req('GET', '/orders/' + encodeURIComponent(id)),
     rates: () => req('GET', '/rates'), balance: () => req('GET', '/balance'), history: t => req('GET', '/history/' + t),
-    buyCreate: (inr, method = 'upi') => req('POST', '/buy', { inr, method }), buyStatus: id => req('GET', '/buy/' + encodeURIComponent(id)), buyPaid: (id, utr) => req('POST', `/buy/${id}/paid`, { utr }),
+    buyCreate: (inr, method = 'upi') => req('POST', '/buy', { inr, method }), buyStatus: id => req('GET', '/buy/' + encodeURIComponent(id)), buyPaid: (id, utr) => req('POST', `/buy/${encodeURIComponent(id)}/paid`, { utr }),
     sellCreate: b => req('POST', '/sell', b), withdraw: b => req('POST', '/withdraw', { chain: 'bsc', ...b }), deposit: () => req('GET', '/deposit'),
     notifications: () => req('GET', '/notifications'), notificationsRead: () => req('POST', '/notifications/read')
   };
@@ -267,56 +268,89 @@
   const msg = e => e.message || 'Something went wrong. Please try again.';
   const sign = { buy: '+', sell: '−', withdraw: '−' };
 
+  const fmtClock = endsAt => {
+    const left = Math.max(0, Math.ceil((endsAt - Date.now()) / 1000));
+    if (left <= 0) return '00:00';
+    const h = Math.floor(left / 3600), m = Math.floor((left % 3600) / 60), s = left % 60;
+    const pad = n => String(n).padStart(2, '0');
+    return h > 0 ? `${h}:${pad(m)}:${pad(s)}` : `${pad(m)}:${pad(s)}`;
+  };
   const fmtLeft = endsAt => {
     const left = Math.max(0, Math.ceil((endsAt - Date.now()) / 1000));
-    if (left <= 0) return ' · finishing…';
-    const m = String(Math.floor(left / 60)).padStart(2, '0'), s = String(left % 60).padStart(2, '0');
-    return ` · ${m}:${s} left`;
+    return left <= 0 ? 'finishing…' : `${fmtClock(endsAt)} left`;
   };
   setInterval(() => {
     document.querySelectorAll('[data-ends]').forEach(el => { el.textContent = fmtLeft(+el.dataset.ends); });
+    document.querySelectorAll('[data-proc-clock]').forEach(el => {
+      const left = Math.max(0, Math.ceil((+el.dataset.procClock - Date.now()) / 1000));
+      el.textContent = left <= 0 ? 'Finishing…' : fmtClock(+el.dataset.procClock);
+    });
+    document.querySelectorAll('[data-buy-left]').forEach(el => {
+      const left = Math.max(0, Math.ceil((+el.dataset.buyLeft - Date.now()) / 1000));
+      el.textContent = left <= 0 ? 'Expired' : `${fmtClock(+el.dataset.buyLeft)} left`;
+    });
   }, 1000);
 
   function screen(root, title, body, back = '#/home') {
     root.innerHTML = `<div class="wrap"><div class="narrow"><div class="top"><a class="iconbtn" href="${back}" aria-label="Back">${icon('back')}</a><h2 class="ttl">${title}</h2><span style="width:42px"></span></div>${body}</div></div>`;
   }
   const makeReqId = () => (window.crypto && crypto.randomUUID ? crypto.randomUUID() : 'req_' + Date.now() + '_' + Math.random().toString(36).slice(2, 12));
+
+  function orderState(x) {
+    if (x.status === 'success') return { cls: 'ok', label: 'Success', isProc: false };
+    if (x.status === 'failed') return { cls: 'fail', label: 'Failed', isProc: false };
+    const isProc = !!(x.timerEndsAt || x.payoutState === 'broadcasted' || (x.kind === 'buy' && x.utr));
+    return isProc ? { cls: 'proc', label: 'Processing', isProc: true } : { cls: 'pend', label: 'Pending', isProc: false };
+  }
+  function badgeHtml(x) {
+    const st = orderState(x);
+    return `<span class="badge ${st.cls}">${st.isProc ? '<i class="pdot"></i>' : ''}${st.label}</span>`;
+  }
   function row(x, i = 0) {
     const k = KIND[x.kind];
-    let [c, l] = ST[x.status];
-    if (x.kind === 'withdraw' && x.status === 'pending') l = x.timerEndsAt ? 'Processing' : 'Pending';
-    if (x.kind === 'buy' && x.status === 'pending' && x.method === 'cashqr') l = x.hasQr ? 'QR Ready · Tap' : 'Getting QR · Tap';
-    const timerSpan = (x.status === 'pending' && x.kind === 'withdraw' && x.timerEndsAt)
-      ? `<span data-ends="${x.timerEndsAt}" style="color:var(--accent-soft);font-weight:600">${fmtLeft(x.timerEndsAt)}</span>` : '';
     const txSpan = (x.kind === 'withdraw' && x.txid) ? ` · Tx: ${esc(short(x.txid))}` : '';
-    const detail = x.kind === 'buy' ? (x.method === 'cashqr' ? `₹${fmt(x.inr)} · CashQR` : `₹${fmt(x.inr)} paid`) : x.kind === 'sell' ? `₹${fmt(x.inr)} to your UPI` : `to ${short(x.address)}${txSpan}${timerSpan}`;
-    const openAttr = x.kind === 'buy' && x.status === 'pending' ? ` data-open-buy="${esc(x.id)}" style="--i:${Math.min(i, 10)};cursor:pointer"` : ` style="--i:${Math.min(i, 10)}"`;
-    return `<div class="row"${openAttr}><span class="rico ${k.tone}">${icon(k.ic)}</span><div class="rmid"><b>${k.label} <small>#${esc(x.id)}</small></b>
-      <small>${when(x.at)} · ${detail}</small>${x.reason ? `<small class="why">Reason: ${esc(x.reason)}</small>` : ''}</div>
-      <div class="rend"><b>${sign[x.kind]}${fmt(x.usdt)} USDT</b><span class="badge ${c}">${l}</span></div></div>`;
-  }
-  function wireOpenBuy(root, list) {
-    root.querySelectorAll('[data-open-buy]').forEach(el => el.onclick = async () => {
-      try {
-        const fresh = await api().buyStatus(el.dataset.openBuy);
-        if (fresh.status !== 'pending') return toast(fresh.reason || `Order #${fresh.id} is ${fresh.status}`, fresh.status === 'failed');
-        fresh.method === 'cashqr' ? payCashQr(root, fresh) : pay(root, fresh);
-      } catch (e) {
-        const o = (list || []).find(x => x.id === el.dataset.openBuy);
-        if (o) o.method === 'cashqr' ? payCashQr(root, o) : pay(root, o);
+    let detail = '';
+    if (x.kind === 'buy') {
+      if (x.status === 'pending' && !x.utr) {
+        const expSpan = x.expiresAt ? ` · <span data-buy-left="${x.expiresAt}" style="color:var(--success);font-weight:700">${fmtClock(x.expiresAt)} left</span>` : '';
+        detail = x.method === 'cashqr'
+          ? `₹${fmt(x.inr)} · CashQR (${x.hasQr ? 'QR Ready — Tap to Pay' : 'Getting QR — Tap'})${expSpan}`
+          : `₹${fmt(x.inr)} · Tap for QR &amp; UTR${expSpan}`;
+      } else if (x.status === 'pending' && x.utr) {
+        detail = `₹${fmt(x.inr)} · UTR ${esc(x.utr)} · Verifying`;
+      } else {
+        detail = `₹${fmt(x.inr)}${x.method === 'cashqr' ? ' · CashQR' : ''}${x.utr ? ' · UTR ' + esc(x.utr) : ''}`;
       }
-    });
+    } else if (x.kind === 'sell') {
+      detail = `₹${fmt(x.inr)} to ${esc(x.upi || 'your UPI')}`;
+    } else {
+      detail = `to ${esc(short(x.address))}${txSpan}`;
+    }
+    const timerLine = (x.status === 'pending' && x.timerEndsAt)
+      ? `<small style="color:#93C5FD;font-weight:700">⏱ Processing · <span data-ends="${x.timerEndsAt}">${fmtLeft(x.timerEndsAt)}</span></small>` : '';
+    return `<a class="row tap" href="#/order/${esc(x.id)}" style="--i:${Math.min(i, 10)}"><span class="rico ${k.tone}">${icon(k.ic)}</span><div class="rmid"><b>${k.label} <small>#${esc(x.id)}</small></b>
+      <small>${when(x.at)} · ${detail}</small>${timerLine}${x.reason ? `<small class="why">Reason: ${esc(x.reason)}</small>` : ''}</div>
+      <div class="rend"><b>${sign[x.kind]}${fmt(x.usdt)} USDT</b>${badgeHtml(x)}</div></a>`;
   }
-  function done(root, title, text, rows, hist) {
-    screen(root, title, `<div class="card center"><div class="okmark">${icon('check')}${'<i class="pt"></i>'.repeat(8)}</div><h3 style="font:700 20px var(--display)">${esc(text)}</h3>
-      <div class="kv" style="text-align:left">${rows.map(r => `<div><span>${esc(r[0])}</span><b>${esc(r[1])}</b></div>`).join('')}</div>
-      <a class="btn" href="#/history/${hist}">View history</a><a class="btn ghost" href="#/home">Back to home</a></div>`);
+  function resumeBuyBanner(list) {
+    const active = (list || []).filter(o => o.kind === 'buy' && o.status === 'pending' && !o.utr && (!o.expiresAt || o.expiresAt > Date.now()));
+    if (!active.length) return '';
+    return active.map(o => `<div class="resume-card">
+      <div>
+        <b>Active Buy Order #${esc(o.id)} · ₹${fmt(o.inr)} (${fmt(o.usdt)} USDT)</b>
+        <small>${o.method === 'cashqr'
+          ? (o.hasQr ? 'Your CashQR is ready — scan &amp; submit UTR now' : 'Getting your CashQR — tap to open')
+          : 'Scan QR or submit your 12-digit UTR'}${o.expiresAt ? ` · <span data-buy-left="${o.expiresAt}" style="color:var(--success);font-weight:700">${fmtClock(o.expiresAt)} left</span>` : ''}</small>
+      </div>
+      <a class="resume-btn" href="#/order/${esc(o.id)}">${o.method === 'cashqr' && !o.hasQr ? 'Open Order →' : 'View QR &amp; Submit UTR →'}</a>
+    </div>`).join('');
   }
 
   let activeOrderHook = null, activeTradeSync = null;
 
   function paintHome(root, d) {
     const { balance: bal, rates: rt, recent: rec, notifications: notifs } = d;
+    const activeBuys = d.activeBuys || (rec || []).filter(o => o.kind === 'buy' && o.status === 'pending' && !o.utr);
     const q = (h, c, i, t) => `<a href="${h}" class="q ${c}"><span class="lk">${icon(i)}</span>${t}</a>`;
     const tile = (t, i, tone, n, s) => `<a class="tile lk tn-${tone}" href="#/history/${t}"><span class="rico ${tone}">${icon(i)}</span><b>${n}</b><small>${s}</small></a>`;
     const [whole, dec] = fmt(bal.usdt).split('.');
@@ -325,6 +359,7 @@
       <div class="top htop"><div class="brand"><span class="mark">${icon('cube')}</span>${esc(cfg.NAME)}</div>
         <span class="pill"><i class="dot"></i>Sell <b class="flash">₹${+rt.sell}</b> · Buy <b>₹${+rt.buy}</b></span>
         <div class="top-acts"><a class="iconbtn" href="#/notifications" aria-label="Notifications">${icon('bell')}${notifs.unread ? `<i class="nbadge">${notifs.unread > 9 ? '9+' : notifs.unread}</i>` : ''}</a><a class="iconbtn" href="#/support" aria-label="Support">${icon('help')}</a><a class="iconbtn" href="#/account" aria-label="Account">${icon('user')}</a></div></div>
+      ${resumeBuyBanner(activeBuys)}
       <div class="home"><section>
         <div class="wallet"><div class="wtop"><span class="lbl">Your balance</span><span class="chainpill"><i></i>USDT · BSC</span></div>
           <div class="big">${whole}<span class="dec">.${dec}</span><small>USDT</small></div>
@@ -339,7 +374,6 @@
         <a class="row lk tn-t" href="#/support" style="margin-top:0"><span class="rico t">${icon('help')}</span><div class="rmid"><b>Need help?</b><small>Contact support</small></div></a>
       </section></div></div>`;
     $('#commBtn', root).onclick = communitySoonAlert;
-    wireOpenBuy(root, rec);
     if (rt.buySellEnabled === false) {
       root.querySelectorAll('a[href="#/buy"], a[href="#/sell"], a[href="#/withdraw"]').forEach(a => a.onclick = e => { e.preventDefault(); buySellOffAlert(rt.buySellReason); });
     }
@@ -365,8 +399,19 @@
 
   async function buy(root) {
     activeOrderHook = null;
-    let rt = BN.state.rates || await api().rates();
-    if (BN.state.rates) api().rates().then(fresh => { if (activeTradeSync) activeTradeSync(fresh, false); }).catch(() => {});
+    let rt = BN.state.rates;
+    let activeBuys = BN.state.activeBuys;
+    if (!rt || !activeBuys) {
+      const hm = await api().home();
+      rt = hm.rates; activeBuys = hm.activeBuys || [];
+    } else {
+      api().home().then(hm => {
+        activeBuys = hm.activeBuys || [];
+        const slot = $('#buyResumeSlot', root);
+        if (slot) slot.innerHTML = resumeBuyBanner(activeBuys);
+        if (activeTradeSync) activeTradeSync(hm.rates, false);
+      }).catch(() => {});
+    }
     const renderBuyForm = (showOffPopup) => {
       const min = Math.ceil(rt.minBuyUsdt * rt.buy);
       if (rt.buySellEnabled === false) {
@@ -376,7 +421,7 @@
       }
       const cMin = rt.minCashQrInr || 2000, cMax = rt.maxCashQrInr || 10000, cStep = rt.cashQrStep || 500;
       let method = 'upi';
-      screen(root, 'Buy USDT', `<div class="card">
+      screen(root, 'Buy USDT', `<div id="buyResumeSlot">${resumeBuyBanner(activeBuys)}</div><div class="card">
         <div class="pm-tabs" role="tablist">
           <button type="button" class="pm on" data-m="upi"><b>UPI</b><small>₹${fmt(min, 0)}–₹${fmt(rt.maxBuyInr, 0)}</small></button>
           <button type="button" class="pm ${rt.cashQrEnabled === false ? 'off' : ''}" data-m="cashqr" id="pmCashQr"><b>CashQR</b><small id="pmCashQrSub">${rt.cashQrEnabled === false ? 'Unavailable' : `₹${fmt(cMin, 0)}–₹${fmt(cMax, 0)}`}</small></button>
@@ -426,13 +471,13 @@
           if (!await ask({ title: 'Confirm CashQR order', rows: [['Method', 'CashQR'], ['You pay', '₹' + fmt(v)], ['You receive', fmt(v / rt.buy, 4) + ' USDT'], ['Rate', '₹' + rt.buy + ' per USDT']], note: 'Step 1 gets your QR (up to 5 min). Once the QR appears, you have 1 minute to scan & pay.', ok: 'Request CashQR' })) return;
           if (rt.buySellEnabled === false) { renderBuyForm(true); return; }
           e.target.disabled = true;
-          try { activeTradeSync = null; payCashQr(root, await api().buyCreate(v, 'cashqr')); } catch (x) { err.textContent = msg(x); e.target.disabled = false; }
+          try { activeTradeSync = null; const created = await api().buyCreate(v, 'cashqr'); location.hash = '#/order/' + created.id; } catch (x) { err.textContent = msg(x); e.target.disabled = false; }
         } else {
           if (!Number.isInteger(v) || v < min || v > rt.maxBuyInr) return err.textContent = `Enter a whole amount between ₹${fmt(min, 0)} and ₹${fmt(rt.maxBuyInr, 0)}.`;
-          if (!await ask({ title: 'Confirm your order', rows: [['You pay', '₹' + fmt(v)], ['You receive', fmt(v / rt.buy, 4) + ' USDT'], ['Rate', '₹' + rt.buy + ' per USDT']], note: 'Next you get a UPI QR code. Pay exactly this amount.', ok: 'Place order' })) return;
+          if (!await ask({ title: 'Confirm your order', rows: [['You pay', '₹' + fmt(v)], ['You receive', fmt(v / rt.buy, 4) + ' USDT'], ['Rate', '₹' + rt.buy + ' per USDT']], note: 'Next you get a UPI QR code (valid for 5 minutes). Even if you close the site to pay, come back here to view the QR and submit your UTR.', ok: 'Place order' })) return;
           if (rt.buySellEnabled === false) { renderBuyForm(true); return; }
           e.target.disabled = true;
-          try { activeTradeSync = null; pay(root, await api().buyCreate(v, 'upi')); } catch (x) { err.textContent = msg(x); e.target.disabled = false; }
+          try { activeTradeSync = null; const created = await api().buyCreate(v, 'upi'); location.hash = '#/order/' + created.id; } catch (x) { err.textContent = msg(x); e.target.disabled = false; }
         }
       };
     };
@@ -452,131 +497,238 @@
     };
     renderBuyForm(rt.buySellEnabled === false);
   }
-  function payCashQr(root, o) {
-    let cur = o, pollIv = null, tickIv = null;
-    const stop = () => { clearInterval(pollIv); clearInterval(tickIv); activeOrderHook = null; };
-    window.addEventListener('hashchange', stop, { once: true });
+
+  // Dedicated live Order Detail & Active Buy Payment screen (#/order/:id)
+  async function order(root, rawId) {
+    activeTradeSync = null;
+    const id = String(rawId || '').trim().toUpperCase();
+    if (!id) { location.hash = '#/home'; return; }
+    screen(root, `Order #${esc(id)}`, '<p class="empty">Loading order…</p>');
+    let cur;
+    try { cur = await api().order(id); }
+    catch (e) { screen(root, 'Order not found', `<div class="card center"><p class="err" style="margin-top:0">${esc(msg(e))}</p><a class="btn ghost" href="#/home">Back to home</a></div>`); return; }
+
+    let pollIv = null, tickIv = null;
+    const stopTimers = () => { clearInterval(pollIv); pollIv = null; clearInterval(tickIv); tickIv = null; };
+    const cleanup = () => { stopTimers(); activeOrderHook = null; };
+    window.addEventListener('hashchange', cleanup, { once: true });
+
+    const orderKeySig = x => JSON.stringify([x.status, x.utr, x.hasQr, x.qrExpiresAt, x.timerEndsAt, x.txid, x.reason, x.payoutState]);
+
     activeOrderHook = ord => {
       if (!ord || ord.id !== cur.id) return;
-      if (ord.status === 'failed') {
-        stop();
-        const err = $('#err', root); if (err) err.textContent = ord.reason || 'CashQR request failed.';
-        const box = $('#cqrTimer', root); if (box) box.innerHTML = '<b style="color:var(--error)">Order expired / failed</b>';
-        const btn = $('#paid', root); if (btn) btn.disabled = true;
-      } else if (ord.hasQr && (!cur.hasQr || ord.qrExpiresAt !== cur.qrExpiresAt)) {
-        clearInterval(pollIv); clearInterval(tickIv);
-        cur = ord; renderStep2();
-      }
+      if (orderKeySig(ord) === orderKeySig(cur)) return;
+      cur = ord;
+      paintOrder();
     };
 
-    const renderStep1 = () => {
-      const exp = cur.expiresAt || (Date.now() + 300000);
-      screen(root, 'CashQR · Step 1 of 2', `<div class="card center">
-        <div class="steps"><span class="st on">1. Getting QR</span><span class="st">2. Scan &amp; Pay (1 min)</span></div>
-        <div class="cqr-spin" aria-hidden="true"></div>
-        <h3 style="font:700 19px var(--display)">Processing your request</h3>
-        <p class="mut" style="margin-top:6px">Step 1: Getting QR — you should receive your QR within 5 minutes.</p>
-        <div class="kv" style="text-align:left"><div><span>Order</span><b>#${esc(cur.id)}</b></div><div><span>Amount</span><b>₹${fmt(cur.inr)} (${fmt(cur.usdt, 4)} USDT)</b></div></div>
-        <div class="note" id="cqrTimer" style="color:var(--text)">Waiting time left: <b>05:00</b></div>
-        <p class="err" id="err" role="alert"></p>
-      </div>`);
-      const tick = () => {
-        const box = $('#cqrTimer', root); if (!box) return stop();
-        const left = Math.max(0, Math.ceil((exp - Date.now()) / 1000));
-        const m = String(Math.floor(left / 60)).padStart(2, '0'), s = String(left % 60).padStart(2, '0');
-        if (left <= 0) {
-          stop();
-          box.innerHTML = '<b style="color:var(--error)">Request timed out (5 min)</b>';
-          const err = $('#err', root); if (err) err.textContent = 'CashQR request timed out after 5 minutes. Please try again.';
-        } else {
-          box.innerHTML = `Getting QR · time left: <b>${m}:${s}</b>`;
+    const kvRow = (label, valHtml) => valHtml ? `<div><span>${esc(label)}</span><b>${valHtml}</b></div>` : '';
+
+    function detailsKvHtml(o) {
+      const st = orderState(o);
+      const typeLabel = o.kind === 'buy'
+        ? (o.method === 'cashqr' ? 'Buy USDT · CashQR' : 'Buy USDT · UPI')
+        : o.kind === 'sell' ? 'Sell USDT · UPI Payout' : 'Withdraw USDT · BSC (BEP20)';
+      const copyBtn = (idAttr, label = 'Copy') => `<button type="button" class="link" id="${idAttr}" style="padding:0 0 0 8px;font-size:12.5px">${label}</button>`;
+      const txHtml = o.txid
+        ? `<span class="addr">${esc(short(o.txid))}</span>${copyBtn('cpTx')} · <a class="link" style="padding:0;font-size:12.5px" href="https://bscscan.com/tx/${encodeURIComponent(o.txid)}" target="_blank" rel="noopener">BscScan ↗</a>`
+        : '';
+      return `<div class="kv" style="text-align:left">
+        ${kvRow('Order ID', `#${esc(o.id)}${copyBtn('cpOid')}`)}
+        ${kvRow('Type', esc(typeLabel))}
+        ${kvRow('Status', badgeHtml(o))}
+        ${kvRow(o.kind === 'buy' ? 'USDT to receive' : o.kind === 'sell' ? 'USDT sold' : 'Withdrawal amount', `${fmt(o.usdt, o.kind === 'buy' ? 4 : 2)} USDT`)}
+        ${o.inr ? kvRow(o.kind === 'buy' ? 'Amount to pay' : 'INR payout', '₹' + fmt(o.inr)) : ''}
+        ${o.rate ? kvRow('Rate', `₹${+o.rate} per USDT`) : ''}
+        ${o.upi ? kvRow(o.kind === 'buy' ? 'Pay to UPI ID' : 'Your UPI ID', `${esc(o.upi)}${copyBtn('cpUpi')}`) : ''}
+        ${o.utr ? kvRow('UTR / Reference', `<span class="addr">${esc(o.utr)}</span>`) : ''}
+        ${o.kind === 'withdraw' ? kvRow('Network', 'BNB Smart Chain (BEP20)') : ''}
+        ${o.address ? kvRow('Wallet address', `<span class="addr">${esc(o.address)}</span>${copyBtn('cpAddr')}`) : ''}
+        ${txHtml ? kvRow('Transaction hash', txHtml) : ''}
+        ${kvRow('Created', esc(when(o.at)))}
+        ${o.updatedAt && o.updatedAt !== o.at ? kvRow('Last update', esc(when(o.updatedAt))) : ''}
+      </div>`;
+    }
+
+    function wireDetailCopies(o) {
+      if ($('#cpOid', root)) $('#cpOid', root).onclick = e => copy(o.id, e.target);
+      if ($('#cpUpi', root)) $('#cpUpi', root).onclick = e => copy(o.upi, e.target);
+      if ($('#cpAddr', root)) $('#cpAddr', root).onclick = e => copy(o.address, e.target);
+      if ($('#cpTx', root)) $('#cpTx', root).onclick = e => copy(o.txid, e.target);
+    }
+
+    function paintOrder() {
+      stopTimers();
+      const backHref = `#/history/${cur.kind}`;
+
+      // 1) Active Unpaid CashQR Buy Order (Step 1: Getting QR, Step 2: 1-Min QR + Submit UTR)
+      if (cur.kind === 'buy' && cur.status === 'pending' && !cur.utr && cur.method === 'cashqr') {
+        if (!cur.hasQr) {
+          const exp = cur.expiresAt || (Date.now() + 300000);
+          screen(root, `Order #${esc(cur.id)}`, `<div class="card center">
+            <div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:12px"><span class="mut">CashQR · Step 1 of 2</span>${badgeHtml(cur)}</div>
+            <div class="steps"><span class="st on">1. Getting QR</span><span class="st">2. Scan &amp; Pay (1 min)</span></div>
+            <div class="cqr-spin" aria-hidden="true"></div>
+            <h3 style="font:700 19px var(--display)">Getting your CashQR</h3>
+            <p class="mut" style="margin-top:6px">You should receive your QR within 5 minutes.</p>
+            <div class="note" id="cqrTimer" style="color:var(--text)">Waiting time left: <b>${fmtClock(exp)}</b></div>
+            <p class="err" id="err" role="alert"></p>
+            ${detailsKvHtml(cur)}
+          </div>`, backHref);
+          wireDetailCopies(cur);
+          const tick = () => {
+            const box = $('#cqrTimer', root); if (!box) return stopTimers();
+            const left = Math.max(0, Math.ceil((exp - Date.now()) / 1000));
+            if (left <= 0) {
+              stopTimers();
+              box.innerHTML = '<b style="color:var(--error)">Request timed out (5 min)</b>';
+              api().order(cur.id).then(s => { cur = s; paintOrder(); }).catch(() => {});
+            } else {
+              box.innerHTML = `Getting QR · time left: <b>${fmtClock(exp)}</b>`;
+            }
+          };
+          tickIv = setInterval(tick, 1000); tick();
+          pollIv = setInterval(async () => {
+            try { const s = await api().order(cur.id); if (orderKeySig(s) !== orderKeySig(cur)) { cur = s; paintOrder(); } } catch {}
+          }, 2500);
+          return;
         }
-      };
-      tickIv = setInterval(tick, 1000); tick();
-      pollIv = setInterval(async () => {
-        if (!$('#cqrTimer', root)) return stop();
-        try {
-          const s = await api().buyStatus(cur.id);
-          if (s.status === 'failed') {
-            stop();
-            const err = $('#err', root); if (err) err.textContent = s.reason || 'CashQR request failed.';
-            const box = $('#cqrTimer', root); if (box) box.innerHTML = '<b style="color:var(--error)">Order expired / failed</b>';
-          } else if (s.hasQr) {
-            stop(); cur = s; renderStep2();
+        const exp = cur.qrExpiresAt || (Date.now() + 60000);
+        const qr = `<img class="qr" id="cqrImg" src="/api/v2/buy/${esc(cur.id)}/qr.svg?t=${cur.qrExpiresAt || Date.now()}" alt="CashQR code">`;
+        screen(root, `Order #${esc(cur.id)}`, `<div class="card center">
+          <div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:12px"><span class="mut">CashQR · Step 2 of 2</span>${badgeHtml(cur)}</div>
+          <div class="steps"><span class="st done">1. QR Ready</span><span class="st on">2. Scan &amp; Pay (1 min)</span></div>
+          ${qr}
+          <p class="mut" style="margin-top:10px">Scan this CashQR and pay exactly <b style="color:var(--text)">₹${fmt(cur.inr)}</b></p>
+          <div class="note" id="cqrTimer" style="margin-top:10px;color:var(--text)">QR expires in: <b>${fmtClock(exp)}</b></div>
+          <label class="field" style="margin-top:16px"><input id="utr" class="sm" inputmode="numeric" maxlength="12" placeholder="12-digit UTR / reference after paying" aria-label="UTR"></label>
+          <p class="err" id="err" role="alert"></p><button class="btn" id="paid">I have paid</button>
+          ${detailsKvHtml(cur)}
+        </div>`, backHref);
+        wireDetailCopies(cur);
+        const tick = () => {
+          const box = $('#cqrTimer', root); if (!box) return stopTimers();
+          const left = Math.max(0, Math.ceil((exp - Date.now()) / 1000));
+          if (left <= 0) {
+            clearInterval(tickIv);
+            box.innerHTML = '<b style="color:var(--error)">QR expired (1 min limit)</b>';
+            const img = $('#cqrImg', root); if (img) img.style.opacity = '0.18';
+            const btn = $('#paid', root); if (btn) btn.disabled = true;
+            const err = $('#err', root); if (err) err.textContent = 'This CashQR expired after 1 minute. Please create a new order.';
+          } else {
+            box.innerHTML = `QR expires in: <b style="color:var(--${left <= 15 ? 'error' : 'success'})">${fmtClock(exp)}</b>`;
           }
-        } catch {}
-      }, 2000);
-    };
-
-    const renderStep2 = () => {
-      const exp = cur.qrExpiresAt || (Date.now() + 60000);
-      const qr = `<img class="qr" id="cqrImg" src="/api/v2/buy/${esc(cur.id)}/qr.svg?t=${Date.now()}" alt="CashQR code">`;
-      screen(root, 'CashQR · Step 2 of 2', `<div class="card center">
-        <div class="steps"><span class="st done">1. QR Ready</span><span class="st on">2. Scan &amp; Pay (1 min)</span></div>
-        ${qr}
-        <p class="mut" style="margin-top:10px">Scan this CashQR and pay exactly <b style="color:var(--text)">₹${fmt(cur.inr)}</b></p>
-        <div class="note" id="cqrTimer" style="margin-top:10px;color:var(--text)">QR expires in: <b>01:00</b></div>
-        <label class="field" style="margin-top:16px"><input id="utr" class="sm" inputmode="numeric" maxlength="12" placeholder="12-digit UTR / reference after paying" aria-label="UTR"></label>
-        <p class="err" id="err" role="alert"></p><button class="btn" id="paid">I have paid</button></div>`);
-      const tick = () => {
-        const box = $('#cqrTimer', root); if (!box) return clearInterval(tickIv);
-        const left = Math.max(0, Math.ceil((exp - Date.now()) / 1000));
-        const m = String(Math.floor(left / 60)).padStart(2, '0'), s = String(left % 60).padStart(2, '0');
-        if (left <= 0) {
-          clearInterval(tickIv);
-          box.innerHTML = '<b style="color:var(--error)">QR expired (1 min limit)</b>';
-          const img = $('#cqrImg', root); if (img) img.style.opacity = '0.18';
-          const btn = $('#paid', root); if (btn) btn.disabled = true;
-          const err = $('#err', root); if (err) err.textContent = 'This CashQR expired after 1 minute. Please create a new order.';
-        } else {
-          box.innerHTML = `QR expires in: <b style="color:var(--${left <= 15 ? 'error' : 'success'})">${m}:${s}</b>`;
-        }
-      };
-      tickIv = setInterval(tick, 1000); tick();
-      $('#utr', root).oninput = e => e.target.value = e.target.value.replace(/\D/g, '');
-      $('#paid', root).onclick = async e => {
-        const u = $('#utr', root).value, err = $('#err', root);
-        if (!/^\d{12}$/.test(u)) return err.textContent = 'Enter the 12-digit UTR / reference number from your payment app.';
-        e.target.disabled = true;
-        try { await api().buyPaid(cur.id, u); stop(); done(root, 'Payment submitted', 'We are verifying your CashQR payment', [['Order', '#' + cur.id], ['Method', 'CashQR'], ['Amount', '₹' + fmt(cur.inr)], ['You receive', fmt(cur.usdt, 4) + ' USDT'], ['Status', 'Processing']], 'buy'); }
-        catch (x) { err.textContent = msg(x); e.target.disabled = false; }
-      };
-    };
-
-    cur.hasQr ? renderStep2() : renderStep1();
-  }
-  function pay(root, o) {
-    const qr = `<img class="qr" src="/api/v2/buy/${esc(o.id)}/qr.svg" alt="UPI QR code">`;
-    const exp = o.expiresAt || (Date.now() + 300000);
-    screen(root, 'Pay with UPI', `<div class="card center">${qr}<p class="mut" style="margin-top:10px">Scan with any UPI app and pay exactly <b style="color:var(--text)">₹${fmt(o.inr)}</b></p>
-      <div class="note" id="btimer" style="margin-top:10px;color:var(--text)">Time left: <b>05:00</b></div>
-      <div class="copyrow"><span class="addr">${esc(o.upi)}</span><button class="btn ghost" style="margin:0;width:auto;padding:8px 14px" id="cp">Copy</button></div>
-      <label class="field" style="margin-top:18px"><input id="utr" class="sm" inputmode="numeric" maxlength="12" placeholder="12-digit UTR after paying" aria-label="UTR"></label>
-      <p class="err" id="err" role="alert"></p><button class="btn" id="paid">I have paid</button></div>`);
-    const tick = () => {
-      const box = $('#btimer', root); if (!box) return clearInterval(iv);
-      const left = Math.max(0, Math.ceil((exp - Date.now()) / 1000));
-      const m = String(Math.floor(left / 60)).padStart(2, '0'), s = String(left % 60).padStart(2, '0');
-      if (left <= 0) {
-        clearInterval(iv);
-        box.innerHTML = '<b style="color:var(--error)">Order expired (5 min limit)</b>';
-        const btn = $('#paid', root); if (btn) btn.disabled = true;
-        const err = $('#err', root); if (err) err.textContent = 'This order expired after 5 minutes. Please create a new order.';
-      } else {
-        box.innerHTML = `Time left to pay &amp; submit UTR: <b>${m}:${s}</b>`;
+        };
+        tickIv = setInterval(tick, 1000); tick();
+        $('#utr', root).oninput = e => e.target.value = e.target.value.replace(/\D/g, '');
+        $('#paid', root).onclick = async e => {
+          const u = $('#utr', root).value, err = $('#err', root);
+          if (!/^\d{12}$/.test(u)) return err.textContent = 'Enter the 12-digit UTR / reference number from your payment app.';
+          e.target.disabled = true;
+          try { const r = await api().buyPaid(cur.id, u); cur = r.order || await api().order(cur.id); toast('UTR submitted — now Processing'); paintOrder(); }
+          catch (x) { err.textContent = msg(x); e.target.disabled = false; }
+        };
+        return;
       }
-    };
-    const iv = setInterval(tick, 1000); tick();
-    window.addEventListener('hashchange', () => clearInterval(iv), { once: true });
-    $('#cp', root).onclick = e => copy(o.upi, e.target);
-    $('#utr', root).oninput = e => e.target.value = e.target.value.replace(/\D/g, '');
-    $('#paid', root).onclick = async e => {
-      const u = $('#utr', root).value, err = $('#err', root);
-      if (!/^\d{12}$/.test(u)) return err.textContent = 'Enter the 12-digit UTR from your payment app.';
-      e.target.disabled = true;
-      try { await api().buyPaid(o.id, u); clearInterval(iv); done(root, 'Payment submitted', 'We are checking your payment', [['Order', '#' + o.id], ['Amount', '₹' + fmt(o.inr)], ['You receive', fmt(o.usdt, 4) + ' USDT'], ['Status', 'Processing']], 'buy'); }
-      catch (x) { err.textContent = msg(x); e.target.disabled = false; }
-    };
+
+      // 2) Active Unpaid Standard UPI Buy Order (QR + Copy UPI + 5-min timer + Submit UTR — works even if user closed & reopened site!)
+      if (cur.kind === 'buy' && cur.status === 'pending' && !cur.utr) {
+        const exp = cur.expiresAt || (cur.at + 300000);
+        const qr = `<img class="qr" id="upiQrImg" src="/api/v2/buy/${esc(cur.id)}/qr.svg?t=${cur.at}" alt="UPI QR code">`;
+        screen(root, `Order #${esc(cur.id)}`, `<div class="card center">
+          <div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:8px"><span class="mut">Pay with UPI</span>${badgeHtml(cur)}</div>
+          ${qr}
+          <p class="mut" style="margin-top:10px">Scan with any UPI app and pay exactly <b style="color:var(--text)">₹${fmt(cur.inr)}</b></p>
+          <div class="note" id="btimer" style="margin-top:10px;color:var(--text)">Time left to pay &amp; submit UTR: <b>${fmtClock(exp)}</b></div>
+          <div class="copyrow"><span class="addr">${esc(cur.upi || '')}</span><button class="btn ghost" style="margin:0;width:auto;padding:8px 14px" id="cpMainUpi">Copy UPI</button></div>
+          <label class="field" style="margin-top:16px"><input id="utr" class="sm" inputmode="numeric" maxlength="12" placeholder="Enter 12-digit UTR after paying" aria-label="UTR"></label>
+          <p class="err" id="err" role="alert"></p>
+          <button class="btn" id="paid">Submit UTR · I have paid</button>
+          ${detailsKvHtml(cur)}
+        </div>`, backHref);
+        wireDetailCopies(cur);
+        if ($('#cpMainUpi', root)) $('#cpMainUpi', root).onclick = e => copy(cur.upi, e.target);
+        const tick = () => {
+          const box = $('#btimer', root); if (!box) return stopTimers();
+          const left = Math.max(0, Math.ceil((exp - Date.now()) / 1000));
+          if (left <= 0) {
+            stopTimers();
+            box.innerHTML = '<b style="color:var(--error)">Order expired (5 min limit)</b>';
+            const img = $('#upiQrImg', root); if (img) img.style.opacity = '0.2';
+            const btn = $('#paid', root); if (btn) btn.disabled = true;
+            const err = $('#err', root); if (err) err.textContent = 'This order expired after 5 minutes without UTR submission.';
+            api().order(cur.id).then(s => { if (s.status !== 'pending') { cur = s; paintOrder(); } }).catch(() => {});
+          } else {
+            box.innerHTML = `Time left to pay &amp; submit UTR: <b style="color:var(--${left <= 45 ? 'error' : 'success'})">${fmtClock(exp)}</b>`;
+          }
+        };
+        tickIv = setInterval(tick, 1000); tick();
+        $('#utr', root).oninput = e => e.target.value = e.target.value.replace(/\D/g, '');
+        $('#paid', root).onclick = async e => {
+          const u = $('#utr', root).value, err = $('#err', root);
+          if (!/^\d{12}$/.test(u)) return err.textContent = 'Enter the 12-digit UTR from your payment app.';
+          e.target.disabled = true;
+          try { const r = await api().buyPaid(cur.id, u); cur = r.order || await api().order(cur.id); toast('UTR submitted — now Processing'); paintOrder(); }
+          catch (x) { err.textContent = msg(x); e.target.disabled = false; }
+        };
+        return;
+      }
+
+      // 3) Full Order Details View (Pending/Processing Withdrawals & Sells, Paid Buys, Completed & Failed Orders)
+      const k = KIND[cur.kind] || KIND.buy;
+      const st = orderState(cur);
+      const headTitle = cur.status === 'success'
+        ? (cur.kind === 'buy' ? 'USDT Credited' : cur.kind === 'sell' ? 'INR Payout Sent' : 'Withdrawal Completed')
+        : cur.status === 'failed'
+          ? (cur.kind === 'withdraw' ? 'Withdrawal Failed' : 'Order Failed')
+          : st.isProc
+            ? (cur.kind === 'withdraw' ? 'Withdrawal Processing' : cur.kind === 'sell' ? 'Sale Processing' : 'Verifying Payment')
+            : (cur.kind === 'withdraw' ? 'Withdrawal Pending' : cur.kind === 'sell' ? 'Sale Pending' : 'Order Pending');
+
+      const statusBanner = cur.status === 'pending' && cur.timerEndsAt
+        ? `<div class="proc-box">
+            <div>
+              <b><span style="display:inline-block;width:8px;height:8px;border-radius:50%;background:#60A5FA;margin-right:7px"></span>Status: Processing</b>
+              <small>Your ${cur.kind === 'withdraw' ? 'USDT withdrawal' : cur.kind === 'sell' ? 'INR payout' : 'order'} is being processed now.</small>
+            </div>
+            <div class="proc-clock" data-proc-clock="${cur.timerEndsAt}">${fmtClock(cur.timerEndsAt)}</div>
+          </div>`
+        : cur.status === 'pending' && cur.payoutState === 'broadcasted'
+          ? `<div class="proc-box"><div><b>Status: Processing on BSC</b><small>Your BEP20 USDT transfer has been broadcasted and is confirming on-chain.</small></div>${badgeHtml(cur)}</div>`
+          : cur.status === 'pending' && cur.kind === 'buy' && cur.utr
+            ? `<div class="proc-box"><div><b>Status: Processing</b><small>UTR <b>${esc(cur.utr)}</b> received. Your USDT will be credited as soon as payment is verified.</small></div>${badgeHtml(cur)}</div>`
+            : cur.status === 'pending'
+              ? `<div class="note" style="text-align:left;border-color:rgba(251,191,36,.35)"><b style="color:#FBBF24">Status: Pending</b> — Your ${cur.kind === 'withdraw' ? 'withdrawal' : 'sale'} request has been received and is waiting in queue. This page updates live to <b style="color:#93C5FD">Processing</b> with a countdown as soon as processing starts.</div>`
+              : cur.status === 'failed'
+                ? `<p class="err" style="text-align:left">${esc(cur.reason || 'This order could not be completed.')}${cur.kind !== 'buy' ? ' Your held USDT has been returned to your balance.' : ''}</p>`
+                : '';
+
+      const topVisual = cur.status === 'success'
+        ? `<div class="okmark">${icon('check')}${'<i class="pt"></i>'.repeat(8)}</div>`
+        : `<div style="display:flex;justify-content:center;margin-bottom:10px"><span class="rico ${k.tone}" style="width:54px;height:54px;border-radius:18px">${icon(k.ic)}</span></div>`;
+
+      screen(root, `${k.label} #${esc(cur.id)}`, `<div class="card center">
+        ${topVisual}
+        <h3 style="font:700 20px var(--display)">${esc(headTitle)}</h3>
+        <div style="margin-top:8px">${badgeHtml(cur)}</div>
+        ${statusBanner}
+        ${detailsKvHtml(cur)}
+        ${cur.txid ? `<a class="btn ghost" href="https://bscscan.com/tx/${encodeURIComponent(cur.txid)}" target="_blank" rel="noopener">View Transaction on BscScan ↗</a>` : ''}
+        <a class="btn" href="${backHref}">View ${esc(cur.kind)} history</a>
+        <a class="btn ghost" href="#/home">Back to home</a>
+      </div>`, backHref);
+      wireDetailCopies(cur);
+
+      // Keep polling every 3s while pending so status flips Pending -> Processing -> Success even if SSE is buffered by a proxy
+      if (cur.status === 'pending') {
+        pollIv = setInterval(async () => {
+          if (document.hidden) return;
+          try { const s = await api().order(cur.id); if (orderKeySig(s) !== orderKeySig(cur)) { cur = s; paintOrder(); } } catch {}
+        }, 3000);
+      }
+    }
+
+    paintOrder();
   }
 
   async function sell(root) {
@@ -609,7 +761,7 @@
         if (!await ask({ title: 'Confirm sale', rows: [['You sell', fmt(v) + ' USDT'], ['Rate', '₹' + rt.sell + ' per USDT'], ['You get', '₹' + fmt(v * rt.sell)], ['Paid to', upi]], note: 'The USDT is set aside for this order. If the payout fails, it returns to your balance.', ok: 'Sell now' })) { submitting = false; return; }
         if (rt.buySellEnabled === false) { submitting = false; renderSellForm(true); return; }
         e.target.disabled = true;
-        try { activeTradeSync = null; const o = await api().sellCreate({ usdt: v, upi, reqId }); done(root, 'Sale requested', 'We will pay your UPI soon', [['Order', '#' + o.id], ['You sold', fmt(o.usdt) + ' USDT'], ['You get', '₹' + fmt(o.inr)], ['Paid to', o.upi], ['Status', 'Processing']], 'sell'); }
+        try { activeTradeSync = null; const o = await api().sellCreate({ usdt: v, upi, reqId }); location.hash = '#/order/' + o.id; }
         catch (x) { submitting = false; err.textContent = msg(x); e.target.disabled = false; }
       };
     };
@@ -666,7 +818,7 @@
         if (!await ask({ title: 'Confirm withdrawal', rows: [['Amount', v + ' USDT'], ['Network', 'BSC (BEP20)'], ['To address', a]], note: 'Check the address carefully. Crypto sent to a wrong address cannot be recovered.', ok: 'Withdraw' })) { submitting = false; return; }
         if (rt.buySellEnabled === false) { submitting = false; renderWdForm(true); return; }
         e.target.disabled = true;
-        try { activeTradeSync = null; const o = await api().withdraw({ amount: v, address: a, reqId }); done(root, 'Withdrawal requested', 'We will send it shortly', [['Request', '#' + o.id], ['Amount', fmt(o.usdt) + ' USDT'], ['To', short(o.address)], ['Status', 'Processing']], 'withdraw'); }
+        try { activeTradeSync = null; const o = await api().withdraw({ amount: v, address: a, reqId }); location.hash = '#/order/' + o.id; }
         catch (x) { submitting = false; err.textContent = msg(x); e.target.disabled = false; }
       };
     };
@@ -680,27 +832,30 @@
   }
 
   async function history(root, type) {
+    activeOrderHook = null; activeTradeSync = null;
     const t = KIND[type] ? type : 'buy', names = { buy: 'Buy history', sell: 'Sell history', withdraw: 'Withdrawals' };
     screen(root, names[t], '<p class="empty">Loading…</p>');
     const list = await api().history(t);
     if (!list.length) return screen(root, names[t], '<p class="empty">Nothing here yet.</p>');
-    screen(root, names[t], `<label class="field" style="margin-top:0;margin-bottom:12px"><input id="hq" class="sm" type="search" placeholder="Search by Order ID (e.g. #${esc(list[0].id)}), amount or status" autocomplete="off" spellcheck="false" aria-label="Search orders"></label><div id="hlist">${list.map(row).join('')}</div>`);
+    screen(root, names[t], `<label class="field" style="margin-top:0;margin-bottom:12px"><input id="hq" class="sm" type="search" placeholder="Search by Order ID (e.g. #${esc(list[0].id)}), amount or status" autocomplete="off" spellcheck="false" aria-label="Search orders"></label><p class="mut" style="font-size:12.5px;margin-bottom:6px">Tap any order to view full details${t === 'buy' ? ' or resume an active QR payment' : ''}.</p><div id="hlist">${list.map(row).join('')}</div>`);
     const hq = $('#hq', root), hlist = $('#hlist', root);
     const filter = () => {
       const q = hq.value.trim().toUpperCase().replace(/^(ORDER|REQUEST|ID)?[\s#:-]+/, '');
-      const hit = !q ? list : list.filter(x =>
-        String(x.id || '').toUpperCase().includes(q) ||
-        String(x.inr || '').includes(q) ||
-        String(x.usdt || '').includes(q) ||
-        String(x.upi || '').toUpperCase().includes(q) ||
-        String(x.address || '').toUpperCase().includes(q) ||
-        String(x.status || '').toUpperCase().includes(q)
-      );
+      const hit = !q ? list : list.filter(x => {
+        const stLbl = orderState(x).label.toUpperCase();
+        return String(x.id || '').toUpperCase().includes(q) ||
+          String(x.inr || '').includes(q) ||
+          String(x.usdt || '').includes(q) ||
+          String(x.upi || '').toUpperCase().includes(q) ||
+          String(x.utr || '').toUpperCase().includes(q) ||
+          String(x.address || '').toUpperCase().includes(q) ||
+          String(x.txid || '').toUpperCase().includes(q) ||
+          String(x.status || '').toUpperCase().includes(q) ||
+          stLbl.includes(q);
+      });
       hlist.innerHTML = hit.length ? hit.map(row).join('') : `<p class="empty">No orders match “${esc(hq.value.trim())}”.</p>`;
-      wireOpenBuy(root, hit);
     };
     hq.oninput = filter;
-    wireOpenBuy(root, list);
   }
   function support(root) {
     screen(root, 'Contact support', `<div class="card"><p class="mut">Tell us what happened and share your order or request ID (for example #A7K2M9) so we can find it quickly.</p>
@@ -747,37 +902,41 @@
       </div>`).join('') : '<div class="card"><p class="empty">No notifications yet.</p></div>';
     screen(root, 'Notifications', body);
   }
-    BN.screens = {
-      home, buy, sell, deposit, withdraw, history, support, account, password, notifications,
-      onLive(ev, root) {
-        const [, name, arg] = (location.hash || '#/home').split('/');
-        if (ev.type === 'settings' && ev.rates) {
-          BN.state.rates = ev.rates;
-          if (typeof ev.usdt === 'number') BN.state.balance = { usdt: ev.usdt };
-          if (activeTradeSync) activeTradeSync(ev.rates, true);
-          else if (!name || name === 'home') {
-            if (BN.state.balance && BN.state.recent && BN.state.notifications) paintHome(root, BN.state);
-            else api().home().then(d => { if (((location.hash || '#/home').split('/')[1] || 'home') === 'home') paintHome(root, d); }).catch(() => {});
-          }
-          return;
+  BN.screens = {
+    home, buy, order, sell, deposit, withdraw, history, support, account, password, notifications,
+    onLive(ev, root) {
+      const [, name, arg] = (location.hash || '#/home').split('/');
+      if (ev.type === 'settings' && ev.rates) {
+        BN.state.rates = ev.rates;
+        if (typeof ev.usdt === 'number') BN.state.balance = { usdt: ev.usdt };
+        if (activeTradeSync) activeTradeSync(ev.rates, true);
+        else if (!name || name === 'home') {
+          if (BN.state.balance && BN.state.recent && BN.state.notifications) paintHome(root, BN.state);
+          else api().home().then(d => { if (((location.hash || '#/home').split('/')[1] || 'home') === 'home') paintHome(root, d); }).catch(() => {});
         }
-        if (ev.type === 'order' && ev.order) {
-          if (activeOrderHook) activeOrderHook(ev.order);
-        }
-        if (ev.type === 'order' || ev.type === 'sync') {
-          api().home().then(d => {
-            const [, curName, curArg] = (location.hash || '#/home').split('/');
-            if (!curName || curName === 'home') paintHome(root, d);
-            else if (curName === 'history') {
-              const qEl = $('#hq', root), savedQ = qEl ? qEl.value : '';
-              history(root, curArg).then(() => { const nq = $('#hq', root); if (nq && savedQ) { nq.value = savedQ; nq.dispatchEvent(new Event('input')); } }).catch(() => {});
-            } else if (curName === 'notifications') notifications(root).catch(() => {});
-            else if (curName === 'sell' && $('#sellAvail', root)) $('#sellAvail', root).textContent = fmt(d.balance.usdt);
-            else if (curName === 'withdraw' && $('#wdAvail', root)) $('#wdAvail', root).textContent = fmt(d.balance.usdt) + ' USDT';
-          }).catch(() => {});
-        }
+        return;
       }
-    };
+      if (ev.type === 'order' && ev.order) {
+        if (activeOrderHook) activeOrderHook(ev.order);
+      }
+      if (ev.type === 'order' || ev.type === 'sync') {
+        if (name === 'order' && arg && activeOrderHook && (!ev.order || ev.order.id !== arg.toUpperCase())) {
+          api().order(arg).then(o => { if (activeOrderHook) activeOrderHook(o); }).catch(() => {});
+        }
+        api().home().then(d => {
+          const [, curName, curArg] = (location.hash || '#/home').split('/');
+          if (!curName || curName === 'home') paintHome(root, d);
+          else if (curName === 'buy' && $('#buyResumeSlot', root)) $('#buyResumeSlot', root).innerHTML = resumeBuyBanner(d.activeBuys || []);
+          else if (curName === 'history') {
+            const qEl = $('#hq', root), savedQ = qEl ? qEl.value : '';
+            history(root, curArg).then(() => { const nq = $('#hq', root); if (nq && savedQ) { nq.value = savedQ; nq.dispatchEvent(new Event('input')); } }).catch(() => {});
+          } else if (curName === 'notifications') notifications(root).catch(() => {});
+          else if (curName === 'sell' && $('#sellAvail', root)) $('#sellAvail', root).textContent = fmt(d.balance.usdt);
+          else if (curName === 'withdraw' && $('#wdAvail', root)) $('#wdAvail', root).textContent = fmt(d.balance.usdt) + ' USDT';
+        }).catch(() => {});
+      }
+    }
+  };
 })();
 
 /* ============================================================
@@ -789,9 +948,10 @@
   const BN = window.BN, { $, toast } = BN.ui;
   document.title = BN.cfg.NAME;
   const app = $('#app'), auth = $('#auth');
-  let user = null, es = null, watchIv = null;
+  let user = null, es = null, watchIv = null, reconnTm = null;
 
   function stopLive() {
+    clearTimeout(reconnTm); reconnTm = null;
     if (es) { try { es.close(); } catch {} es = null; }
     clearInterval(watchIv); watchIv = null;
   }
@@ -809,19 +969,39 @@
             if (BN.screens.onLive) BN.screens.onLive(ev, app);
           } catch {}
         };
+        es.onerror = () => {
+          if (es) { try { es.close(); } catch {} es = null; }
+          if (user) { clearTimeout(reconnTm); reconnTm = setTimeout(connect, 3500); }
+        };
       } catch {}
     };
     connect();
-    // Lightweight fallback sync when tab becomes visible or if a mobile proxy buffers SSE
+    // Lightweight fallback sync so Pending -> Processing timers and status updates show up even if a proxy buffers SSE
+    const recentSig = list => JSON.stringify((list || []).map(x => [x.id, x.status, x.timerEndsAt, x.utr, x.hasQr, x.txid]));
     watchIv = setInterval(async () => {
       if (!user || document.hidden) return;
       try {
+        const [, curName] = (location.hash || '#/home').split('/');
+        const hasPending = (BN.state.recent || []).some(x => x.status === 'pending') || (BN.state.activeBuys || []).length > 0;
+        if (!curName || curName === 'home' || curName === 'history' || hasPending) {
+          const prevR = BN.state.rates ? JSON.stringify([BN.state.rates.buySellEnabled, BN.state.rates.buySellReason, BN.state.rates.cashQrEnabled]) : '';
+          const prevO = recentSig(BN.state.recent);
+          const prevB = BN.state.balance ? BN.state.balance.usdt : null;
+          const d = await BN.api.home();
+          const nextR = JSON.stringify([d.rates.buySellEnabled, d.rates.buySellReason, d.rates.cashQrEnabled]);
+          if (prevR && prevR !== nextR && BN.screens.onLive) BN.screens.onLive({ type: 'settings', rates: d.rates, usdt: d.balance.usdt }, app);
+          else if ((prevO && prevO !== recentSig(d.recent)) || (prevB !== null && prevB !== d.balance.usdt)) {
+            if (!curName || curName === 'home') BN.screens.home(app);
+            else if (curName === 'history' && BN.screens.onLive) BN.screens.onLive({ type: 'sync' }, app);
+          }
+          return;
+        }
         const prev = BN.state.rates ? JSON.stringify([BN.state.rates.buySellEnabled, BN.state.rates.buySellReason, BN.state.rates.cashQrEnabled]) : '';
         const rt = await BN.api.rates();
         const next = JSON.stringify([rt.buySellEnabled, rt.buySellReason, rt.cashQrEnabled]);
         if (prev && prev !== next && BN.screens.onLive) BN.screens.onLive({ type: 'settings', rates: rt }, app);
       } catch {}
-    }, 6000);
+    }, 5000);
   }
   document.addEventListener('visibilitychange', () => {
     if (!document.hidden && user && BN.screens.onLive) BN.screens.onLive({ type: 'sync' }, app);
@@ -836,7 +1016,7 @@
   }
   function showAuth(errMsg) {
     user = null; stopLive();
-    BN.state = { rates: null, balance: null, recent: null, notifications: null };
+    BN.state = { rates: null, balance: null, recent: null, activeBuys: null, notifications: null };
     app.hidden = true; auth.hidden = false;
     BN.auth.render(auth, (u, opts) => { user = u; auth.hidden = true; app.hidden = false; startLive(); location.hash = opts && opts.setPassword ? '#/password/forgot' : '#/home'; route(); });
     if (errMsg) toast(errMsg, true);

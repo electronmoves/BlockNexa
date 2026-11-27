@@ -177,8 +177,22 @@ a.lk:active,.q:active .lk{transform:scale(.985)}
 .rmid{flex:1;min-width:0}.rmid b{display:block;font-size:15px;overflow-wrap:anywhere}.rmid small{display:block;color:var(--text2);font-size:12.5px;margin-top:2px;overflow-wrap:anywhere}
 .rmid b small{display:inline;font-weight:500}.rmid .why{color:var(--error)}
 .rend{text-align:right;display:grid;gap:5px;justify-items:end}.rend b{font:700 14px var(--display)}
-.badge{font-size:11px;font-weight:700;padding:3px 9px;border-radius:999px}
+.badge{display:inline-flex;align-items:center;gap:5px;font-size:11px;font-weight:700;padding:3.5px 9.5px;border-radius:999px;white-space:nowrap}
 .ok{background:rgba(52,211,153,.15);color:var(--success)}.fail{background:rgba(248,113,113,.15);color:var(--error)}.wait{background:rgba(184,199,255,.14);color:var(--accent-soft)}
+.pend{background:rgba(251,191,36,.15);color:#FBBF24;border:1px solid rgba(251,191,36,.3)}
+.proc{background:rgba(100,136,245,.2);color:#93C5FD;border:1px solid rgba(100,136,245,.45)}
+.proc .pdot{width:6px;height:6px;border-radius:50%;background:#60A5FA;box-shadow:0 0 8px #60A5FA;animation:pingB 1.6s infinite}
+@keyframes pingB{0%{box-shadow:0 0 0 0 rgba(96,165,250,.7)}70%,100%{box-shadow:0 0 0 7px rgba(96,165,250,0)}}
+.proc-box{display:flex;align-items:center;justify-content:space-between;gap:14px;padding:14px 16px;border-radius:16px;margin-top:14px;background:linear-gradient(135deg,rgba(100,136,245,.18),rgba(16,185,129,.1));border:1px solid rgba(100,136,245,.45);text-align:left}
+.proc-box b{display:block;font:700 14.5px var(--display);color:#BFDBFE}
+.proc-box small{display:block;color:var(--text2);font-size:12.5px;margin-top:2px}
+.proc-clock{font:700 22px var(--display);color:#93C5FD;letter-spacing:.5px;white-space:nowrap}
+.resume-card{display:flex;align-items:center;justify-content:space-between;gap:12px;flex-wrap:wrap;padding:15px 16px;border-radius:18px;background:linear-gradient(135deg,rgba(16,185,129,.18),rgba(17,28,46,.95));border:1.5px solid rgba(52,211,153,.5);margin-bottom:14px}
+.resume-card b{display:block;font:700 15px var(--display);color:var(--text)}
+.resume-card small{display:block;color:var(--text2);font-size:12.5px;margin-top:3px}
+.resume-btn{padding:10px 15px;border-radius:12px;background:var(--primary);color:var(--on-primary);font:700 13.5px var(--display);white-space:nowrap}
+.row.tap{cursor:pointer}
+.row.tap:hover{border-color:rgba(100,136,245,.45);background:var(--elev)}
 .empty{text-align:center;color:var(--text2);padding:36px 10px}
 .ncard{background:var(--card);border:1px solid var(--border);border-radius:18px;padding:16px;margin-top:10px}
 .ncard.unr{border-color:rgba(16,185,129,.45);background:linear-gradient(145deg,rgba(16,185,129,.08),var(--card))}

@@ -166,7 +166,14 @@
       </aside></div>`;
     bind();
   }
-  const rowHtml = o => `<button class="row" data-oid="${esc(o.id)}"><span class="t ${o.kind}">${o.method === 'cashqr' ? 'CashQR' : TYPE[o.kind]}</span><span class="m"><b>#${esc(o.id)} · ${f2(o.usdt)} USDT${o.inr ? ' · ₹' + f2(o.inr) : ''}</b><small>${day(o.at)} ${clock(o.at)}${o.method === 'cashqr' ? ' · CashQR (ATM)' : ''}${o.reason ? ' · <span class="why">' + esc(o.reason) + '</span>' : ''}</small></span><span class="badge ${o.status}">${STAT[o.status]}</span></button>`;
+  const adminBadge = o => {
+    if (o.status === 'success') return '<span class="badge success">Success</span>';
+    if (o.status === 'failed') return '<span class="badge failed">Failed</span>';
+    if (o.timerEndsAt) return `<span class="badge processing" data-cqr-t="${o.timerEndsAt}">Processing · ${fmtRem(o.timerEndsAt)}</span>`;
+    if (o.kind === 'buy' && o.utr) return '<span class="badge processing">Processing (UTR)</span>';
+    return '<span class="badge pending">Pending</span>';
+  };
+  const rowHtml = o => `<button class="row" data-oid="${esc(o.id)}"><span class="t ${o.kind}">${o.method === 'cashqr' ? 'CashQR' : TYPE[o.kind]}</span><span class="m"><b>#${esc(o.id)} · ${f2(o.usdt)} USDT${o.inr ? ' · ₹' + f2(o.inr) : ''}</b><small>${day(o.at)} ${clock(o.at)}${o.method === 'cashqr' ? ' · CashQR (ATM)' : ''}${o.reason ? ' · <span class="why">' + esc(o.reason) + '</span>' : ''}</small></span>${adminBadge(o)}</button>`;
 
   // ---------- order view ----------
   const fmtRem = ends => {
@@ -174,15 +181,33 @@
     if (left <= 0) return '00:00';
     return `${String(Math.floor(left / 60)).padStart(2, '0')}:${String(left % 60).padStart(2, '0')}`;
   };
+  async function openSetTimerModal(order, afterFn) {
+    const curMins = order.timerEndsAt ? Math.max(1, Math.ceil((order.timerEndsAt - Date.now()) / 60000)) : 30;
+    const r = await ask({
+      title: order.timerEndsAt ? 'Edit countdown timer' : 'Set countdown timer',
+      html: `<p>Switches Order <b>#${esc(order.id)}</b> from <b>Pending</b> to <b>Processing</b> with a live countdown visible on the user's screen immediately.</p>`,
+      num: { label: 'Duration (minutes)', value: curMins, preview: v => v >= 1 && v <= 1440 ? `User sees: <b>Processing · ${Math.round(v)}:00</b>` : '<span class="why">Enter 1 to 1440 minutes</span>' },
+      chips: ['10 min', '15 min', '30 min', '45 min', '60 min'],
+      ok: 'Save timer'
+    });
+    if (!r) return;
+    const mins = +r.num;
+    if (!(mins >= 1 && mins <= 1440)) return toast('Enter a timer between 1 and 1440 minutes.', true);
+    try {
+      const d = await api(`/orders/${order.id}/timer`, { method: 'POST', body: { minutes: mins } });
+      toast(`${mins} min timer set — user now sees Processing`);
+      if (typeof afterFn === 'function') afterFn(d.order);
+      else showOrder(d.order);
+    } catch (e) { toast(e.message, true); }
+  }
   function showOrder(o) {
     panelMode = 'order'; openOrderId = o.id;
     loadSettings();
     const can = s => o.kind === 'buy' ? o.status !== s : o.status === 'pending';
     const kv = (k, v) => v === undefined || v === null || v === '' ? '' : `<div><span>${k}</span><b>${v}</b></div>`;
     const isCqr = o.kind === 'buy' && o.method === 'cashqr';
-    const wdLabel = o.kind === 'withdraw' && o.status === 'pending' ? (o.timerEndsAt ? 'Processing' : 'Pending') : STAT[o.status];
-    const wdTimerText = o.kind === 'withdraw' && o.status === 'pending'
-      ? (o.timerEndsAt ? `${fmtRem(o.timerEndsAt)} remaining (Processing)` : 'Not set (shows Pending to user)') : '';
+    const wdTimerText = o.status === 'pending'
+      ? (o.timerEndsAt ? `<span style="color:#93C5FD" data-cqr-t="${o.timerEndsAt}">Processing · ${fmtRem(o.timerEndsAt)}</span>` : 'Not set (user sees Pending)') : '';
     const cqrStatusHtml = !isCqr ? '' : o.utr ? `<span style="color:var(--success)">UTR submitted (${esc(o.utr)})</span>`
       : (o.hasQr && o.qrExpiresAt > Date.now()) ? `<span style="color:var(--success)" data-cqr-t="${o.qrExpiresAt}">QR active · ${fmtRem(o.qrExpiresAt)}</span>`
       : o.hasQr ? '<span class="why">QR expired (1 min elapsed) — assign a fresh QR</span>'
@@ -194,13 +219,13 @@
       ? '<span style="color:var(--success)">✓ Verified (Order + Ledger HMAC)</span>'
       : `<span class="why">⚠ ${esc(o.sealError || 'Seal verification failed')}</span>`;
     const txHtml = o.txid ? `<a class="link mono" href="https://bscscan.com/tx/${encodeURIComponent(o.txid)}" target="_blank" rel="noopener">${esc(o.txid)}</a>` : '';
-    $('#main').innerHTML = `<div style="max-width:620px;margin:0 auto"><div class="card"><div class="head"><h2>Order #${esc(o.id)}</h2><span class="badge ${o.status}">${wdLabel}</span></div>
+    $('#main').innerHTML = `<div style="max-width:620px;margin:0 auto"><div class="card"><div class="head"><h2>Order #${esc(o.id)}</h2>${adminBadge(o)}</div>
       <div class="kv">
         ${kv('Type', isCqr ? 'Buy · CashQR (ATM)' : TYPE[o.kind])}${kv('Payment method', o.kind === 'buy' ? (isCqr ? 'CashQR (ATM High Limit)' : 'UPI') : '')}${kv('Amount', (o.inr ? '₹' + f2(o.inr) + ' → ' : '') + f2(o.usdt) + ' USDT')}${kv('Rate', o.rate ? '₹' + o.rate + ' per USDT' : '')}
         ${kv('CashQR status', cqrStatusHtml)}
         ${kv('Integrity seal', sealHtml)}
         ${kv('UTR', o.utr ? esc(o.utr) : o.kind === 'buy' ? 'Not submitted yet' : '')}${kv('Paid to UPI', esc(o.upi))}${kv('Wallet', esc(o.address))}${kv('Chain', esc(o.chain && o.chain.toUpperCase()))}${kv('Transaction hash', txHtml)}
-        ${kv('Withdraw timer', wdTimerText)}
+        ${kv('Countdown timer', wdTimerText)}
         ${kv('Payout note', o.payoutError ? `<span class="why">${esc(o.payoutError)}</span>` : '')}
         ${kv('User ID', `<button class="link" data-uid="${esc(o.user.uid)}">${esc(o.user.uid)}</button>`)}${kv('User email', esc(o.user.email))}${kv('User phone', esc(o.user.phone))}
         ${kv('Date', day(o.at))}${kv('Time', clock(o.at))}${kv('Last update', day(o.updatedAt) + ' ' + clock(o.updatedAt))}${o.reason ? `<div><span>Failure reason</span><b class="why">${esc(o.reason)}</b></div>` : ''}
@@ -229,7 +254,7 @@
           <button class="btn ghost" id="ordPasteQr">Paste QR Text</button>
         </div>
       </div>` : ''}
-      <div style="display:flex;gap:10px;margin-top:16px;flex-wrap:wrap">${o.kind === 'withdraw' && o.status === 'pending' ? `<button class="btn ghost" id="setTimer">${o.timerEndsAt ? 'Edit timer' : 'Set timer'}</button>` : ''}${can('success') ? '<button class="btn" id="ok">Mark success</button>' : ''}${can('failed') ? '<button class="btn danger" id="bad">Mark failed</button>' : ''}</div>
+      <div style="display:flex;gap:10px;margin-top:16px;flex-wrap:wrap">${o.status === 'pending' ? `<button class="btn ghost" id="setTimer">${o.timerEndsAt ? 'Edit timer' : 'Set timer'}</button>` : ''}${can('success') ? '<button class="btn" id="ok">Mark success</button>' : ''}${can('failed') ? '<button class="btn danger" id="bad">Mark failed</button>' : ''}</div>
       ${o.kind !== 'buy' && o.status !== 'pending' ? '<p class="mut" style="margin-top:12px">Finished sells and withdrawals are locked. Use Edit balance on the user to correct anything.</p>' : ''}</div></div>`;
     bind(o);
   }
@@ -285,25 +310,27 @@
       loadSettings();
       const list = await api('/pending');
       const lbl = o => {
-        if (o.kind === 'withdraw') return o.timerEndsAt ? `Processing (${Math.max(1, Math.ceil((o.timerEndsAt - Date.now()) / 60000))}m)` : 'Pending';
+        if (o.timerEndsAt) return `Processing · ${fmtRem(o.timerEndsAt)}`;
         if (o.kind === 'buy' && o.method === 'cashqr') {
-          if (o.utr) return 'UTR submitted';
+          if (o.utr) return 'Processing (UTR)';
           if (o.hasQr && o.qrExpiresAt > Date.now()) return `QR active · ${fmtRem(o.qrExpiresAt)}`;
           if (o.expiresAt) return `Waiting QR · ${fmtRem(o.expiresAt)}`;
           return 'Waiting QR';
         }
+        if (o.kind === 'buy' && o.utr) return 'Processing (UTR)';
         return 'Pending';
       };
       const rowP = o => {
         const isCqr = o.kind === 'buy' && o.method === 'cashqr';
-        const timerAttr = isCqr && !o.utr ? (o.hasQr && o.qrExpiresAt > Date.now() ? ` data-cqr-t="${o.qrExpiresAt}"` : o.expiresAt ? ` data-cqr-t="${o.expiresAt}"` : '') : '';
+        const timerAttr = o.timerEndsAt ? ` data-cqr-t="${o.timerEndsAt}"` : (isCqr && !o.utr ? (o.hasQr && o.qrExpiresAt > Date.now() ? ` data-cqr-t="${o.qrExpiresAt}"` : o.expiresAt ? ` data-cqr-t="${o.expiresAt}"` : '') : '');
+        const bCls = o.utr ? 'success' : o.timerEndsAt ? 'processing' : 'pending';
         const isWd = o.kind === 'withdraw' && o.sealOk && !o.payoutState;
         return `<div class="row" data-pid="${esc(o.id)}" style="cursor:pointer">
           <span class="t ${o.kind}">${isCqr ? 'CashQR' : TYPE[o.kind]}</span>
           <span class="m"><b>#${esc(o.id)} · ${f2(o.usdt)} USDT${o.inr ? ' · ₹' + f2(o.inr) : ''}</b><small>${esc(o.user.uid)} · ${day(o.at)} ${clock(o.at)}${isCqr ? ' · <b>CashQR (ATM)</b>' : o.upi ? ' · UPI: <b>' + esc(o.upi) + '</b>' : o.address ? ' · <span class="mono">' + esc(o.address.slice(0, 10) + '…' + o.address.slice(-6)) + '</span>' : ''}${o.kind === 'buy' ? (o.utr ? ' · UTR: <b>' + esc(o.utr) + '</b>' : isCqr ? (o.hasQr ? ' · QR sent to user' : ' · Waiting for you to assign QR') : ' · no UTR yet') : ''}</small></span>
           ${isCqr && !o.utr ? `<button type="button" class="btn ub-act" data-assign-pid="${esc(o.id)}">${o.hasQr ? 'Replace QR' : 'Assign QR'}</button>` : ''}
           ${isWd ? `<button type="button" class="btn ub-act" data-send-pid="${esc(o.id)}">Approve &amp; Send</button>` : ''}
-          <span class="badge ${o.utr ? 'success' : 'pending'}"${timerAttr}>${lbl(o)}</span>
+          <span class="badge ${bCls}"${timerAttr}>${lbl(o)}</span>
         </div>`;
       };
       $('#main').innerHTML = `<div class="head" style="margin-bottom:6px"><div><h3>Pending (${list.length})</h3><small>Buys with a UTR are first. Click an order to review it, or click <b>Assign QR</b> on CashQR requests.</small></div></div>` + (list.length ? list.map(rowP).join('') : '<p class="empty">Nothing is waiting.</p>');
@@ -354,21 +381,7 @@
         };
       }
       if ($('#ordPasteQr', m)) $('#ordPasteQr', m).onclick = () => openAssignQrModal(order, upd => showOrder(upd));
-      if ($('#setTimer', m)) $('#setTimer', m).onclick = async () => {
-        const curMins = order.timerEndsAt ? Math.max(1, Math.ceil((order.timerEndsAt - Date.now()) / 60000)) : 60;
-        const r = await ask({
-          title: order.timerEndsAt ? 'Edit withdraw timer' : 'Set withdraw timer',
-          html: '<p>Sets the withdrawal status to <b>Processing</b> with a live countdown shown to the user.</p>',
-          num: { label: 'Duration (minutes)', value: curMins, preview: v => v >= 1 && v <= 1440 ? `Countdown: <b>${Math.round(v)}:00</b>` : '<span class="why">Enter 1 to 1440 minutes</span>' },
-          chips: ['15 min', '30 min', '45 min', '60 min'],
-          ok: 'Save timer'
-        });
-        if (!r) return;
-        const mins = +r.num;
-        if (!(mins >= 1 && mins <= 1440)) return toast('Enter a timer between 1 and 1440 minutes.', true);
-        try { const d = await api(`/orders/${order.id}/timer`, { method: 'POST', body: { minutes: mins } }); toast(`${mins} min timer set — status is now Processing`); showOrder(d.order); }
-        catch (e) { toast(e.message, true); }
-      };
+      if ($('#setTimer', m)) $('#setTimer', m).onclick = () => openSetTimerModal(order, upd => showOrder(upd));
       if ($('#ok', m)) $('#ok', m).onclick = () => changeStatus(order, 'success');
       if ($('#bad', m)) $('#bad', m).onclick = () => changeStatus(order, 'failed');
     }
@@ -951,8 +964,8 @@
           ? '<span class="active-badge">✓ Seal &amp; Ledger Verified</span>'
           : '<span class="deact-badge">⚠ Tamper / Seal Mismatch</span>';
         const stateBadge = o.payoutState === 'broadcasted'
-          ? '<span class="badge pending">Broadcasted on BSC</span>'
-          : o.timerEndsAt ? `<span class="badge pending" data-cqr-t="${o.timerEndsAt}">Processing · ${fmtRem(o.timerEndsAt)}</span>`
+          ? '<span class="badge processing">Broadcasted on BSC</span>'
+          : o.timerEndsAt ? `<span class="badge processing" data-cqr-t="${o.timerEndsAt}">Processing · ${fmtRem(o.timerEndsAt)}</span>`
           : '<span class="badge pending">Pending</span>';
         return `<div class="cqr-card" style="${o.sealOk ? '' : 'border-color:var(--error)'}">
           <div class="cqr-top">
@@ -968,6 +981,7 @@
           ${o.payoutError ? `<small class="why">${esc(o.payoutError)}</small>` : ''}
           <div class="cqr-acts">
             <button class="btn" data-pay-send="${esc(o.id)}" ${(!d.enabled || !w.configured || !o.sealOk || busy) ? 'disabled' : ''}>${o.payoutState === 'broadcasted' ? 'Waiting BSC confirmation…' : busy ? 'Sending on BSC…' : `⚡ Approve & Auto-Send ${f2(o.usdt)} USDT`}</button>
+            <button class="btn ghost" data-pay-timer="${esc(o.id)}">${o.timerEndsAt ? 'Edit Timer' : 'Set Timer'}</button>
             <button class="btn ghost" data-pay-open="${esc(o.id)}">Open / Manual</button>
           </div>
         </div>`;
@@ -1054,6 +1068,10 @@
       m.querySelectorAll('[data-pay-send]').forEach(b => b.onclick = () => {
         const o = window._payList.find(x => x.id === b.dataset.paySend);
         if (o) approveAndSendPayout(o, () => payoutsPanel(true));
+      });
+      m.querySelectorAll('[data-pay-timer]').forEach(b => b.onclick = () => {
+        const o = window._payList.find(x => x.id === b.dataset.payTimer);
+        if (o) openSetTimerModal(o, () => payoutsPanel(false));
       });
       m.querySelectorAll('[data-pay-open]').forEach(b => b.onclick = () => {
         const o = window._payList.find(x => x.id === b.dataset.payOpen);
